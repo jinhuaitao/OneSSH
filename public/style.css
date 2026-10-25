@@ -474,9 +474,33 @@ textarea {
     display: flex;
     align-items: center;
     gap: 8px;
-    margin-bottom: 10px;
+    width: 100%;
+    margin: 0 0 10px;
+    padding: 2px 0;
+    border: 0;
+    background: none;
+    font: inherit;
     font-size: 12px;
     color: var(--muted);
+    text-align: left;
+    cursor: pointer;
+}
+.group-head:hover b {
+    color: var(--ink);
+}
+.group-head .chev {
+    display: inline-flex;
+    color: var(--muted);
+    transition: transform 0.18s ease;
+}
+.group.collapsed .chev {
+    transform: rotate(-90deg);
+}
+.group.collapsed {
+    margin-bottom: 18px;
+}
+.group.collapsed .group-body {
+    display: none;
 }
 .group-head b {
     color: var(--ink-2);
@@ -892,6 +916,9 @@ textarea {
     font-size: 11px;
     color: var(--muted);
     margin-top: 2px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 .empty-hint {
     text-align: center;
@@ -899,6 +926,34 @@ textarea {
     font-size: 12px;
     padding: 22px 12px;
     line-height: 1.8;
+}
+.vault-sec + .vault-sec {
+    margin-top: 18px;
+}
+.vault-sec-head {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-size: 12px;
+}
+.vault-sec-head b {
+    font-weight: 600;
+    color: var(--ink-2);
+}
+.vault-sec-head .count {
+    color: var(--muted-2);
+    font-size: 11px;
+}
+.list-row .flag {
+    display: inline-flex;
+    align-items: center;
+    color: var(--muted);
+}
+.vault-sec .empty-hint {
+    padding: 14px 12px;
+    border: 1px dashed var(--line-2);
+    border-radius: 9px;
 }
 
 .toasts {

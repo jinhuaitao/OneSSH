@@ -15,6 +15,7 @@ const state = {
     hosts: [],
     groups: [],
     keys: [],
+    creds: [],
     snippets: [],
     filter: 'all',
     settings: { fontSize: 13, record: false },
@@ -231,6 +232,23 @@ function autoColor(host) {
     return PALETTE[h % PALETTE.length];
 }
 
+const COLLAPSE_KEY = 'webssh.collapsedGroups';
+
+function collapsedGroups() {
+    try {
+        const raw = JSON.parse(localStorage.getItem(COLLAPSE_KEY) || '[]');
+        return new Set(Array.isArray(raw) ? raw : []);
+    } catch (_) {
+        return new Set();
+    }
+}
+
+function persistCollapsed(set) {
+    try {
+        localStorage.setItem(COLLAPSE_KEY, JSON.stringify(Array.from(set)));
+    } catch (_) {}
+}
+
 function renderHosts() {
     const box = $('#host-groups');
     box.textContent = '';
@@ -266,16 +284,29 @@ function renderHosts() {
     });
 
     let idx = 0;
+    const collapsed = collapsedGroups();
     for (const name of names) {
         const items = groups.get(name);
-        const group = el('div', { class: 'group' });
-        group.appendChild(
-            el('div', { class: 'group-head' }, [
-                el('b', { text: name }),
-                el('span', { class: 'count', text: items.length + ' 台' }),
-            ])
-        );
-        for (const h of items) group.appendChild(hostRow(h, idx++));
+        const group = el('div', { class: 'group' + (collapsed.has(name) ? ' collapsed' : '') });
+        const head = el('button', { class: 'group-head', type: 'button', title: '收起 / 展开' }, [
+            el('span', { class: 'chev', html: icon('chevron', 13) }),
+            el('b', { text: name }),
+            el('span', { class: 'count', text: items.length + ' 台' }),
+        ]);
+        head.setAttribute('aria-expanded', collapsed.has(name) ? 'false' : 'true');
+        head.addEventListener('click', () => {
+            const set = collapsedGroups();
+            const nowCollapsed = !set.has(name);
+            if (nowCollapsed) set.add(name);
+            else set.delete(name);
+            persistCollapsed(set);
+            group.classList.toggle('collapsed', nowCollapsed);
+            head.setAttribute('aria-expanded', nowCollapsed ? 'false' : 'true');
+        });
+        const body = el('div', { class: 'group-body' });
+        for (const h of items) body.appendChild(hostRow(h, idx++));
+        group.appendChild(head);
+        group.appendChild(body);
         box.appendChild(group);
     }
 }
@@ -510,14 +541,14 @@ function openHostEditor(host) {
     const keyMeta = el('div', { class: 'fp', style: 'font-size:11px;padding:8px 10px' });
     const keyField = field('私钥（PEM）', keyIn);
     const passField = field('私钥口令', passIn);
-    const keyNote = el('p', { class: 'muted-sm', style: 'margin:0', text: '在「密钥库」里可以复用同一把私钥，主机只需要引用。' });
+    const keyNote = el('p', { class: 'muted-sm', style: 'margin:0', text: '在「凭据库」里可以复用同一把私钥，主机只需要引用。' });
     const applyKey = () => {
         const entry = state.keys.find((k) => k.id === keyId);
         keyMeta.hidden = !entry;
         if (entry) keyMeta.textContent = (entry.algo || '') + ' · ' + (entry.fingerprint || '');
         keyField.hidden = !!entry;
         passField.hidden = !!entry;
-        keyNote.textContent = entry ? '这把私钥在「密钥库」中统一管理。' : '在「密钥库」里可以复用同一把私钥，主机只需要引用。';
+        keyNote.textContent = entry ? '这把私钥在「凭据库」中统一管理。' : '在「凭据库」里可以复用同一把私钥，主机只需要引用。';
     };
     const fillKeys = (selected) => {
         keySel.textContent = '';
@@ -539,11 +570,52 @@ function openHostEditor(host) {
     });
     fillKeys(h.keyId || '');
 
+    let credId = h.credId && state.creds.some((c) => c.id === h.credId) ? h.credId : '';
+    const credSel = el('select', { name: 'credId' });
+    const credField = field('常用账号', credSel);
+    const pwField = field('密码', pwIn);
+    const credNote = el('p', {
+        class: 'muted-sm',
+        style: 'margin:0',
+        text: '把用户名和密码存进「凭据库」，多台主机可以共用同一份登录信息。',
+    });
+    const applyCred = (fillUser) => {
+        const entry = state.creds.find((c) => c.id === credId);
+        pwField.hidden = !!entry;
+        if (entry) {
+            userIn.readOnly = true;
+            if (fillUser) userIn.value = entry.username;
+            credNote.textContent = '用户名和密码由凭据库「' + entry.name + '」提供。';
+        } else {
+            userIn.readOnly = false;
+            credNote.textContent = '把用户名和密码存进「凭据库」，多台主机可以共用同一份登录信息。';
+        }
+    };
+    const fillCreds = (selected, fillUser) => {
+        credSel.textContent = '';
+        credSel.appendChild(el('option', { value: '', text: '手动输入密码' }));
+        for (const c of state.creds) credSel.appendChild(el('option', { value: c.id, text: c.name + ' · ' + c.username }));
+        credSel.appendChild(el('option', { value: '__new', text: '＋ 新建常用账号…' }));
+        credId = selected && state.creds.some((c) => c.id === selected) ? selected : '';
+        credSel.value = credId;
+        applyCred(fillUser);
+    };
+    credSel.addEventListener('change', () => {
+        if (credSel.value === '__new') {
+            credSel.value = credId;
+            credEditor(null, (meta) => fillCreds(meta.id, true));
+            return;
+        }
+        credId = credSel.value;
+        applyCred(true);
+    });
+    fillCreds(h.credId || '', false);
+
     let authType = h.authType === 'key' ? 'key' : 'password';
     const segPw = el('button', { type: 'button', text: '密码' });
     const segKey = el('button', { type: 'button', text: '私钥' });
     const seg = el('div', { class: 'seg' }, [segPw, segKey]);
-    const pwBox = el('div', {}, [field('密码', pwIn)]);
+    const pwBox = el('div', { style: 'display:flex;flex-direction:column;gap:10px' }, [credField, pwField, credNote]);
     const keyBox = el('div', { style: 'display:flex;flex-direction:column;gap:10px' }, [
         field('私钥来源', keySel),
         keyMeta,
@@ -669,7 +741,8 @@ function openHostEditor(host) {
             return;
         }
         if (authType === 'password') {
-            if (pwIn.value) payload.password = pwIn.value;
+            if (credId) payload.credId = credId;
+            else if (pwIn.value) payload.password = pwIn.value;
         } else if (keyId) {
             payload.keyId = keyId;
         } else {
@@ -731,6 +804,13 @@ async function loadKeys() {
     if (!res) return;
     state.keys = res.keys || [];
     return state.keys;
+}
+
+async function loadCreds() {
+    const res = await safe(() => api('/api/creds'));
+    if (!res) return;
+    state.creds = res.creds || [];
+    return state.creds;
 }
 
 /* ---------------------------------------------------------------- groups */
@@ -819,20 +899,66 @@ function openGroups() {
     loadGroups().then(render);
 }
 
-/* ------------------------------------------------------------------ keys */
+/* --------------------------------------------------------------- vault */
 
-function openKeys() {
+function openVault() {
     setNav('keys');
-    const box = el('div', { class: 'list' });
-    const render = () => {
-        box.textContent = '';
+    const credBox = el('div', { class: 'list' });
+    const keyBox = el('div', { class: 'list' });
+
+    const renderCreds = () => {
+        credBox.textContent = '';
+        const used = new Map();
+        for (const h of state.hosts) {
+            if (!h.credId) continue;
+            used.set(h.credId, (used.get(h.credId) || 0) + 1);
+        }
+        if (!state.creds.length) {
+            credBox.appendChild(el('div', { class: 'empty-hint', html: '还没有常用账号。<br>把常用的 SSH 用户名和密码存进来，多台主机共用一份。' }));
+            return;
+        }
+        for (const c of state.creds) {
+            const n = used.get(c.id) || 0;
+            const edit = el('button', { class: 'act icon-only', type: 'button', title: '编辑', html: icon('edit', 14) });
+            edit.addEventListener('click', () => credEditor(c, render));
+            const del = el('button', { class: 'act icon-only', type: 'button', title: '删除', html: icon('trash', 14) });
+            del.addEventListener('click', async () => {
+                const ok = await confirmModal(
+                    '删除常用账号',
+                    '确定删除 <b>' + esc(c.name) + '</b> 吗？' + (n ? '<br>它正被 ' + n + ' 台主机使用，删除后这些主机会连不上。' : ''),
+                    '删除',
+                    true
+                );
+                if (!ok) return;
+                const res = await safe(() => api('/api/creds/' + encodeURIComponent(c.id), { method: 'DELETE' }));
+                if (!res) return;
+                state.creds = state.creds.filter((x) => x.id !== c.id);
+                render();
+                toast('已删除');
+            });
+            credBox.appendChild(
+                el('div', { class: 'list-row' }, [
+                    el('span', { class: 'flag', html: icon('user', 18) }),
+                    el('div', { class: 'grow' }, [
+                        el('div', { class: 'ttl', text: c.name + (n ? '  ·  ' + n + ' 台主机' : '') }),
+                        el('div', { class: 'mono', text: c.username }),
+                    ]),
+                    edit,
+                    del,
+                ])
+            );
+        }
+    };
+
+    const renderKeys = () => {
+        keyBox.textContent = '';
         const used = new Map();
         for (const h of state.hosts) {
             if (!h.keyId) continue;
             used.set(h.keyId, (used.get(h.keyId) || 0) + 1);
         }
         if (!state.keys.length) {
-            box.appendChild(el('div', { class: 'empty-hint', html: '密钥库还是空的。<br>把常用的 SSH 私钥存进来，多台主机可以共用同一把。' }));
+            keyBox.appendChild(el('div', { class: 'empty-hint', html: '还没有私钥。<br>把常用的 SSH 私钥存进来，多台主机可以共用同一把。' }));
             return;
         }
         for (const k of state.keys) {
@@ -854,7 +980,7 @@ function openKeys() {
                 render();
                 toast('已删除');
             });
-            box.appendChild(
+            keyBox.appendChild(
                 el('div', { class: 'list-row' }, [
                     el('span', { class: 'flag', text: '🔑' }),
                     el('div', { class: 'grow' }, [
@@ -867,27 +993,106 @@ function openKeys() {
             );
         }
     };
-    const addBtn = el('button', {
+
+    const render = () => {
+        renderCreds();
+        renderKeys();
+        credCount.textContent = state.creds.length + ' 个';
+        keyCount.textContent = state.keys.length + ' 把';
+    };
+
+    const credCount = el('span', { class: 'count' });
+    const keyCount = el('span', { class: 'count' });
+
+    const addCred = el('button', {
         class: 'btn primary',
         type: 'button',
-        html: icon('plus', 14) + ' 添加密钥',
+        html: icon('plus', 14) + ' 常用账号',
+        onclick: () => credEditor(null, render),
+    });
+    const addKey = el('button', {
+        class: 'btn',
+        type: 'button',
+        html: icon('plus', 14) + ' 私钥',
         onclick: () => keyEditor(null, render),
     });
+
     modal({
-        title: '密钥库',
+        title: '凭据库',
         body: el('div', {}, [
             el('p', {
                 class: 'note-box',
-                style: 'margin:0 0 10px',
-                text: '私钥用 AES-GCM 加密后保存在你的 R2；主机可以引用这里的密钥，无需重复粘贴。',
+                style: 'margin:0 0 14px',
+                text: '常用账号和私钥都用 AES-GCM 加密后保存在你的 R2；主机引用后连接时自动解密，无需重复填写。',
             }),
-            box,
+            el('div', { class: 'vault-sec', 'data-sec': 'creds' }, [
+                el('div', { class: 'vault-sec-head' }, [el('b', { text: '常用账号' }), credCount]),
+                credBox,
+            ]),
+            el('div', { class: 'vault-sec', 'data-sec': 'keys' }, [
+                el('div', { class: 'vault-sec-head' }, [el('b', { text: '私钥' }), keyCount]),
+                keyBox,
+            ]),
         ]),
-        footer: el('div', { style: 'display:flex;gap:8px;align-items:center;width:100%' }, [addBtn]),
+        footer: el('div', { style: 'display:flex;gap:8px;align-items:center;width:100%' }, [addCred, addKey]),
         onClose: () => setNav('overview'),
     });
     render();
-    loadKeys().then(render);
+    Promise.all([loadCreds(), loadKeys()]).then(render);
+}
+
+function credEditor(cred, after) {
+    const nameIn = el('input', { type: 'text', value: cred ? cred.name : '', placeholder: '例如 生产服务器账号' });
+    const userIn = el('input', { type: 'text', value: cred ? cred.username : '', placeholder: 'root', autocomplete: 'off' });
+    const pwIn = el('input', {
+        type: 'password',
+        autocomplete: 'new-password',
+        placeholder: cred ? '已保存，留空则不修改' : '登录密码',
+    });
+    const body = el('div', { style: 'display:flex;flex-direction:column;gap:12px' }, [
+        field('名称', nameIn, '在主机设置里用这个名字识别账号'),
+        field('用户名', userIn),
+        field('密码', pwIn),
+        el('p', {
+            class: 'note-box',
+            style: 'margin:0',
+            text: '密码加密保存在你的 R2；引用该账号的主机会使用这里的用户名和密码登录。',
+        }),
+    ]);
+    const foot = el('div', { style: 'display:flex;gap:8px' }, [
+        el('button', { class: 'btn', type: 'button', text: '取消', onclick: () => m.close() }),
+        el('button', {
+            class: 'btn primary',
+            type: 'button',
+            text: '保存',
+            onclick: async () => {
+                const name = nameIn.value.trim();
+                const username = userIn.value.trim();
+                if (!name) {
+                    toast('账号名称不能为空', 'err');
+                    return;
+                }
+                if (!username) {
+                    toast('用户名不能为空', 'err');
+                    return;
+                }
+                if (!cred && !pwIn.value) {
+                    toast('请填写登录密码', 'err');
+                    return;
+                }
+                const payload = { name, username };
+                if (cred) payload.id = cred.id;
+                if (pwIn.value) payload.password = pwIn.value;
+                const res = await safe(() => api('/api/creds', { method: 'POST', body: payload }));
+                if (!res) return;
+                m.close();
+                toast(cred ? '账号已更新' : '账号已添加');
+                await loadCreds();
+                if (after) after(res.cred);
+            },
+        }),
+    ]);
+    const m = modal({ title: cred ? '编辑常用账号' : '新建常用账号', body, footer: foot, width: '520px' });
 }
 
 function keyEditor(key, after) {
@@ -930,7 +1135,7 @@ function keyEditor(key, after) {
                 const res = await safe(() => api('/api/keys', { method: 'POST', body: payload }));
                 if (!res) return;
                 m.close();
-                toast(key ? '密钥已更新' : '密钥已添加');
+                toast(key ? '私钥已更新' : '私钥已添加');
                 await loadKeys();
                 if (after) after(res.key);
             },
@@ -1327,6 +1532,7 @@ function enterApp() {
     loadHosts();
     loadSnippets();
     loadKeys();
+    loadCreds();
 }
 
 async function logout() {
@@ -1356,7 +1562,7 @@ function bindStatic() {
             else if (nav === 'snippets') openSnippets(state.term && !$('#view-term').hidden ? (cmd) => state.term.sendToActive(cmd) : null);
             else if (nav === 'quick') openQuickConnect();
             else if (nav === 'known') openKnown();
-            else if (nav === 'keys') openKeys();
+            else if (nav === 'keys') openVault();
             else if (nav === 'settings') openSettings();
             else if (nav === 'logout') logout();
         });

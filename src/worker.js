@@ -87,7 +87,7 @@ function cleanHostInput(body) {
 
 function publicHost(h) {
     const { secretEnc, keyEnc, passphraseEnc, ...rest } = h;
-    return { ...rest, hasSecret: Boolean(secretEnc || keyEnc || h.keyId) };
+    return { ...rest, hasSecret: Boolean(secretEnc || keyEnc || h.keyId || h.credId) };
 }
 
 /* ---------------------------------------------------------------- groups */
@@ -165,6 +165,29 @@ function publicKeyMeta(k) {
 async function inspectKey(privateKey) {
     const key = await loadPrivateKey(privateKey);
     return { algo: key.alg, fingerprint: await fingerprint(key.publicBlob) };
+}
+
+/* ----------------------------------------------------------------- creds */
+
+function cleanCredName(v) {
+    const name = String(v == null ? '' : v).trim();
+    if (!name || name.length > 60) throw new HttpError(400, '常用账号名称需为 1-60 个字符');
+    return name;
+}
+
+function cleanCredUser(v) {
+    const user = String(v == null ? '' : v).trim();
+    if (!user || user.length > 64 || /\s/.test(user)) throw new HttpError(400, '用户名需为 1-64 个非空白字符');
+    return user;
+}
+
+async function storedCreds(env) {
+    const rec = await getJSON(env, 'sys/creds');
+    return rec && Array.isArray(rec.creds) ? rec.creds : [];
+}
+
+function publicCredMeta(c) {
+    return { id: c.id, name: c.name, username: c.username, createdAt: c.createdAt || 0 };
 }
 
 /* -------------------------------------------------------------------- api */
@@ -343,6 +366,63 @@ async function handleApi(request, env, url) {
         return json({ ok: true });
     }
 
+    if (path === '/api/creds') {
+        if (method === 'GET') {
+            return json({ creds: (await storedCreds(env)).map(publicCredMeta) });
+        }
+        if (method === 'POST') {
+            const body = await readJSON(request);
+            const creds = await storedCreds(env);
+            const id = String(body.id || '').trim();
+            const name = cleanCredName(body.name);
+            const username = cleanCredUser(body.username);
+            const password = body.password ? String(body.password) : '';
+            const entry = id ? creds.find((c) => c.id === id) : null;
+            if (id && !entry) return json({ error: 'not_found', message: '常用账号不存在' }, 404);
+            if (creds.some((c) => c.name === name && c.id !== id)) {
+                return json({ error: 'dup', message: '同名常用账号已存在' }, 409);
+            }
+            if (!entry && !password) return json({ error: 'bad_cred', message: '请填写密码' }, 400);
+            const rec = {
+                id: entry ? entry.id : 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+                name,
+                username,
+                passEnc: password ? await auth.encryptSecret(env, password) : entry.passEnc,
+                createdAt: entry ? entry.createdAt : Date.now(),
+                updatedAt: Date.now(),
+            };
+            const next = entry ? creds.map((c) => (c.id === rec.id ? rec : c)) : creds.concat(rec);
+            await putJSON(env, 'sys/creds', { creds: next, updatedAt: Date.now() });
+            // hosts keep a denormalised username for list rendering
+            if (entry && entry.username !== username) {
+                for (const o of await list(env, 'hosts/')) {
+                    const host = await getJSON(env, o.key);
+                    if (host && host.credId === rec.id) {
+                        host.username = username;
+                        host.updatedAt = Date.now();
+                        await putJSON(env, o.key, host);
+                    }
+                }
+            }
+            return json({ cred: publicCredMeta(rec) });
+        }
+    }
+
+    if (path.startsWith('/api/creds/') && method === 'DELETE') {
+        const id = path.slice('/api/creds/'.length);
+        if (!/^[a-zA-Z0-9]+$/.test(id)) return json({ error: 'bad_id', message: '无效的账号 ID' }, 400);
+        const creds = await storedCreds(env);
+        if (!creds.some((c) => c.id === id)) return json({ error: 'not_found', message: '常用账号不存在' }, 404);
+        let used = 0;
+        for (const o of await list(env, 'hosts/')) {
+            const rec = await getJSON(env, o.key);
+            if (rec && rec.credId === id) used++;
+        }
+        if (used) return json({ error: 'in_use', message: `该账号正被 ${used} 台主机使用，请先改用其他凭据` }, 409);
+        await putJSON(env, 'sys/creds', { creds: creds.filter((c) => c.id !== id), updatedAt: Date.now() });
+        return json({ ok: true });
+    }
+
     if (path === '/api/hosts') {
         if (method === 'GET') {
             const objs = await list(env, 'hosts/');
@@ -364,10 +444,19 @@ async function handleApi(request, env, url) {
 
             const saveSecret = body.saveSecret !== false;
             if (base.authType === 'password') {
-                if (body.password) {
+                const credId = typeof body.credId === 'string' ? body.credId.trim() : '';
+                if (credId) {
+                    const vault = await storedCreds(env);
+                    if (!vault.some((c) => c.id === credId && c.passEnc)) {
+                        return json({ error: 'bad_cred', message: '所选常用账号不存在，请刷新凭据库后重试' }, 400);
+                    }
+                    rec.credId = credId;
+                } else if (body.password) {
                     rec.secretEnc = saveSecret ? await auth.encryptSecret(env, String(body.password)) : null;
                 } else if (existing && existing.secretEnc && saveSecret) {
                     rec.secretEnc = existing.secretEnc;
+                } else if (existing && existing.credId && saveSecret) {
+                    rec.credId = existing.credId;
                 }
             } else {
                 const keyId = typeof body.keyId === 'string' ? body.keyId.trim() : '';

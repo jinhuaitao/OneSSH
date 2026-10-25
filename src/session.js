@@ -196,6 +196,12 @@ export class Terminal {
                 } else if (saved.authType === 'key' && saved.keyEnc) {
                     privateKey = await decryptSecret(this.env, saved.keyEnc);
                     if (saved.passphraseEnc) passphrase = await decryptSecret(this.env, saved.passphraseEnc);
+                } else if (saved.authType === 'password' && saved.credId) {
+                    const vault = await getJSON(this.env, 'sys/creds');
+                    const cred = vault && Array.isArray(vault.creds) ? vault.creds.find((c) => c.id === saved.credId) : null;
+                    if (!cred || !cred.passEnc) throw new Error('凭据库里找不到该主机使用的账号，请在主机设置中重新选择');
+                    password = await decryptSecret(this.env, cred.passEnc);
+                    if (cred.username) username = cred.username;
                 } else if (saved.secretEnc) {
                     password = await decryptSecret(this.env, saved.secretEnc);
                 }

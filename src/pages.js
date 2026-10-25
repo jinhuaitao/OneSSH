@@ -98,7 +98,7 @@ export function renderShell() {
       <button class="rail-item" data-nav="snippets">${icon('code')}<span>代码片段</span></button>
       <button class="rail-item" data-nav="quick">${icon('bolt')}<span>快速连接</span></button>
       <button class="rail-item" data-nav="known">${icon('key')}<span>主机密钥</span></button>
-      <button class="rail-item" data-nav="keys">${icon('lock')}<span>密钥库</span></button>
+      <button class="rail-item" data-nav="keys">${icon('lock')}<span>凭据库</span></button>
       <button class="rail-item" data-nav="settings">${icon('gear')}<span>设置</span></button>
     </nav>
     <button class="rail-item rail-out" data-nav="logout">${icon('logout')}<span>退出</span></button>

@@ -21,6 +21,8 @@ const LAND = (() => {
             const nibble = parseInt(ch, 16);
             if (!Number.isFinite(nibble)) continue;
             if (!((nibble >> (3 - (c % 4))) & 1)) continue;
+            // thin high latitudes so converging rows don't merge into rings
+            if (cosLat < 0.6 && ((r * 31 + c * 17) % 100) / 100 > Math.pow(cosLat, 0.7)) continue;
             const lon = (-180 + (c + 0.5) * step) * RAD;
             out.push({
                 cl: cosLat,
@@ -102,28 +104,54 @@ export function createGlobe(canvas, labelLayer, opts) {
 
     /* ------------------------------------------------------------ drawing */
 
+    function drawShadow() {
+        const g = ctx.createRadialGradient(cx, cy + R * 0.98, R * 0.06, cx, cy + R * 0.98, R * 0.82);
+        g.addColorStop(0, 'rgba(116, 104, 84, 0.18)');
+        g.addColorStop(0.5, 'rgba(116, 104, 84, 0.06)');
+        g.addColorStop(1, 'rgba(116, 104, 84, 0)');
+        ctx.beginPath();
+        ctx.ellipse(cx, cy + R * 0.99, R * 0.76, R * 0.12, 0, 0, TAU);
+        ctx.fillStyle = g;
+        ctx.fill();
+    }
+
     function drawSphere() {
-        const g = ctx.createRadialGradient(cx - R * 0.34, cy - R * 0.4, R * 0.08, cx, cy, R * 1.02);
+        const g = ctx.createRadialGradient(cx - R * 0.36, cy - R * 0.42, R * 0.06, cx, cy, R * 1.04);
         g.addColorStop(0, '#ffffff');
-        g.addColorStop(0.62, '#fdfbf7');
-        g.addColorStop(1, '#f3ede3');
+        g.addColorStop(0.36, '#f4fafd');
+        g.addColorStop(0.72, '#e2f0f8');
+        g.addColorStop(0.92, '#c9dfee');
+        g.addColorStop(1, '#b3cfe3');
         ctx.beginPath();
         ctx.arc(cx, cy, R, 0, TAU);
         ctx.fillStyle = g;
         ctx.fill();
         ctx.lineWidth = 1;
-        ctx.strokeStyle = 'rgba(170, 158, 138, 0.5)';
+        ctx.strokeStyle = 'rgba(132, 162, 186, 0.5)';
         ctx.stroke();
     }
 
-    const BUCKETS = 6;
+    let landCanvas = null;
+    let landCtx = null;
 
     function drawLand() {
+        if (!landCanvas) {
+            landCanvas = document.createElement('canvas');
+            landCtx = landCanvas.getContext('2d');
+        }
+        if (landCanvas.width !== canvas.width || landCanvas.height !== canvas.height) {
+            landCanvas.width = canvas.width;
+            landCanvas.height = canvas.height;
+        }
+        const lc = landCtx;
+        lc.setTransform(1, 0, 0, 1, 0, 0);
+        lc.clearRect(0, 0, landCanvas.width, landCanvas.height);
+        lc.setTransform(dpr, 0, 0, dpr, 0, 0);
+
         const cosP = Math.cos(pitch);
         const sinP = Math.sin(pitch);
-        const buckets = [];
-        for (let i = 0; i < BUCKETS; i++) buckets.push([]);
-
+        const base = Math.max(0.85, R / 132);
+        lc.beginPath();
         for (let i = 0; i < LAND.length; i++) {
             const d = LAND[i];
             const x0 = d.cl * (d.sn * cosYaw + d.cn * sinYaw);
@@ -131,26 +159,37 @@ export function createGlobe(canvas, labelLayer, opts) {
             const y2 = d.sl * cosP - z1 * sinP;
             const z2 = d.sl * sinP + z1 * cosP;
             if (z2 <= 0.015) continue;
+            // polar rows converge, so shrink those dots to avoid smeared arcs
+            const rad = base * (0.4 + z2 * 0.72) * (0.58 + 0.42 * Math.sqrt(d.cl));
             const x = cx + x0 * R;
             const y = cy - y2 * R;
-            const b = Math.min(BUCKETS - 1, Math.floor(z2 * BUCKETS));
-            buckets[b].push(x, y, z2);
+            lc.moveTo(x + rad, y);
+            lc.arc(x, y, rad, 0, TAU);
         }
+        lc.fillStyle = 'rgba(34, 52, 42, 0.85)';
+        lc.fill();
 
-        const base = Math.max(0.85, R / 132);
-        for (let b = 0; b < BUCKETS; b++) {
-            const arr = buckets[b];
-            if (!arr.length) continue;
-            const depth = (b + 0.5) / BUCKETS;
-            ctx.beginPath();
-            const rad = base * (0.62 + depth * 0.5);
-            for (let i = 0; i < arr.length; i += 3) {
-                ctx.moveTo(arr[i] + rad, arr[i + 1]);
-                ctx.arc(arr[i], arr[i + 1], rad, 0, TAU);
-            }
-            ctx.fillStyle = 'rgba(38, 33, 26, ' + (0.09 + depth * 0.44).toFixed(3) + ')';
-            ctx.fill();
-        }
+        lc.globalCompositeOperation = 'source-atop';
+        const lit = lc.createRadialGradient(cx - R * 0.4, cy - R * 0.45, R * 0.05, cx + R * 0.26, cy + R * 0.32, R * 1.16);
+        lit.addColorStop(0, 'rgba(255, 255, 255, 0.36)');
+        lit.addColorStop(0.4, 'rgba(255, 255, 255, 0)');
+        lit.addColorStop(1, 'rgba(12, 32, 48, 0.55)');
+        lc.fillStyle = lit;
+        lc.fillRect(0, 0, W, H);
+        lc.globalCompositeOperation = 'source-over';
+
+        ctx.drawImage(landCanvas, 0, 0, W, H);
+    }
+
+    function drawFinish() {
+        const halo = ctx.createRadialGradient(cx, cy, R * 0.94, cx, cy, R * 1.14);
+        halo.addColorStop(0, 'rgba(108, 164, 206, 0.2)');
+        halo.addColorStop(0.55, 'rgba(108, 164, 206, 0.07)');
+        halo.addColorStop(1, 'rgba(108, 164, 206, 0)');
+        ctx.beginPath();
+        ctx.arc(cx, cy, R * 1.14, 0, TAU);
+        ctx.fillStyle = halo;
+        ctx.fill();
     }
 
     function drawMarkers(t) {
@@ -274,8 +313,10 @@ export function createGlobe(canvas, labelLayer, opts) {
             sinYaw = Math.sin(yaw);
         }
         ctx.clearRect(0, 0, W, H);
+        drawShadow();
         drawSphere();
         drawLand();
+        drawFinish();
         drawMarkers(t);
         layoutLabels();
         raf = requestAnimationFrame(frame);
@@ -296,7 +337,7 @@ export function createGlobe(canvas, labelLayer, opts) {
         lastX = ev.clientX;
         lastY = ev.clientY;
         yaw += dx * 0.0062;
-        pitch = Math.max(-1.15, Math.min(1.15, pitch - dy * 0.005));
+        pitch = Math.max(-1.15, Math.min(1.15, pitch + dy * 0.005));
         cosYaw = Math.cos(yaw);
         sinYaw = Math.sin(yaw);
     }

@@ -64,6 +64,8 @@ const PATHS = {
     upload: '<path d="M12 19.5v-14M6.5 11 12 5.5 17.5 11M5 21h14"/>',
     download: '<path d="M12 4.5v14M6.5 13 12 18.5 17.5 13M5 21h14"/>',
     up: '<path d="m6.5 14.5 5.5-5.5 5.5 5.5"/>',
+    chevron: '<path d="m6.5 9.5 5.5 5.5 5.5-5.5"/>',
+    user: '<circle cx="12" cy="8" r="3.5"/><path d="M5 20a7 7 0 0 1 14 0"/>',
     lock: '<rect x="4" y="10" width="16" height="10" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
 };
 
