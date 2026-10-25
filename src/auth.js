@@ -4,7 +4,8 @@ import { getJSON, putJSON, del, list } from './store.js';
 const ADMIN_KEY = 'sys/admin';
 const MASTER_KEY = 'sys/master';
 const SESSION_PREFIX = 'sess/';
-const PBKDF2_ITER = 120000;
+// Workers 生产运行时拒绝 >100000 的 PBKDF2 迭代（NotSupportedError），本地 dev 不检查
+const PBKDF2_ITER = 100000;
 const SESSION_TTL = 30 * 24 * 3600 * 1000;
 
 const te = new TextEncoder();
