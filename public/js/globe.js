@@ -2,6 +2,7 @@
 
 const TAU = Math.PI * 2;
 const RAD = Math.PI / 180;
+const FONT = '-apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", sans-serif';
 
 const QUAD_VERT = `
 attribute vec2 aPos;
@@ -350,25 +351,41 @@ export function createGlobe(canvas, labelLayer, opts) {
             if (s.z <= 0.03) continue;
             const fade = Math.min(1, (s.z - 0.03) / 0.32);
             const pulse = (Math.sin(t / 620 + (p.phase || 0)) + 1) / 2;
+            const many = p.items.length > 1;
             // halo
             ctx.beginPath();
-            ctx.arc(s.x, s.y, 6 + pulse * 6, 0, TAU);
+            ctx.arc(s.x, s.y, (many ? 9 : 6) + pulse * 6, 0, TAU);
             ctx.fillStyle = 'rgba(255, 74, 23, ' + (0.16 * fade * (1 - pulse * 0.7)).toFixed(3) + ')';
             ctx.fill();
-            // white collar keeps the pin readable over land and sea
-            ctx.beginPath();
-            ctx.arc(s.x, s.y, 5.2, 0, TAU);
-            ctx.strokeStyle = 'rgba(255, 255, 255, ' + (0.9 * fade).toFixed(3) + ')';
-            ctx.lineWidth = 1.8;
-            ctx.stroke();
-            // core
-            ctx.beginPath();
-            ctx.arc(s.x, s.y, 2.7, 0, TAU);
-            ctx.fillStyle = 'rgba(255, 74, 23, ' + fade.toFixed(3) + ')';
-            ctx.fill();
+            if (many) {
+                // badge: how many hosts share this spot
+                ctx.beginPath();
+                ctx.arc(s.x, s.y, 7.8, 0, TAU);
+                ctx.fillStyle = 'rgba(255, 255, 255, ' + (0.96 * fade).toFixed(3) + ')';
+                ctx.fill();
+                ctx.lineWidth = 1.7;
+                ctx.strokeStyle = 'rgba(255, 74, 23, ' + (0.92 * fade).toFixed(3) + ')';
+                ctx.stroke();
+                ctx.fillStyle = 'rgba(230, 60, 12, ' + fade.toFixed(3) + ')';
+                ctx.font = '600 9.5px ' + FONT;
+                ctx.textAlign = 'center';
+                ctx.textBaseline = 'middle';
+                ctx.fillText(String(p.items.length), s.x, s.y + 0.4);
+            } else {
+                // white collar keeps the pin readable over land and sea
+                ctx.beginPath();
+                ctx.arc(s.x, s.y, 5.2, 0, TAU);
+                ctx.strokeStyle = 'rgba(255, 255, 255, ' + (0.9 * fade).toFixed(3) + ')';
+                ctx.lineWidth = 1.8;
+                ctx.stroke();
+                ctx.beginPath();
+                ctx.arc(s.x, s.y, 2.7, 0, TAU);
+                ctx.fillStyle = 'rgba(255, 74, 23, ' + fade.toFixed(3) + ')';
+                ctx.fill();
+            }
             if (p === selected) {
                 ctx.beginPath();
-                ctx.arc(s.x, s.y, 9, 0, TAU);
+                ctx.arc(s.x, s.y, many ? 11.6 : 9, 0, TAU);
                 ctx.strokeStyle = 'rgba(255, 74, 23, ' + (0.5 * fade).toFixed(3) + ')';
                 ctx.lineWidth = 1.4;
                 ctx.stroke();
@@ -381,23 +398,16 @@ export function createGlobe(canvas, labelLayer, opts) {
     const card = document.createElement('div');
     card.className = 'glabel';
     card.style.display = 'none';
+    const cardHead = document.createElement('div');
+    cardHead.className = 'gl-head';
     const cardFlag = document.createElement('span');
     cardFlag.className = 'gl-flag';
-    const cardTxt = document.createElement('span');
-    cardTxt.className = 'gl-txt';
-    const cardName = document.createElement('span');
-    cardName.className = 'gl-name';
-    const cardCity = document.createElement('span');
-    cardCity.className = 'gl-city';
-    cardTxt.appendChild(cardName);
-    cardTxt.appendChild(cardCity);
-    card.appendChild(cardFlag);
-    card.appendChild(cardTxt);
+    const cardPlace = document.createElement('span');
+    cardPlace.className = 'gl-place';
+    cardHead.appendChild(cardFlag);
+    cardHead.appendChild(cardPlace);
+    card.appendChild(cardHead);
     labelLayer.appendChild(card);
-    card.addEventListener('click', (ev) => {
-        ev.stopPropagation();
-        if (selected && options.onPick) options.onPick(selected);
-    });
 
     function selectPoint(p) {
         selected = p;
@@ -405,9 +415,21 @@ export function createGlobe(canvas, labelLayer, opts) {
             card.style.display = 'none';
             return;
         }
-        cardFlag.textContent = p.flag || '🌐';
-        cardName.textContent = p.name || '';
-        cardCity.textContent = p.city || '';
+        const first = p.items[0];
+        cardFlag.textContent = first.flag || '🌐';
+        cardPlace.textContent = first.city || '';
+        while (card.lastChild !== cardHead) card.removeChild(card.lastChild);
+        for (const host of p.items) {
+            const row = document.createElement('button');
+            row.type = 'button';
+            row.className = 'gl-host';
+            row.textContent = host.name || host.id;
+            row.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                if (options.onPick) options.onPick(host);
+            });
+            card.appendChild(row);
+        }
         card.style.display = '';
         card.style.opacity = '0';
     }
@@ -538,7 +560,18 @@ export function createGlobe(canvas, labelLayer, opts) {
     return {
         setPoints(list) {
             selectPoint(null);
-            points = (list || []).map((p, i) => Object.assign({ phase: i * 1.3 }, p));
+            // hosts in the same city share coordinates: one dot per spot, with a count
+            const spots = new Map();
+            for (const p of list || []) {
+                const key = p.lat + ',' + p.lon;
+                let spot = spots.get(key);
+                if (!spot) {
+                    spot = { lat: p.lat, lon: p.lon, items: [] };
+                    spots.set(key, spot);
+                }
+                spot.items.push(p);
+            }
+            points = [...spots.values()].map((spot, i) => Object.assign({ phase: i * 1.3 }, spot));
         },
         setAutoRotate(on) {
             auto = !!on;
