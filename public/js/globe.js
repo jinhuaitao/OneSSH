@@ -370,7 +370,7 @@ export function createGlobe(canvas, labelLayer, opts) {
                 ctx.font = '600 9.5px ' + FONT;
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.fillText(String(p.items.length), s.x, s.y + 0.4);
+                ctx.fillText(p.items.length > 9 ? '9+' : String(p.items.length), s.x, s.y + 0.4);
             } else {
                 // white collar keeps the pin readable over land and sea
                 ctx.beginPath();
