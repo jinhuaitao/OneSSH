@@ -15,8 +15,6 @@ export function knownKey(host, port) {
     return 'known/' + String(host).toLowerCase().replace(/[^a-z0-9.\-:\[\]]/g, '_') + '_' + port;
 }
 
-const enc = new TextEncoder();
-
 // Single round-trip sample of the remote /proc counters.
 const STATS_CMD =
     "awk '/^cpu /{print \"@@CPU\",$2,$3,$4,$5,$6,$7,$8,$9}' /proc/stat 2>/dev/null; " +
@@ -87,6 +85,7 @@ export class Terminal {
         this.recording = false;
         this.recChunks = [];
         this.recBytes = 0;
+        this.startedAt = 0;
         this.closed = false;
         this.keepaliveTimer = null;
         this.statsTimer = null;
@@ -216,6 +215,8 @@ export class Terminal {
 
         this.meta = { host, port, user: username };
         this.recording = record;
+        // 录制元数据的「开始时间」要取连接建立的时刻，而不是 cleanup 的时刻
+        this.startedAt = Date.now();
         if (this.socket) {
             this.send({ t: 'status', phase: 'tcp', message: `TCP 已连接 ${host}:${port}，正在协商 SSH 会话 …` });
         } else {
@@ -631,7 +632,10 @@ export class Terminal {
 
     _record(data) {
         if (!this.recording || this.recBytes > 4 * 1024 * 1024) return;
-        this.recChunks.push(new TextDecoder().decode(data));
+        // 按原始字节累积。一个 UTF-8 字符（中文 3 字节、emoji 4 字节）完全可能跨 SSH
+        // 包边界，逐包 decode 会把它拆成 U+FFFD；收齐后一次性解码才不会打断字符。
+        // slice() 不能省：data 是 SSH 接收缓冲上的视图，缓冲区会被后续数据复用。
+        this.recChunks.push(data.slice());
         this.recBytes += data.length;
     }
 
@@ -659,13 +663,15 @@ export class Terminal {
         } catch (_) {}
         if (this.recording && this.recBytes > 0) {
             try {
-                const id = new Date().toISOString().replace(/[:.]/g, '-') + '-' + randomHex(4);
-                const bytes = enc.encode(this.recChunks.join(''));
+                // 记录的是会话开始的时刻；文件名也用它，便于按会话时间排序
+                const startedAt = this.startedAt || Date.now();
+                const id = new Date(startedAt).toISOString().replace(/[:.]/g, '-') + '-' + randomHex(4);
+                const bytes = joinBytes(this.recChunks, this.recBytes);
                 await putBytes(this.env, 'logs/' + id + '.log', await encryptBytes(this.env, bytes), {
                     host: this.meta.host,
                     port: String(this.meta.port),
                     user: this.meta.user,
-                    started: new Date().toISOString(),
+                    started: new Date(startedAt).toISOString(),
                     bytes: String(this.recBytes),
                     reason: String(reason || ''),
                     enc: 'v1',
@@ -680,4 +686,15 @@ function clampInt(v, min, max, dflt) {
     const n = parseInt(v, 10);
     if (!Number.isFinite(n)) return dflt;
     return Math.min(max, Math.max(min, n));
+}
+
+/** 把录制分片按顺序拼成一个字节流（解码留到读日志时整体进行） */
+function joinBytes(chunks, total) {
+    const out = new Uint8Array(total);
+    let off = 0;
+    for (const c of chunks) {
+        out.set(c, off);
+        off += c.length;
+    }
+    return out;
 }
