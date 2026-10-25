@@ -1,45 +1,76 @@
-/* Dotted orthographic globe: land mask + host markers + DOM label cards. */
-
-import { LAND_META, LAND_ROWS } from './land.js';
+/* Orthographic globe: NASA Blue Marble on a WebGL sphere, markers on canvas 2D. */
 
 const TAU = Math.PI * 2;
 const RAD = Math.PI / 180;
 
-/* ------------------------------------------------------------ land dots */
+const QUAD_VERT = `
+attribute vec2 aPos;
+void main() { gl_Position = vec4(aPos, 0.0, 1.0); }
+`;
 
-const LAND = (() => {
-    const out = [];
-    const { cols, rows, lat0, step } = LAND_META;
-    for (let r = 0; r < rows; r++) {
-        const line = LAND_ROWS[r] || '';
-        const lat = (lat0 + (r + 0.5) * step) * RAD;
-        const cosLat = Math.cos(lat);
-        const sinLat = Math.sin(lat);
-        for (let c = 0; c < cols; c++) {
-            const ch = line[Math.floor(c / 4)];
-            if (!ch) continue;
-            const nibble = parseInt(ch, 16);
-            if (!Number.isFinite(nibble)) continue;
-            if (!((nibble >> (3 - (c % 4))) & 1)) continue;
-            // thin high latitudes so converging rows don't merge into rings
-            if (cosLat < 0.6 && ((r * 31 + c * 17) % 100) / 100 > Math.pow(cosLat, 0.7)) continue;
-            const lon = (-180 + (c + 0.5) * step) * RAD;
-            out.push({
-                cl: cosLat,
-                sl: sinLat,
-                cn: Math.cos(lon),
-                sn: Math.sin(lon),
-            });
-        }
-    }
-    return out;
-})();
-
-export function landDotCount() {
-    return LAND.length;
+// atmosphere bloom and the page shadow, outside the disk
+const BG_FRAG = `
+precision highp float;
+uniform vec2 uCenter;
+uniform float uRadius;
+void main() {
+    vec2 p = (gl_FragCoord.xy - uCenter) / uRadius;
+    float r = length(p);
+    if (r <= 1.0) discard;
+    float ga = 1.0 - smoothstep(1.0, 1.075, r);
+    ga = ga * ga * 0.45;
+    vec3 gc = vec3(0.42, 0.64, 0.92);
+    vec2 s = (p - vec2(0.06, -1.03)) / vec2(0.78, 0.14);
+    float sa = (1.0 - smoothstep(0.15, 1.0, length(s))) * 0.16;
+    vec3 sc = vec3(0.45, 0.39, 0.31);
+    gl_FragColor = vec4(gc * ga + sc * sa, ga + sa);
 }
+`;
 
-/* ---------------------------------------------------------------- globe */
+const SPHERE_VERT = `
+attribute vec3 aPos;
+attribute vec2 aUv;
+uniform vec2 uView;   // globe radius in clip space, per axis
+uniform float uYaw;
+uniform float uPitch;
+varying vec2 vUv;
+varying vec3 vN;
+void main() {
+    float cy = cos(uYaw);
+    float sy = sin(uYaw);
+    vec3 p = vec3(aPos.x * cy + aPos.z * sy, aPos.y, -aPos.x * sy + aPos.z * cy);
+    float cp = cos(uPitch);
+    float sp = sin(uPitch);
+    vN = vec3(p.x, p.y * cp - p.z * sp, p.y * sp + p.z * cp);
+    vUv = aUv;
+    gl_Position = vec4(vN.x * uView.x, vN.y * uView.y, 0.0, 1.0);
+}
+`;
+
+const SPHERE_FRAG = `
+precision highp float;
+uniform sampler2D uTex;
+varying vec2 vUv;
+varying vec3 vN;
+void main() {
+    vec3 n = normalize(vN);
+    // lifted and slightly washed out so the globe sits on the light dashboard
+    vec3 tex = pow(texture2D(uTex, vUv).rgb, vec3(0.66));
+    tex = mix(tex, vec3(0.90, 0.94, 0.98), 0.18);
+    vec3 L = normalize(vec3(-0.5, 0.58, 0.64));
+    float diff = max(dot(n, L), 0.0);
+    float lit = 0.88 + 0.26 * pow(diff, 0.9);
+    vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));
+    float water = smoothstep(0.02, 0.14, tex.b - tex.r);
+    float glint = pow(max(dot(n, H), 0.0), 110.0) * water * 0.55;
+    float graze = pow(1.0 - max(n.z, 0.0), 3.0);
+    float haze = graze * 0.42 + graze * diff * 0.18;
+    vec3 col = tex * lit + vec3(glint) + vec3(0.62, 0.76, 0.92) * haze;
+    gl_FragColor = vec4(col, 1.0);
+}
+`;
+
+/* ------------------------------------------------------------------- globe */
 
 export function createGlobe(canvas, labelLayer, opts) {
     const options = opts || {};
@@ -57,29 +88,221 @@ export function createGlobe(canvas, labelLayer, opts) {
     let dragging = false;
     let lastX = 0;
     let lastY = 0;
+    let downX = 0;
+    let downY = 0;
+    let tapMoved = 0;
     let raf = 0;
     let points = [];
-    let labels = [];
+    let selected = null;
     let alive = true;
 
-    /* ------------------------------------------------------------ sizing */
+    /* --------------------------------------------------------- gl layer */
 
-    function resize() {
-        const rect = canvas.getBoundingClientRect();
-        const w = Math.max(80, Math.round(rect.width));
-        const h = Math.max(80, Math.round(rect.height));
-        dpr = Math.min(2.5, window.devicePixelRatio || 1);
-        canvas.width = Math.round(w * dpr);
-        canvas.height = Math.round(h * dpr);
-        W = w;
-        H = h;
-        cx = w / 2;
-        cy = h / 2;
-        R = Math.min(w, h) * 0.43;
-        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const glCanvas = document.createElement('canvas');
+    glCanvas.setAttribute('aria-hidden', 'true');
+    glCanvas.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none';
+    canvas.parentNode.insertBefore(glCanvas, canvas);
+
+    const gl = glCanvas.getContext('webgl', { alpha: true, antialias: true });
+    let bgProg = null;
+    let bgUni = null;
+    let bgPos = -1;
+    let sphereProg = null;
+    let sphereUni = null;
+    let sphereCount = 0;
+    let quadBuf = null;
+    let posBuf = null;
+    let uvBuf = null;
+    let idxBuf = null;
+    let texture = null;
+    let texWanted = false;
+    let texReady = false;
+    let glOk = !!gl;
+
+    function makeProgram(frag, vert) {
+        const compile = (type, src) => {
+            const sh = gl.createShader(type);
+            gl.shaderSource(sh, src);
+            gl.compileShader(sh);
+            if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+            return sh;
+        };
+        const prog = gl.createProgram();
+        gl.attachShader(prog, compile(gl.VERTEX_SHADER, vert));
+        gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, frag));
+        gl.linkProgram(prog);
+        if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+        return prog;
     }
 
-    /* -------------------------------------------------------- projection */
+    // UV sphere: texture coordinates interpolate across the mesh, so the
+    // equirectangular seam and the polar singularity never reach the shader
+    function buildSphere() {
+        const SEG = 128;
+        const RING = 64;
+        const verts = [];
+        const uvs = [];
+        for (let y = 0; y <= RING; y++) {
+            const v = y / RING;
+            const lat = (0.5 - v) * Math.PI;
+            const cl = Math.cos(lat);
+            const sl = Math.sin(lat);
+            for (let x = 0; x <= SEG; x++) {
+                const u = x / SEG;
+                const lon = (u - 0.5) * TAU;
+                verts.push(cl * Math.sin(lon), sl, cl * Math.cos(lon));
+                uvs.push(u, 1 - v);
+            }
+        }
+        const idx = [];
+        for (let y = 0; y < RING; y++) {
+            for (let x = 0; x < SEG; x++) {
+                const a = y * (SEG + 1) + x;
+                const b = a + 1;
+                const c = a + SEG + 1;
+                const d = c + 1;
+                idx.push(a, c, b, b, c, d);
+            }
+        }
+        sphereCount = idx.length;
+
+        posBuf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(verts), gl.STATIC_DRAW);
+
+        uvBuf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(uvs), gl.STATIC_DRAW);
+
+        idxBuf = gl.createBuffer();
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+        gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, new Uint16Array(idx), gl.STATIC_DRAW);
+    }
+
+    function initGL() {
+        if (!gl) return;
+        bgProg = makeProgram(BG_FRAG, QUAD_VERT);
+        sphereProg = makeProgram(SPHERE_FRAG, SPHERE_VERT);
+
+        bgUni = {
+            center: gl.getUniformLocation(bgProg, 'uCenter'),
+            radius: gl.getUniformLocation(bgProg, 'uRadius'),
+        };
+        bgPos = gl.getAttribLocation(bgProg, 'aPos');
+        sphereUni = {
+            view: gl.getUniformLocation(sphereProg, 'uView'),
+            yaw: gl.getUniformLocation(sphereProg, 'uYaw'),
+            pitch: gl.getUniformLocation(sphereProg, 'uPitch'),
+            tex: gl.getUniformLocation(sphereProg, 'uTex'),
+            aPos: gl.getAttribLocation(sphereProg, 'aPos'),
+            aUv: gl.getAttribLocation(sphereProg, 'aUv'),
+        };
+
+        quadBuf = gl.createBuffer();
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+        gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+
+        buildSphere();
+
+        gl.disable(gl.BLEND);
+        gl.disable(gl.DEPTH_TEST);
+
+        texture = gl.createTexture();
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, 1, 1, 0, gl.RGBA, gl.UNSIGNED_BYTE, new Uint8Array([12, 40, 66, 255]));
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.REPEAT);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    }
+
+    // the pane is hidden below 1180px; only pay for the 1MB texture once it shows
+    function wantTexture() {
+        if (texWanted || !gl || !glOk) return;
+        texWanted = true;
+        loadTexture();
+    }
+
+    function loadTexture() {
+        const img = new Image();
+        img.decoding = 'async';
+        img.onload = () => {
+            if (!alive || !gl || gl.isContextLost()) return;
+            gl.bindTexture(gl.TEXTURE_2D, texture);
+            gl.pixelStorei(gl.UNPACK_FLIP_Y_WEBGL, true);
+            gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, img);
+            gl.generateMipmap(gl.TEXTURE_2D);
+            gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+            const aniso = gl.getExtension('EXT_texture_filter_anisotropic');
+            if (aniso) {
+                const max = gl.getParameter(aniso.MAX_TEXTURE_MAX_ANISOTROPY_EXT);
+                gl.texParameterf(gl.TEXTURE_2D, aniso.TEXTURE_MAX_ANISOTROPY_EXT, Math.min(8, max));
+            }
+            texReady = true;
+        };
+        img.src = 'img/earth.jpg';
+    }
+
+    if (gl) {
+        try {
+            initGL();
+        } catch (e) {
+            glOk = false;
+        }
+        glCanvas.addEventListener('webglcontextlost', (ev) => {
+            ev.preventDefault();
+            texReady = false;
+            glOk = false;
+        });
+        glCanvas.addEventListener('webglcontextrestored', () => {
+            glOk = true;
+            try {
+                initGL();
+                if (texWanted) loadTexture();
+            } catch (e) {
+                glOk = false;
+            }
+        });
+    }
+
+    function drawGL() {
+        if (!gl || !bgProg || gl.isContextLost()) return;
+        gl.viewport(0, 0, glCanvas.width, glCanvas.height);
+        gl.clearColor(0, 0, 0, 0);
+        gl.clear(gl.COLOR_BUFFER_BIT);
+
+        // sky: atmosphere and shadow behind the disk
+        gl.disable(gl.CULL_FACE);
+        gl.useProgram(bgProg);
+        gl.bindBuffer(gl.ARRAY_BUFFER, quadBuf);
+        gl.enableVertexAttribArray(bgPos);
+        gl.vertexAttribPointer(bgPos, 2, gl.FLOAT, false, 0, 0);
+        gl.uniform2f(bgUni.center, cx * dpr, (H - cy) * dpr);
+        gl.uniform1f(bgUni.radius, R * dpr);
+        gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+
+        // globe
+        gl.enable(gl.CULL_FACE);
+        gl.cullFace(gl.BACK);
+        gl.useProgram(sphereProg);
+        gl.bindBuffer(gl.ARRAY_BUFFER, posBuf);
+        gl.enableVertexAttribArray(sphereUni.aPos);
+        gl.vertexAttribPointer(sphereUni.aPos, 3, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ARRAY_BUFFER, uvBuf);
+        gl.enableVertexAttribArray(sphereUni.aUv);
+        gl.vertexAttribPointer(sphereUni.aUv, 2, gl.FLOAT, false, 0, 0);
+        gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, idxBuf);
+        gl.activeTexture(gl.TEXTURE0);
+        gl.bindTexture(gl.TEXTURE_2D, texture);
+        gl.uniform1i(sphereUni.tex, 0);
+        gl.uniform2f(sphereUni.view, (2 * R) / Math.max(1, W), (2 * R) / Math.max(1, H));
+        gl.uniform1f(sphereUni.yaw, ((yaw % TAU) + TAU) % TAU);
+        gl.uniform1f(sphereUni.pitch, pitch);
+        gl.drawElements(gl.TRIANGLES, sphereCount, gl.UNSIGNED_SHORT, 0);
+        gl.disable(gl.CULL_FACE);
+    }
+
+    /* --------------------------------------------------------- projection */
 
     let cosYaw = Math.cos(yaw);
     let sinYaw = Math.sin(yaw);
@@ -91,105 +314,31 @@ export function createGlobe(canvas, labelLayer, opts) {
         const y0 = Math.sin(la);
         const x0 = cl * Math.sin(lo);
         const z0 = cl * Math.cos(lo);
-        // yaw
         const x1 = x0 * cosYaw + z0 * sinYaw;
         const z1 = z0 * cosYaw - x0 * sinYaw;
-        // pitch (rotate around X)
         const cp = Math.cos(pitch);
         const sp = Math.sin(pitch);
-        const y2 = y0 * cp - z1 * sp;
-        const z2 = y0 * sp + z1 * cp;
-        return { x: cx + x1 * R, y: cy - y2 * R, z: z2 };
+        const ny = y0 * cp - z1 * sp;
+        const z = y0 * sp + z1 * cp;
+        return { x: cx + x1 * R, y: cy - ny * R, z };
     }
 
-    /* ------------------------------------------------------------ drawing */
+    /* ------------------------------------------------------ 2d fallback */
 
-    function drawShadow() {
-        const g = ctx.createRadialGradient(cx, cy + R * 0.98, R * 0.06, cx, cy + R * 0.98, R * 0.82);
-        g.addColorStop(0, 'rgba(116, 104, 84, 0.18)');
-        g.addColorStop(0.5, 'rgba(116, 104, 84, 0.06)');
-        g.addColorStop(1, 'rgba(116, 104, 84, 0)');
-        ctx.beginPath();
-        ctx.ellipse(cx, cy + R * 0.99, R * 0.76, R * 0.12, 0, 0, TAU);
-        ctx.fillStyle = g;
-        ctx.fill();
-    }
-
-    function drawSphere() {
-        const g = ctx.createRadialGradient(cx - R * 0.36, cy - R * 0.42, R * 0.06, cx, cy, R * 1.04);
-        g.addColorStop(0, '#ffffff');
-        g.addColorStop(0.36, '#f4fafd');
-        g.addColorStop(0.72, '#e2f0f8');
-        g.addColorStop(0.92, '#c9dfee');
-        g.addColorStop(1, '#b3cfe3');
+    function drawFallback() {
+        const g = ctx.createRadialGradient(cx - R * 0.42, cy - R * 0.46, R * 0.04, cx + R * 0.1, cy + R * 0.14, R * 1.12);
+        g.addColorStop(0, '#5d95bb');
+        g.addColorStop(0.55, '#2f668f');
+        g.addColorStop(1, '#123a5c');
         ctx.beginPath();
         ctx.arc(cx, cy, R, 0, TAU);
         ctx.fillStyle = g;
         ctx.fill();
-        ctx.lineWidth = 1;
-        ctx.strokeStyle = 'rgba(132, 162, 186, 0.5)';
-        ctx.stroke();
-    }
-
-    let landCanvas = null;
-    let landCtx = null;
-
-    function drawLand() {
-        if (!landCanvas) {
-            landCanvas = document.createElement('canvas');
-            landCtx = landCanvas.getContext('2d');
-        }
-        if (landCanvas.width !== canvas.width || landCanvas.height !== canvas.height) {
-            landCanvas.width = canvas.width;
-            landCanvas.height = canvas.height;
-        }
-        const lc = landCtx;
-        lc.setTransform(1, 0, 0, 1, 0, 0);
-        lc.clearRect(0, 0, landCanvas.width, landCanvas.height);
-        lc.setTransform(dpr, 0, 0, dpr, 0, 0);
-
-        const cosP = Math.cos(pitch);
-        const sinP = Math.sin(pitch);
-        const base = Math.max(0.85, R / 132);
-        lc.beginPath();
-        for (let i = 0; i < LAND.length; i++) {
-            const d = LAND[i];
-            const x0 = d.cl * (d.sn * cosYaw + d.cn * sinYaw);
-            const z1 = d.cl * (d.cn * cosYaw - d.sn * sinYaw);
-            const y2 = d.sl * cosP - z1 * sinP;
-            const z2 = d.sl * sinP + z1 * cosP;
-            if (z2 <= 0.015) continue;
-            // polar rows converge, so shrink those dots to avoid smeared arcs
-            const rad = base * (0.4 + z2 * 0.72) * (0.58 + 0.42 * Math.sqrt(d.cl));
-            const x = cx + x0 * R;
-            const y = cy - y2 * R;
-            lc.moveTo(x + rad, y);
-            lc.arc(x, y, rad, 0, TAU);
-        }
-        lc.fillStyle = 'rgba(34, 52, 42, 0.85)';
-        lc.fill();
-
-        lc.globalCompositeOperation = 'source-atop';
-        const lit = lc.createRadialGradient(cx - R * 0.4, cy - R * 0.45, R * 0.05, cx + R * 0.26, cy + R * 0.32, R * 1.16);
-        lit.addColorStop(0, 'rgba(255, 255, 255, 0.36)');
-        lit.addColorStop(0.4, 'rgba(255, 255, 255, 0)');
-        lit.addColorStop(1, 'rgba(12, 32, 48, 0.55)');
-        lc.fillStyle = lit;
-        lc.fillRect(0, 0, W, H);
-        lc.globalCompositeOperation = 'source-over';
-
-        ctx.drawImage(landCanvas, 0, 0, W, H);
-    }
-
-    function drawFinish() {
-        const halo = ctx.createRadialGradient(cx, cy, R * 0.94, cx, cy, R * 1.14);
-        halo.addColorStop(0, 'rgba(108, 164, 206, 0.2)');
-        halo.addColorStop(0.55, 'rgba(108, 164, 206, 0.07)');
-        halo.addColorStop(1, 'rgba(108, 164, 206, 0)');
         ctx.beginPath();
-        ctx.arc(cx, cy, R * 1.14, 0, TAU);
-        ctx.fillStyle = halo;
-        ctx.fill();
+        ctx.arc(cx, cy, R - 0.5, 0, TAU);
+        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(255, 255, 255, 0.4)';
+        ctx.stroke();
     }
 
     function drawMarkers(t) {
@@ -204,99 +353,97 @@ export function createGlobe(canvas, labelLayer, opts) {
             // halo
             ctx.beginPath();
             ctx.arc(s.x, s.y, 6 + pulse * 6, 0, TAU);
-            ctx.fillStyle = 'rgba(255, 74, 23, ' + (0.14 * fade * (1 - pulse * 0.7)).toFixed(3) + ')';
+            ctx.fillStyle = 'rgba(255, 74, 23, ' + (0.16 * fade * (1 - pulse * 0.7)).toFixed(3) + ')';
             ctx.fill();
-            // ring
+            // white collar keeps the pin readable over land and sea
             ctx.beginPath();
-            ctx.arc(s.x, s.y, 4.6, 0, TAU);
-            ctx.strokeStyle = 'rgba(255, 74, 23, ' + (0.55 * fade).toFixed(3) + ')';
-            ctx.lineWidth = 1.2;
+            ctx.arc(s.x, s.y, 5.2, 0, TAU);
+            ctx.strokeStyle = 'rgba(255, 255, 255, ' + (0.9 * fade).toFixed(3) + ')';
+            ctx.lineWidth = 1.8;
             ctx.stroke();
             // core
             ctx.beginPath();
-            ctx.arc(s.x, s.y, 2.5, 0, TAU);
+            ctx.arc(s.x, s.y, 2.7, 0, TAU);
             ctx.fillStyle = 'rgba(255, 74, 23, ' + fade.toFixed(3) + ')';
             ctx.fill();
+            if (p === selected) {
+                ctx.beginPath();
+                ctx.arc(s.x, s.y, 9, 0, TAU);
+                ctx.strokeStyle = 'rgba(255, 74, 23, ' + (0.5 * fade).toFixed(3) + ')';
+                ctx.lineWidth = 1.4;
+                ctx.stroke();
+            }
         }
     }
 
-    /* ------------------------------------------------------------- labels */
+    /* ------------------------------------------------------- name card */
 
-    function syncLabels() {
-        if (labels.length !== points.length) {
-            labelLayer.textContent = '';
-            labels = points.map((p) => {
-                const node = document.createElement('div');
-                node.className = 'glabel';
-                const flag = document.createElement('span');
-                flag.className = 'gl-flag';
-                flag.textContent = p.flag || '🌐';
-                const txt = document.createElement('span');
-                txt.className = 'gl-txt';
-                const nm = document.createElement('span');
-                nm.className = 'gl-name';
-                nm.textContent = p.name || '';
-                const ct = document.createElement('span');
-                ct.className = 'gl-city';
-                ct.textContent = p.city || '';
-                txt.appendChild(nm);
-                txt.appendChild(ct);
-                node.appendChild(flag);
-                node.appendChild(txt);
-                node.addEventListener('click', (ev) => {
-                    ev.stopPropagation();
-                    if (options.onPick) options.onPick(p);
-                });
-                labelLayer.appendChild(node);
-                return { node, p, h: 34, w: 132 };
-            });
+    const card = document.createElement('div');
+    card.className = 'glabel';
+    card.style.display = 'none';
+    const cardFlag = document.createElement('span');
+    cardFlag.className = 'gl-flag';
+    const cardTxt = document.createElement('span');
+    cardTxt.className = 'gl-txt';
+    const cardName = document.createElement('span');
+    cardName.className = 'gl-name';
+    const cardCity = document.createElement('span');
+    cardCity.className = 'gl-city';
+    cardTxt.appendChild(cardName);
+    cardTxt.appendChild(cardCity);
+    card.appendChild(cardFlag);
+    card.appendChild(cardTxt);
+    labelLayer.appendChild(card);
+    card.addEventListener('click', (ev) => {
+        ev.stopPropagation();
+        if (selected && options.onPick) options.onPick(selected);
+    });
+
+    function selectPoint(p) {
+        selected = p;
+        if (!p) {
+            card.style.display = 'none';
+            return;
         }
+        cardFlag.textContent = p.flag || '🌐';
+        cardName.textContent = p.name || '';
+        cardCity.textContent = p.city || '';
+        card.style.display = '';
+        card.style.opacity = '0';
     }
 
-    function layoutLabels() {
-        const placed = [];
-        // 前面的先放，后面的避让
-        const order = labels.slice().sort((a, b) => (b.p._z || -1) - (a.p._z || -1));
-        for (const item of order) {
-            const p = item.p;
-            const visible = p._z > 0.08;
-            if (!visible) {
-                item.node.style.opacity = '0';
-                item.node.style.pointerEvents = 'none';
-                continue;
-            }
-            const w = item.node.offsetWidth || 132;
-            const h = item.node.offsetHeight || 34;
-            let x = p._x + 12;
-            let y = p._y;
-            if (x + w > W - 4) x = p._x - w - 12;
-            const tries = [0, -h - 6, h + 6, -2 * (h + 6), 2 * (h + 6)];
-            let ok = false;
-            for (const dy of tries) {
-                const yy = y + dy;
-                const box = { x, y: yy - h / 2, w, h };
-                if (box.y < 2 || box.y + h > H - 2) continue;
-                let hit = false;
-                for (const other of placed) {
-                    if (box.x < other.x + other.w + 4 && box.x + w + 4 > other.x && box.y < other.y + other.h + 4 && box.y + h + 4 > other.y) {
-                        hit = true;
-                        break;
-                    }
-                }
-                if (!hit) {
-                    y = yy;
-                    ok = true;
-                    break;
-                }
-            }
-            placed.push({ x, y: y - h / 2, w, h });
-            item.node.style.opacity = String(Math.min(1, (p._z - 0.08) / 0.3).toFixed(2));
-            item.node.style.pointerEvents = 'auto';
-            item.node.style.left = Math.round(x) + 'px';
-            item.node.style.top = Math.round(y) + 'px';
-            item.node.style.zIndex = String(10 + Math.round(p._z * 40));
-            if (!ok) item.node.style.opacity = '0.55';
+    function placeCard() {
+        const p = selected;
+        if (!p || !p._z || p._z <= 0.08) {
+            card.style.display = 'none';
+            return;
         }
+        if (card.style.display === 'none') card.style.display = '';
+        const w = card.offsetWidth || 132;
+        const h = card.offsetHeight || 34;
+        let x = p._x + 14;
+        if (x + w > W - 6) x = p._x - w - 14;
+        x = Math.max(4, x);
+        const y = Math.max(2 + h / 2, Math.min(H - 2 - h / 2, p._y));
+        card.style.left = Math.round(x) + 'px';
+        card.style.top = Math.round(y) + 'px';
+        card.style.opacity = String(Math.min(1, (p._z - 0.08) / 0.3).toFixed(2));
+    }
+
+    function pickAt(x, y) {
+        let best = null;
+        let bestD = 15 * 15;
+        for (const p of points) {
+            if (!p._z || p._z <= 0.08) continue;
+            const dx = p._x - x;
+            const dy = p._y - y;
+            const d = dx * dx + dy * dy;
+            if (d < bestD) {
+                bestD = d;
+                best = p;
+            }
+        }
+        return best;
     }
 
     /* --------------------------------------------------------------- loop */
@@ -307,45 +454,74 @@ export function createGlobe(canvas, labelLayer, opts) {
         if (!alive) return;
         const dt = last ? Math.min(60, t - last) : 16;
         last = t;
-        if (auto && !dragging) {
+        if (auto && !dragging && !selected) {
             yaw += dt * 0.00011;
             cosYaw = Math.cos(yaw);
             sinYaw = Math.sin(yaw);
         }
+        if (glOk && texReady) drawGL();
         ctx.clearRect(0, 0, W, H);
-        drawShadow();
-        drawSphere();
-        drawLand();
-        drawFinish();
+        if (!glOk || !texReady) drawFallback();
         drawMarkers(t);
-        layoutLabels();
+        placeCard();
         raf = requestAnimationFrame(frame);
     }
 
     /* ---------------------------------------------------------- interact */
 
+    function resize() {
+        const rect = canvas.getBoundingClientRect();
+        const w = Math.max(80, Math.round(rect.width));
+        const h = Math.max(80, Math.round(rect.height));
+        dpr = Math.min(2.5, window.devicePixelRatio || 1);
+        canvas.width = Math.round(w * dpr);
+        canvas.height = Math.round(h * dpr);
+        glCanvas.width = Math.round(w * dpr);
+        glCanvas.height = Math.round(h * dpr);
+        W = w;
+        H = h;
+        cx = w / 2;
+        cy = h / 2;
+        R = Math.min(w, h) * 0.43;
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        if (w >= 200) wantTexture();
+    }
+
     function onDown(ev) {
         dragging = true;
         lastX = ev.clientX;
         lastY = ev.clientY;
+        downX = ev.clientX;
+        downY = ev.clientY;
+        tapMoved = 0;
         canvas.setPointerCapture(ev.pointerId);
     }
     function onMove(ev) {
-        if (!dragging) return;
+        if (!dragging) {
+            const rect = canvas.getBoundingClientRect();
+            canvas.style.cursor = pickAt(ev.clientX - rect.left, ev.clientY - rect.top) ? 'pointer' : 'grab';
+            return;
+        }
         const dx = ev.clientX - lastX;
         const dy = ev.clientY - lastY;
         lastX = ev.clientX;
         lastY = ev.clientY;
+        tapMoved = Math.max(tapMoved, Math.abs(ev.clientX - downX) + Math.abs(ev.clientY - downY));
         yaw += dx * 0.0062;
         pitch = Math.max(-1.15, Math.min(1.15, pitch + dy * 0.005));
         cosYaw = Math.cos(yaw);
         sinYaw = Math.sin(yaw);
     }
     function onUp(ev) {
+        if (!dragging) return;
         dragging = false;
         try {
             canvas.releasePointerCapture(ev.pointerId);
         } catch (_) {}
+        if (tapMoved < 6) {
+            const rect = canvas.getBoundingClientRect();
+            selectPoint(pickAt(ev.clientX - rect.left, ev.clientY - rect.top));
+        }
     }
 
     canvas.addEventListener('pointerdown', onDown);
@@ -361,9 +537,8 @@ export function createGlobe(canvas, labelLayer, opts) {
 
     return {
         setPoints(list) {
+            selectPoint(null);
             points = (list || []).map((p, i) => Object.assign({ phase: i * 1.3 }, p));
-            labels = [];
-            syncLabels();
         },
         setAutoRotate(on) {
             auto = !!on;
@@ -384,6 +559,8 @@ export function createGlobe(canvas, labelLayer, opts) {
             canvas.removeEventListener('pointermove', onMove);
             canvas.removeEventListener('pointerup', onUp);
             canvas.removeEventListener('pointercancel', onUp);
+            card.remove();
+            glCanvas.remove();
         },
     };
 }

@@ -128,7 +128,7 @@ export function renderShell() {
     <div class="globe-head">
       <p class="eyebrow">A SMALLER WORLD</p>
       <h2>散布全球，<br><em>就在手边。</em></h2>
-      <p class="sub">点击圆点，即刻连接。</p>
+      <p class="sub">点击圆点查看主机，点名字连接。</p>
     </div>
     <div class="globe-wrap" id="globe-wrap">
       <canvas id="globe"></canvas>
