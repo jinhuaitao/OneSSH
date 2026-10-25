@@ -23,6 +23,10 @@
 | 分组收起 · 地区筛选<br><sub>可拖拽点阵地球</sub> | 账号与私钥复用<br><sub>AES-GCM 加密存储</sub> | 主机密钥强校验<br><sub>同源防护 · 日志加密</sub> |
 
 ## 🚀 部署
+### 方式一
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/jinhuaitao/OneSSH)
+
+### 方式二
 
 **1️⃣ 开通 R2 → 2️⃣ 推 GitHub → 3️⃣ 连接仓库 → 4️⃣ 部署 → 5️⃣ 设置管理员**
 
