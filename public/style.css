@@ -1011,6 +1011,52 @@ textarea {
     color: var(--accent);
     font-weight: 600;
 }
+.country-pick button.on::after {
+    content: '✓';
+    margin-left: auto;
+    font-size: 11px;
+    line-height: 1;
+}
+
+.city-pick {
+    position: relative;
+}
+.city-sug {
+    position: absolute;
+    z-index: 20;
+    bottom: calc(100% + 4px);
+    left: 0;
+    right: 0;
+    max-height: 176px;
+    overflow-y: auto;
+    padding: 4px;
+    background: #fff;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    box-shadow: var(--shadow-md);
+}
+.city-opt {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 7px 9px;
+    border: 0;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--ink-2);
+    font-size: 12px;
+    text-align: left;
+    cursor: pointer;
+}
+.city-opt:hover {
+    background: var(--paper-2);
+}
+.city-cc {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 11px;
+}
 
 .swatches {
     display: flex;

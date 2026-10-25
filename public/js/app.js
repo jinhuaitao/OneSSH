@@ -640,50 +640,90 @@ function openHostEditor(host) {
     });
     applyAuth();
 
-    /* country picker */
+    /* country + city picker */
     let country = h.country || '';
+
+    // 自己画城市建议，原生 <datalist> 弹层会吃掉紧跟着的那次点击（选地区时点不动）。
+    const cityIn = el('input', { type: 'text', value: h.city || '', placeholder: '例如 香港 / 东京', autocomplete: 'off' });
+    const citySug = el('div', { class: 'city-sug', hidden: true });
+    const cityWrap = el('div', { class: 'city-pick' }, [cityIn, citySug]);
+    const renderCitySug = () => {
+        const q = cityIn.value.trim().toLowerCase();
+        const hits = q
+            ? CITIES.filter((c) => c.n.toLowerCase().includes(q) || c.c.toLowerCase() === q)
+                  .sort((a, b) => (b.c === country) - (a.c === country))
+                  .slice(0, 8)
+            : [];
+        citySug.textContent = '';
+        if (!hits.length) {
+            citySug.hidden = true;
+            return;
+        }
+        for (const c of hits) {
+            const co = countryOf(c.c);
+            const opt = el('button', { type: 'button', class: 'city-opt' }, [
+                el('span', { class: 'flag', text: co ? co.f : '' }),
+                el('span', { text: c.n }),
+                el('span', { class: 'city-cc', text: co ? co.n : c.c }),
+            ]);
+            opt.addEventListener('mousedown', (ev) => {
+                ev.preventDefault();
+                cityIn.value = c.n;
+                citySug.hidden = true;
+            });
+            citySug.appendChild(opt);
+        }
+        citySug.hidden = false;
+    };
+    cityIn.addEventListener('input', renderCitySug);
+    cityIn.addEventListener('focus', renderCitySug);
+    const hideCitySug = (ev) => {
+        if (!cityWrap.contains(ev.target)) citySug.hidden = true;
+    };
+    document.addEventListener('pointerdown', hideCitySug, true);
+
     const countryGrid = el('div', { class: 'country-pick' });
     const countrySearch = el('input', { type: 'text', placeholder: '搜索国家 / 地区', style: 'margin-bottom:8px' });
     const countryButtons = [];
+    const selectCountry = (code) => {
+        const prev = countryOf(country);
+        country = code;
+        for (const b of countryButtons) {
+            const on = b.dataset.code === code;
+            b.classList.toggle('on', on);
+            b.setAttribute('aria-pressed', on ? 'true' : 'false');
+        }
+        citySug.hidden = true;
+        const co = countryOf(code);
+        const typed = cityIn.value.trim();
+        if (co && (!typed || (prev && typed === prev.city))) cityIn.value = co.city;
+    };
     const mkCountry = (code, label, flag) => {
-        const btn = el('button', { type: 'button', class: code === country ? 'on' : '' }, [
+        const btn = el('button', { type: 'button', class: code === country ? 'on' : '', 'aria-pressed': code === country ? 'true' : 'false' }, [
             el('span', { class: 'flag', text: flag }),
             el('span', { text: label }),
         ]);
         btn.dataset.code = code;
         btn.dataset.search = (label + ' ' + code).toLowerCase();
-        btn.addEventListener('click', () => {
-            country = code;
-            countryButtons.forEach((b) => b.classList.toggle('on', b.dataset.code === code));
-            const co = countryOf(code);
-            if (co && !cityIn.value) cityIn.value = co.city;
-        });
+        btn.addEventListener('click', () => selectCountry(code));
         countryButtons.push(btn);
         countryGrid.appendChild(btn);
     };
-    countryButtons.push(
-        (() => {
-            const btn = el('button', { type: 'button', class: country ? '' : 'on' }, [el('span', { class: 'flag', text: '🌐' }), el('span', { text: '不标注' })]);
-            btn.dataset.code = '';
-            btn.dataset.search = '不标注 none';
-            btn.addEventListener('click', () => {
-                country = '';
-                countryButtons.forEach((b) => b.classList.toggle('on', b.dataset.code === ''));
-            });
-            countryButtons.push(btn);
-            countryGrid.appendChild(btn);
-            return btn;
-        })()
+    const noneBtn = el(
+        'button',
+        { type: 'button', class: country ? '' : 'on', 'aria-pressed': country ? 'false' : 'true' },
+        [el('span', { class: 'flag', text: '🌐' }), el('span', { text: '不标注' })]
     );
+    noneBtn.dataset.code = '';
+    noneBtn.dataset.search = '不标注 none';
+    noneBtn.addEventListener('click', () => selectCountry(''));
+    countryButtons.push(noneBtn);
+    countryGrid.appendChild(noneBtn);
     COUNTRIES.forEach((c) => mkCountry(c.c, c.n, c.f));
     countrySearch.addEventListener('input', () => {
         const q = countrySearch.value.trim().toLowerCase();
         for (const b of countryButtons) b.style.display = !q || b.dataset.search.indexOf(q) >= 0 ? '' : 'none';
     });
-
-    const cityIn = el('input', { type: 'text', value: h.city || '', placeholder: '例如 香港 / 东京', list: 'city-list' });
-    const cityList = el('datalist', { id: 'city-list' });
-    CITIES.forEach((c) => cityList.appendChild(el('option', { value: c.n })));
 
     let color = h.color || (isNew ? '' : autoColor(h));
     const swatches = el('div', { class: 'swatches' });
@@ -710,12 +750,11 @@ function openHostEditor(host) {
         field('主机地址', hostIn),
         pwBox,
         keyBox,
-        el('div', { class: 'grid-2' }, [field('地区', countrySearch), field('城市', cityIn)]),
+        el('div', { class: 'grid-2' }, [field('地区', countrySearch), field('城市', cityWrap)]),
         countryGrid,
         el('div', {}, [el('div', { class: 'muted-sm', style: 'margin-bottom:6px', text: '标签颜色' }), swatches]),
         field('备注', noteIn),
         saveSecretLabel,
-        cityList,
     ]);
 
     const submit = async () => {
@@ -762,7 +801,13 @@ function openHostEditor(host) {
         el('button', { class: 'btn primary', type: 'button', text: isNew ? '添加主机' : '保存修改', onclick: submit }),
     ]);
 
-    const m = modal({ title: isNew ? '添加主机' : '编辑主机', body, footer: foot, width: '620px' });
+    const m = modal({
+        title: isNew ? '添加主机' : '编辑主机',
+        body,
+        footer: foot,
+        width: '620px',
+        onClose: () => document.removeEventListener('pointerdown', hideCitySug, true),
+    });
 }
 
 async function removeHost(host) {
