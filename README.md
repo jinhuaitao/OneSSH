@@ -1,160 +1,151 @@
 # WebSSH
 
-在浏览器里使用的 SSH 客户端。整个应用跑在 Cloudflare Workers 上：一个 Worker + 一个 R2 存储桶，**不需要服务器**。
+浏览器里的 SSH 客户端，跑在 Cloudflare Workers 上——**一个 Worker + 一个 R2 桶，不需要服务器**。
 
-![总览](docs/dashboard.png)
+| 运行环境 | 数据存放 | 打开方式 |
+| --- | --- | --- |
+| Cloudflare Workers（免费计划够用） | 你自己的 R2 桶 | 桌面 / 手机浏览器 |
 
-![终端](docs/terminal.png)
+## 功能
 
-![文件管理](docs/files.png)
+- **主机**：密码 / 私钥认证，支持域名、IPv4、IPv6，分组内按添加先后排列
+- **仪表盘**：分组收起展开、独立分组面板、地区筛选、可拖拽点阵地球
+- **终端**：多标签、实时监控（CPU / 内存 / 网络 / RTT / 负载）、特殊按键条、代码片段、会话录制
+- **文件管理**：SFTP 浏览、上传、下载、新建、重命名、删除、在线编辑
+- **凭据库**：常用账号与私钥命名复用，AES-GCM 加密后存在你自己的 R2
+- **安全**：主机密钥 TOFU 校验、登录限流、CSRF 防护
 
-![凭据库](docs/keys.png)
+## 部署
 
-- 首次打开让你设置管理员账号密码，之后用它登录
-- 浅色仪表盘：分组可收起 / 展开（状态记在本地）、独立分组面板（改名自动同步主机）、地区筛选、可拖拽的点阵地球（每台主机一个可点的城市标签）
-- 深色终端页：多标签、实时监控（CPU / 内存 / 网络 / RTT / 负载）、底部特殊按键条、代码片段一键发送、文件管理
-- 主机列表（密码 / 私钥两种认证），支持 IPv4、IPv6 和域名，凭据 AES-GCM 加密后存在你自己的 R2 里
-- 凭据库：常用账号（用户名 + 密码）与私钥都能命名保存；账号和私钥显示使用数量，主机直接引用，不用重复填写
-- 文件管理（SFTP）：浏览、上传、下载、新建文件夹、重命名、删除、在线编辑文本文件
-- 主机密钥 TOFU 校验：首次连接弹指纹确认，之后指纹变化直接拒绝（防中间人）
-- 可选的会话录制，保存在 R2 里随时回看
-
-> SSH 协议栈是自己实现的（`src/ssh/`），只依赖 WebCrypto：`curve25519-sha256` 密钥交换、`aes{128,192,256}-ctr` 加密、`hmac-sha2-{256,512}` / `hmac-sha1` 校验、`ssh-ed25519` / `ecdsa-sha2-nistp256` / `rsa-sha2-{256,512}` / `ssh-rsa` 主机密钥，支持密码、公钥（OpenSSH / PKCS#1 / PKCS#8）、keyboard-interactive 认证。
-
----
-
-## 部署（Cloudflare 控制台 + GitHub，R2 自动创建）
-
-1. **先开通 R2**：Cloudflare 控制台 → R2 → 点一次同意条款。没开通的话，自动创建存储桶会失败，这是最常见的部署失败原因。
-2. 把这个仓库推到 GitHub（public / private 都行）。
-3. 控制台 → **Workers & Pages → Create → Workers → Connect to Git**，选中仓库。
-4. 构建设置填：
+1. **先开通 R2**：控制台 → R2 → 同意条款。没开通的话首次部署自动建桶会失败。
+2. 仓库推到 GitHub（public / private 都行）。
+3. 控制台 → **Workers & Pages → Create → Connect to Git**，选中仓库。
+4. 构建设置：
 
    | 配置项 | 值 |
    | --- | --- |
-   | Project name | `webssh`（**必须和 `wrangler.jsonc` 里的 `name` 完全一致**） |
+   | Project name | `webssh`（必须与 `wrangler.jsonc` 的 `name` 完全一致） |
    | Build command | `npm install` |
    | Deploy command | `npx wrangler deploy` |
 
-5. 点部署。`wrangler.jsonc` 里的 R2 绑定故意没写 `bucket_name`：
+5. 部署。R2 绑定故意不写桶名，首次部署会自动建桶并绑定：
 
    ```jsonc
    "r2_buckets": [{ "binding": "BUCKET" }]
    ```
 
-   所以首次部署时 Cloudflare 会**自动创建**一个以 Worker 名开头的存储桶并完成绑定，不用手工建桶、不用填 ID。
+6. 打开 `https://<worker>.<subdomain>.workers.dev`，按提示设置管理员账号密码。
 
-6. 打开 `https://<worker>.<subdomain>.workers.dev`，第一次访问会让你设置管理员账号密码。
+<details>
+<summary><b>⚠️ 两个容易踩的坑</b></summary>
 
-> ⚠️ 两个坑，先看一眼：
-> - 通过 Dashboard（GitHub）部署时，资源会被自动创建，但**创建出来的 bucket 名称不会写回仓库**。以后如果想改用本地 `wrangler deploy`，要先去控制台把 bucket 名字填进 `wrangler.jsonc` 的 `bucket_name`，否则 wrangler 会认为没有绑定、再建一套新的（看起来就像"数据丢了"）。
-> - 修改 `wrangler.jsonc` 里的 `name` 等于换一个应用：会自动创建另一套 R2，原来的数据不会跟过来。
+- Dashboard 部署会自动建桶，但**桶名不会写回仓库**。以后改用本地 `wrangler deploy` 时，先把桶名填进 `wrangler.jsonc` 的 `bucket_name`，否则 wrangler 会再建一套新的，看起来就像"数据丢了"。
+- 改 `wrangler.jsonc` 的 `name` 等于换一个应用：会创建另一套 R2，原数据不会跟过来。
 
-### 本地开发
+</details>
+
+### 本地开发与测试
 
 ```bash
 npm install
-npx wrangler dev        # http://127.0.0.1:8787，本地 R2 存在 .wrangler/ 下
-npx wrangler deploy     # 或者用 CLI 部署（需要先 wrangler login）
+npx wrangler dev                # http://127.0.0.1:8787，本地 R2 在 .wrangler/ 下
+npx wrangler deploy             # CLI 部署，需先 wrangler login
+npm test                        # 端到端：本地 sshd + wrangler dev + 真 Chrome
+node tests/e2e.mjs --headful    # 想看着它点
 ```
 
-本地 `wrangler dev` 时 R2 是本地模拟的，删掉 `.wrangler/state` 就等于清空所有数据（包括管理员账号）。
+`npm test` 覆盖初始化、分组、凭据库、主机密钥确认、终端交互、监控、代码片段、文件管理、刷新保持登录、退出登录。依赖 `ssh2`（本地 SSH 服务端）与 `playwright-core`（用本机 Chrome）。删掉 `.wrangler/state` 会清空本地全部数据。
 
-### 测试
+## 使用
 
-```bash
-npm test                # 端到端：起一个本地 sshd + wrangler dev + 真 Chrome 走完整流程
-node tests/e2e.mjs --headful   # 想看着它点的话
-```
+| 功能 | 说明 |
+| --- | --- |
+| **添加主机** | 名称、分组、地址、端口、用户名，选密码或私钥，再选地区和城市；地区和城市决定筛选标签和地球上的位置 |
+| **IPv6** | 填 `2001:db8::1` 或 `[2001:db8::1]` 都行，列表统一显示为 `user@[addr]:port` |
+| **分组** | 左侧「分组」面板新建 / 改名 / 删除；改名同步主机，删除后主机回到「未分组」；点分组标题收起展开并记住状态 |
+| **凭据库** | 「常用账号」存用户名 + 密码，「私钥」自动识别算法并计算 `SHA256:` 指纹；主机直接引用，被引用的条目不能删除 |
+| **连接** | 点主机行一键直连；没存凭据则弹窗临时输入，只在内存里用 |
+| **快速连接** | 左侧 ⚡，临时连接不落库，可勾选「同时保存到我的主机」 |
+| **文件管理** | 终端顶部「文件」走 SFTP；单文件上限 64 MB，在线编辑限 512 KB 以内的文本 |
+| **代码片段** | 左侧「代码片段」维护常用命令，终端页右上角也能打开，点一下发送到当前会话 |
+| **监控** | Linux 主机每 3 秒采样一次 `/proc`（独立 exec 通道，不打断 shell）；其他系统显示「不可用」 |
+| **特殊按键** | Ctrl / Alt、Tab / Esc、方向键、Ctrl+C / Ctrl+D、PgUp / PgDn / Home / End / Del，手机上很好用 |
+| **主机密钥** | 首次连接弹 `SHA256:...` 指纹确认（与 `ssh-keygen -lf` 一致）；服务器重装后需先删旧记录再连 |
+| **会话日志** | 设置里可默认开启录制，终端输出以文本存在 R2，随时回看 / 复制 / 删除 |
+| **快捷键** | `Ctrl/Cmd+Shift+C` 复制、`+V` 粘贴、`+F` 全屏、`+R` 重连、`+W` 关闭标签、`Alt+1..9` 切标签；终端里右键 = 粘贴 |
 
-`tests/e2e.mjs` 覆盖：初始化 → 新建分组 → 常用账号 → 添加主机（引用账号）→ 分组/筛选 → 分组收起/展开 → 凭据库 + 密钥登录 → 主机密钥确认 → 终端交互 → 监控指标 → 代码片段 → 特殊按键 → 多标签 → 文件管理（列目录/上传/编辑/下载/重命名/删除）→ 分组改名与删除 → 刷新保持登录 → 退出登录。依赖 `ssh2`（本地 SSH 服务端）与 `playwright-core`（用你机器上的 Chrome，不额外下载浏览器）。
+## 安全
 
----
+- **单管理员**：第一个完成初始化的账号就是唯一账号，没有注册入口。忘记密码只能删掉 R2 里的 `sys/admin` 和 `sess/*` 重新初始化（已存凭据会丢）。
+- **加密边界**：凭据用 AES-GCM 加密，主密钥默认也在同一个桶的 `sys/master`。这能防"桶被人翻到"，但防不了"Cloudflare 账号被攻破"。可以自带密钥：
 
-## 用起来
+  ```bash
+  npx wrangler secret put WEBSSH_MASTER_KEY   # 32 字节 base64 或 64 位 hex
+  ```
 
-- **添加主机**：名称、分组、主机、端口、用户名，选密码或私钥，再选地区和城市。地区和城市决定它在筛选标签和地球上的位置。主机地址支持域名、IPv4 和 IPv6，IPv6 直接填 `2001:db8::1` 或 `[2001:db8::1]` 都行，列表里统一显示成 `user@[addr]:port`；同一分组内按添加先后排列，新加的在下面。
-- **分组**：左侧「分组」面板里新建 / 重命名 / 删除。改名会同步所有主机，删除后主机回到「未分组」；主机编辑框的下拉里也能直接「＋ 新建分组…」。仪表盘上点分组标题即可收起或展开，状态会记住。
-- **凭据库**：左侧「凭据库」分两部分——**常用账号**保存用户名 + 密码，**私钥**自动识别算法并计算 `SHA256:` 指纹。主机认证直接选条目即可复用，用户名和密码都不用再填；被主机引用的条目不会被删除。
-- **文件管理**：进入终端后点顶部「文件」，走 SFTP 子系统浏览远程目录，支持上传、下载、新建文件夹、重命名、删除和在线编辑文本文件。单个文件上限 64 MB，在线编辑读取 512 KB 以内的文本。
-- **连接**：点主机行或「连接」。凭据保存在 R2 的话一键直连；没保存则弹窗临时输入（只在内存里用）。
-- **快速连接**：左侧 ⚡，临时连接不落库，可以顺手勾选「同时保存到我的主机」。
-- **代码片段**：左侧「代码片段」里维护常用命令；终端页右上角也能打开，点一下直接发送到当前会话。
-- **监控**：连上 Linux 主机后，顶部信息条每 3 秒刷新一次 CPU / 内存 / 网络 / RTT，数据来自 `/proc`（一次 `exec` 通道采样，不打断你的 shell）。非 Linux 会显示「不可用」。
-- **特殊按键**：底部按键条有 Ctrl / Alt 修饰键、Tab / Esc、方向键、Ctrl+C / Ctrl+D、PgUp / PgDn / Home / End / Del，手机上没有实体键盘时很好用。
-- **主机密钥**：首次连接会弹指纹确认（`SHA256:...`，和 `ssh-keygen -lf` 输出一致）。服务器重装后指纹会变，需要先在「主机密钥」里删掉旧记录再连。
-- **会话日志**：设置里可以默认开启录制。开启后终端输出会以文本形式存到 R2，在「会话日志」里查看 / 复制 / 删除。
-- **快捷键**：`Ctrl/Cmd+Shift+C` 复制选中、`Ctrl/Cmd+Shift+V` 粘贴、`Ctrl/Cmd+Shift+F` 全屏、`Ctrl/Cmd+Shift+R` 重连、`Alt+1..9` 切换标签、`Ctrl/Cmd+Shift+W` 关闭当前标签；终端里右键 = 粘贴。
+  设置后不再使用 `sys/master`，但**换密钥后旧凭据都解不开**，需要重新录入。
+- **录制是明文**：记录的是终端原始输出，可能包含命令和打印出来的密钥。
+- **登录限流**：同一 IP 10 分钟内失败 6 次，锁 15 分钟；写接口只收 `application/json`，并校验 HttpOnly + SameSite=Lax 的会话 Cookie。
+- **连不了内网**：Workers 只能连公网地址，Cloudflare 自家网段、localhost、内网地址都会被拒。
 
----
+<details>
+<summary><b>已知限制</b></summary>
 
-## 它是怎么实现的
+- 免费计划单请求 CPU 只有 10ms，`yes`、`cat` 大文件这类持续大输出可能被中断；重度使用建议 Paid 计划（$5/月，30s CPU）。
+- 监控依赖 Linux 的 `/proc`，BSD / macOS / Windows 显示「不可用」（终端本身照常可用）。
+- 暂不支持端口转发、Agent 转发、带口令的 OpenSSH 私钥（`bcrypt_pbkdf`）。带口令私钥请先 `ssh-keygen -p -m PEM` 转成无口令 PEM。
+- 只支持 `curve25519-sha256` 系列密钥交换和 CTR 系列加密，非常老的服务器（`diffie-hellman-group1-sha1` / `3des-cbc`）连不上。
+
+</details>
+
+<details>
+<summary><b>实现细节</b></summary>
 
 ```
 浏览器 (xterm.js)  ──WebSocket──▶  Worker  ──TCP(cloudflare:sockets)──▶  sshd:22
                                      │
-                                     ├── 同一条 SSH 连接：shell 通道 + exec 通道（采样 /proc）+ sftp 子系统（文件管理）
+                                     ├── 同一条 SSH 连接：shell + exec（采样 /proc）+ sftp（文件管理）
                                      └── R2：账号 / 会话 / 主机 / 分组 / 凭据库 / 已知主机密钥 / 录制 / 片段
 ```
+
+SSH 协议栈是自己实现的（`src/ssh/`），只依赖 WebCrypto：`curve25519-sha256` 密钥交换、`aes{128,192,256}-ctr` 加密、`hmac-sha2-{256,512}` / `hmac-sha1` 校验、`ssh-ed25519` / `ecdsa-sha2-nistp256` / `rsa-sha2-{256,512}` / `ssh-rsa` 主机密钥，支持密码、公钥（OpenSSH / PKCS#1 / PKCS#8）和 keyboard-interactive 认证。
 
 | 文件 | 作用 |
 | --- | --- |
 | `src/worker.js` | 路由：页面、`/api/*`、`/ws` 升级；在 fetch 处理器内建立 TCP 连接 |
 | `src/session.js` | WebSocket ↔ SSH 桥接：状态推送、主机密钥确认、窗口调整、录制、保活、监控采样 |
+| `src/hostaddr.js` | 主机地址规范化：域名 / IPv4 / IPv6（IPv6 统一补方括号） |
 | `src/ssh/client.js` | SSH-2 传输层 / 密钥交换 / 认证 / 多通道（shell + exec + sftp） |
 | `src/ssh/sftp.js` | SFTP v3 客户端：读目录、读写文件、原子保存（临时文件 + 重命名） |
 | `src/ssh/crypto.js` | CTR 密钥流（按包偏移连续）、HMAC、密钥派生、主机密钥签名校验 |
 | `src/ssh/keys.js` | OpenSSH / PKCS#1 / PKCS#8 私钥解析与签名 |
 | `src/auth.js` | PBKDF2 口令、会话 Cookie、登录限流、凭据加解密 |
 | `src/store.js` | R2 读写封装 |
-| `src/pages.js` | 单页骨架（所有数据都走 `/api/*`，HTML 里没有任何秘密） |
+| `src/pages.js` | 单页骨架（数据都走 `/api/*`，HTML 里没有任何秘密） |
 | `public/js/app.js` | 前端主控：登录、主机增删改、分组与凭据库面板、弹窗、设置 |
 | `public/js/files.js` | 文件管理弹窗：目录浏览、上传 / 下载、在线编辑 |
-| `public/js/globe.js` | 点阵地球：正交投影 + 拖拽旋转（上下左右跟手）+ 海洋渐变与大气层 + 标签跟随 |
-| `public/js/land.js` | 2°×2° 陆地掩码（构建期从 geo 数据光栅化生成，运行时零依赖） |
+| `public/js/globe.js` | 点阵地球：正交投影 + 拖拽旋转 + 海洋渐变与大气层 + 标签跟随 |
+| `public/js/land.js` | 2°×2° 陆地掩码（构建期光栅化生成，运行时零依赖） |
 | `public/js/term.js` | 终端页：多标签、WebSocket 会话、监控面板、按键条 |
 | `public/vendor/` | xterm.js（随仓库内置，不依赖 CDN） |
 
-R2 里的数据布局：
+R2 数据布局：
 
 ```
 sys/admin           管理员账号（PBKDF2-SHA256 + 随机盐）
-sys/master          凭据加密用的主密钥
+sys/master          凭据加密主密钥
 sys/snippets        代码片段
 sys/groups          分组名称列表
 sys/keys            凭据库里的私钥（AES-GCM 密文 + 算法 / 指纹）
 sys/creds           凭据库里的常用账号（密码为 AES-GCM 密文）
 sess/<token>        登录会话（30 天）
-hosts/<id>          主机配置（密码/私钥字段为 AES-GCM 密文，或引用 sys/keys / sys/creds）
+hosts/<id>          主机配置（密码 / 私钥为密文，或引用 sys/keys / sys/creds）
 known/<host>_<port> 已信任的主机密钥指纹
 logs/<id>.log       会话录制（纯文本 + 元数据）
 throttle/<ip>       登录失败计数
 ```
 
----
-
-## 安全说明（请读完）
-
-- **单管理员模型**：第一个完成初始化的账号就是唯一账号，没有注册入口。忘了密码只能清掉 R2 里的 `sys/admin` 和 `sess/*` 重新初始化（会失去已保存的凭据）。
-- **凭据加密的边界**：密码和私钥用 AES-GCM 加密后存 R2，主密钥默认也放在同一个桶的 `sys/master` 里。这能防"桶被人翻到"，但**不能防"Cloudflare 账号被攻破"**——毕竟你的 Worker 代码本身也能读到它。想更硬一点，可以自己设一个 Secret：
-
-  ```bash
-  npx wrangler secret put WEBSSH_MASTER_KEY   # 32 字节 base64，或 64 位 hex
-  ```
-
-  设置后就不会再用 `sys/master`，但**换了主密钥，之前保存的凭据都解不开**（需要重新录入）。
-- **会话记录是明文**：录下来的是终端原始输出，可能包含你敲过的命令、打印出来的密钥。不放心就别开。
-- **登录限流**：同一 IP 10 分钟内失败 6 次，锁 15 分钟。
-- **CSRF**：写接口只接受 `application/json`，并校验 `HttpOnly` + `SameSite=Lax` 的会话 Cookie。
-- **出口限制**：Workers 只能连公网地址（Cloudflare 自家 IP 段、localhost、内网地址都会被拒绝）。所以这个工具**连不了内网机器**，除非那台机器有公网入口。
-
-## 已知限制
-
-- 免费计划每个请求的 CPU 时间有限（10ms），长时间大流量输出（比如 `yes`、`cat` 大文件）可能被中断；日常运维够用，重度使用建议上 Paid 计划（$5/月，30s CPU）。
-- 监控面板依赖 Linux 的 `/proc`，BSD / macOS / Windows 主机上会显示「不可用」（终端本身照常可用）。
-- 暂不支持：端口转发、Agent 转发、带口令的 OpenSSH 私钥（`bcrypt_pbkdf`）。带口令的私钥请先用 `ssh-keygen -p -m PEM` 转成无口令 PEM。
-- 文件管理走 SFTP 子系统，需要服务器启用 `sftp-server`（OpenSSH 默认开启）。浏览器内单文件上限 64 MB，在线编辑只适合 512 KB 以内的文本文件。
-- 只支持 `curve25519-sha256` 系列密钥交换和 CTR 系列加密算法。非常老的服务器（只支持 `diffie-hellman-group1-sha1` / `3des-cbc`）连不上。
+</details>
 
 ## 许可
 
