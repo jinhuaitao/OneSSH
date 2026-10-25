@@ -56,8 +56,8 @@ varying vec3 vN;
 void main() {
     vec3 n = normalize(vN);
     // lifted and slightly washed out so the globe sits on the light dashboard
-    vec3 tex = pow(texture2D(uTex, vUv).rgb, vec3(0.66));
-    tex = mix(tex, vec3(0.90, 0.94, 0.98), 0.18);
+    vec3 tex = pow(texture2D(uTex, vUv).rgb, vec3(0.6));
+    tex = mix(tex, vec3(0.92, 0.95, 0.98), 0.26);
     vec3 L = normalize(vec3(-0.5, 0.58, 0.64));
     float diff = max(dot(n, L), 0.0);
     float lit = 0.88 + 0.26 * pow(diff, 0.9);
@@ -328,9 +328,9 @@ export function createGlobe(canvas, labelLayer, opts) {
 
     function drawFallback() {
         const g = ctx.createRadialGradient(cx - R * 0.42, cy - R * 0.46, R * 0.04, cx + R * 0.1, cy + R * 0.14, R * 1.12);
-        g.addColorStop(0, '#5d95bb');
-        g.addColorStop(0.55, '#2f668f');
-        g.addColorStop(1, '#123a5c');
+        g.addColorStop(0, '#74a8cb');
+        g.addColorStop(0.55, '#427aa2');
+        g.addColorStop(1, '#1c4870');
         ctx.beginPath();
         ctx.arc(cx, cy, R, 0, TAU);
         ctx.fillStyle = g;
