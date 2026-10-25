@@ -2,10 +2,6 @@
 
 在浏览器里使用的 SSH 客户端。整个应用跑在 Cloudflare Workers 上：一个 Worker + 一个 R2 存储桶，**不需要服务器**。
 
-![总览](docs/dashboard.png)
-
-![终端](docs/terminal.png)
-
 - 首次打开让你设置管理员账号密码，之后用它登录
 - 浅色仪表盘：主机分组、地区筛选、点阵地球（每台主机一个可点的城市标签）
 - 深色终端页：多标签、实时监控（CPU / 内存 / 网络 / RTT / 负载）、底部特殊按键条、代码片段一键发送
@@ -133,6 +129,10 @@ throttle/<ip>       登录失败计数
 - **登录限流**：同一 IP 10 分钟内失败 6 次，锁 15 分钟。
 - **CSRF**：写接口只接受 `application/json`，并校验 `HttpOnly` + `SameSite=Lax` 的会话 Cookie。
 - **出口限制**：Workers 只能连公网地址（Cloudflare 自家 IP 段、localhost、内网地址都会被拒绝）。所以这个工具**连不了内网机器**，除非那台机器有公网入口。
+
+![总览](docs/dashboard.png)
+
+![终端](docs/terminal.png)
 
 ## 已知限制
 
