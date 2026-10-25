@@ -1,5 +1,6 @@
 // WebSSH — Cloudflare Worker entry (API + WebSocket bridge + static shell)
 import { Terminal } from './session.js';
+import { normalizeHost } from './hostaddr.js';
 import { connect } from 'cloudflare:sockets';
 import * as auth from './auth.js';
 import { getJSON, putJSON, del, list, getText } from './store.js';
@@ -57,7 +58,6 @@ class HttpError extends Error {
     }
 }
 
-const HOST_RE = /^[a-zA-Z0-9._\-:[\]]+$/;
 
 function cleanHostInput(body) {
     const name = String(body.name || '').trim();
@@ -66,13 +66,14 @@ function cleanHostInput(body) {
     const port = parseInt(body.port, 10) || 22;
     const authType = body.authType === 'key' ? 'key' : 'password';
     if (!host) throw new HttpError(400, '主机地址不能为空');
-    if (!HOST_RE.test(host)) throw new HttpError(400, '主机地址只能包含字母、数字、点、下划线、冒号和短横线');
+    const addr = normalizeHost(host);
+    if (!addr) throw new HttpError(400, '主机地址不合法（支持域名、IPv4、IPv6）');
     if (!username) throw new HttpError(400, '用户名不能为空');
     if (port < 1 || port > 65535) throw new HttpError(400, '端口范围应为 1-65535');
     if (name.length > 60) throw new HttpError(400, '名称过长');
     return {
-        name: name || `${username}@${host}`,
-        host,
+        name: name || `${username}@${addr}`,
+        host: addr,
         port,
         username,
         authType,
@@ -87,7 +88,7 @@ function cleanHostInput(body) {
 
 function publicHost(h) {
     const { secretEnc, keyEnc, passphraseEnc, ...rest } = h;
-    return { ...rest, hasSecret: Boolean(secretEnc || keyEnc || h.keyId || h.credId) };
+    return { ...rest, host: normalizeHost(h.host) || h.host, hasSecret: Boolean(secretEnc || keyEnc || h.keyId || h.credId) };
 }
 
 /* ---------------------------------------------------------------- groups */
@@ -431,7 +432,7 @@ async function handleApi(request, env, url) {
                 const rec = await getJSON(env, o.key);
                 if (rec) hosts.push(publicHost(rec));
             }
-            hosts.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+            hosts.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || (a.name || '').localeCompare(b.name || ''));
             return json({ hosts });
         }
         if (method === 'POST') {
@@ -592,11 +593,12 @@ async function handleWebSocket(request, env) {
         if (!/^[a-zA-Z0-9]+$/.test(hostId)) return json({ error: 'bad_id', message: '无效的主机 ID' }, 400);
         const rec = await getJSON(env, 'hosts/' + hostId);
         if (!rec) return json({ error: 'not_found', message: '主机不存在，可能已被删除' }, 404);
-        target = { host: rec.host, port: rec.port || 22 };
+        target = { host: normalizeHost(rec.host), port: rec.port || 22 };
     } else {
-        if (!qHost || !HOST_RE.test(qHost)) return json({ error: 'bad_host', message: '主机地址不合法' }, 400);
+        const addr = normalizeHost(qHost);
+        if (!addr) return json({ error: 'bad_host', message: '主机地址不合法' }, 400);
         if (qPort < 1 || qPort > 65535) return json({ error: 'bad_port', message: '端口不合法' }, 400);
-        target = { host: qHost, port: qPort };
+        target = { host: addr, port: qPort };
     }
 
     let socket;

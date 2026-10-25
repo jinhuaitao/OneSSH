@@ -529,7 +529,7 @@ function openHostEditor(host) {
     });
 
     const userIn = el('input', { type: 'text', value: h.username || 'root', placeholder: 'root', autocomplete: 'off' });
-    const hostIn = el('input', { type: 'text', value: h.host || '', placeholder: '192.0.2.10 或 example.com', spellcheck: 'false' });
+    const hostIn = el('input', { type: 'text', name: 'host', value: h.host || '', placeholder: '192.0.2.10、example.com 或 2001:db8::1', spellcheck: 'false' });
     const portIn = el('input', { type: 'number', value: h.port || 22, min: '1', max: '65535' });
 
     const pwIn = el('input', { type: 'password', autocomplete: 'new-password', placeholder: h.hasSecret ? '已保存，留空则不修改' : '登录密码' });
@@ -1424,7 +1424,7 @@ function openSettings() {
 function openQuickConnect() {
     setNav('quick');
     const userIn = el('input', { type: 'text', value: 'root', autocomplete: 'off' });
-    const hostIn = el('input', { type: 'text', placeholder: 'example.com 或 192.0.2.10', spellcheck: 'false' });
+    const hostIn = el('input', { type: 'text', name: 'host', placeholder: 'example.com、192.0.2.10 或 2001:db8::1', spellcheck: 'false' });
     const portIn = el('input', { type: 'number', value: '22', min: '1', max: '65535' });
     const pwIn = el('input', { type: 'password', autocomplete: 'off', placeholder: '登录密码' });
     const keyIn = el('textarea', { placeholder: '-----BEGIN OPENSSH PRIVATE KEY-----', spellcheck: 'false' });

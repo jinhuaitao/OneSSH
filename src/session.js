@@ -4,6 +4,7 @@ import { SSHClient } from './ssh/client.js';
 import { SFTPClient, OPEN, b64encode, b64decode, isDirMode, isLinkMode, modeString } from './ssh/sftp.js';
 import { getJSON, putJSON, putText } from './store.js';
 import { decryptSecret, randomHex } from './auth.js';
+import { normalizeHost } from './hostaddr.js';
 
 const MAX_FILE = 64 * 1024 * 1024;
 const READ_CHUNK = 128 * 1024;
@@ -11,7 +12,7 @@ const WRITE_CHUNK = 64 * 1024;
 const EDIT_MAX = 512 * 1024;
 
 export function knownKey(host, port) {
-    return 'known/' + String(host).toLowerCase().replace(/[^a-z0-9.\-:]/g, '_') + '_' + port;
+    return 'known/' + String(host).toLowerCase().replace(/[^a-z0-9.\-:\[\]]/g, '_') + '_' + port;
 }
 
 const enc = new TextEncoder();
@@ -208,9 +209,9 @@ export class Terminal {
             }
         }
 
-        if (!host) throw new Error('缺少主机地址');
+        host = normalizeHost(host);
+        if (!host) throw new Error('主机地址不合法（支持域名、IPv4、IPv6）');
         if (!username) throw new Error('缺少用户名');
-        if (!/^[a-zA-Z0-9._\-:\[\]]+$/.test(host)) throw new Error('主机地址包含非法字符');
         if (port < 1 || port > 65535) throw new Error('端口不合法');
 
         this.meta = { host, port, user: username };
