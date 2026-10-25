@@ -3,7 +3,7 @@ import { Terminal } from './session.js';
 import { normalizeHost } from './hostaddr.js';
 import { connect } from 'cloudflare:sockets';
 import * as auth from './auth.js';
-import { getJSON, putJSON, del, list, getText } from './store.js';
+import { getJSON, putJSON, del, list, getBytes } from './store.js';
 import { renderShell } from './pages.js';
 import { loadPrivateKey } from './ssh/keys.js';
 import { fingerprint } from './ssh/crypto.js';
@@ -14,10 +14,29 @@ const SECURITY_HEADERS = {
     'X-Content-Type-Options': 'nosniff',
     'X-Frame-Options': 'DENY',
     'Referrer-Policy': 'no-referrer',
+    'Cross-Origin-Opener-Policy': 'same-origin',
+    'Cross-Origin-Resource-Policy': 'same-origin',
+    'Permissions-Policy': 'geolocation=(), microphone=(), camera=(), payment=(), usb=()',
     'Content-Security-Policy':
         "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; " +
-        "connect-src 'self' ws: wss:; font-src 'self' data:; base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
+        "connect-src 'self'; font-src 'self' data:; object-src 'none'; frame-src 'none'; worker-src 'none'; " +
+        "base-uri 'none'; form-action 'self'; frame-ancestors 'none'",
 };
+
+const MAX_BODY = 4 * 1024 * 1024;
+const MIN_PASSWORD = 10;
+const WEAK_PASSWORDS = new Set([
+    '1234567890', '12345678', '123456789', 'password', 'password1', 'password123',
+    'qwertyuiop', 'admin12345', 'administrator', 'letmein123', 'iloveyou123', 'webssh12345',
+]);
+
+function securityHeaders(request) {
+    const headers = { ...SECURITY_HEADERS };
+    if (new URL(request.url).protocol === 'https:') {
+        headers['Strict-Transport-Security'] = 'max-age=31536000; includeSubDomains';
+    }
+    return headers;
+}
 
 function json(data, status = 200, extraHeaders) {
     return new Response(JSON.stringify(data), {
@@ -31,12 +50,12 @@ function json(data, status = 200, extraHeaders) {
     });
 }
 
-function html(body) {
+function html(body, request) {
     return new Response(body, {
         headers: {
             'content-type': 'text/html; charset=utf-8',
-            'cache-control': 'no-cache',
-            ...SECURITY_HEADERS,
+            'cache-control': 'no-store',
+            ...(request ? securityHeaders(request) : SECURITY_HEADERS),
         },
     });
 }
@@ -44,11 +63,35 @@ function html(body) {
 async function readJSON(request) {
     const ct = request.headers.get('content-type') || '';
     if (!ct.includes('application/json')) throw new HttpError(415, '请求必须使用 application/json');
+    const declared = parseInt(request.headers.get('content-length') || '0', 10);
+    if (declared > MAX_BODY) throw new HttpError(413, '请求体过大');
+    const text = await request.text();
+    if (text.length > MAX_BODY) throw new HttpError(413, '请求体过大');
     try {
-        return await request.json();
+        return JSON.parse(text);
     } catch (_) {
         throw new HttpError(400, '请求体不是合法 JSON');
     }
+}
+
+/**
+ * CSRF / 跨站 WebSocket 劫持防线：浏览器发出的跨站请求一定带 Origin，
+ * 只要 Origin 存在就必须与本服务同源。非浏览器客户端（无 Origin）放行。
+ */
+function assertSameOrigin(request) {
+    const origin = request.headers.get('origin');
+    if (!origin) return;
+    const url = new URL(request.url);
+    if (origin !== url.protocol + '//' + url.host) throw new HttpError(403, '跨站请求已被拒绝');
+}
+
+function checkPassword(password, username) {
+    const pw = String(password || '');
+    if (pw.length < MIN_PASSWORD) return `密码至少 ${MIN_PASSWORD} 位`;
+    if (pw.length > 200) return '密码不能超过 200 位';
+    if (WEAK_PASSWORDS.has(pw.toLowerCase())) return '这个密码太常见了，换一个更不容易被猜到的';
+    if (username && pw.toLowerCase() === String(username).toLowerCase()) return '密码不能与用户名相同';
+    return null;
 }
 
 class HttpError extends Error {
@@ -196,6 +239,7 @@ function publicCredMeta(c) {
 async function handleApi(request, env, url) {
     const path = url.pathname;
     const method = request.method;
+    if (method !== 'GET' && method !== 'HEAD') assertSameOrigin(request);
 
     if (path === '/api/state' && method === 'GET') {
         const admin = await auth.getAdmin(env);
@@ -204,8 +248,8 @@ async function handleApi(request, env, url) {
             setup: Boolean(admin),
             authed: Boolean(session),
             user: session ? session.u : null,
+            needsSetupToken: Boolean(env.WEBSSH_SETUP_TOKEN),
             version: VERSION,
-            username: admin ? admin.username : null,
         });
     }
 
@@ -213,19 +257,24 @@ async function handleApi(request, env, url) {
         const admin = await auth.getAdmin(env);
         if (admin) return json({ error: 'already_setup', message: '系统已经完成初始化' }, 409);
         const body = await readJSON(request);
+        // 公开部署时防止陌生人抢先初始化：设置了 WEBSSH_SETUP_TOKEN 就必须带上它
+        if (env.WEBSSH_SETUP_TOKEN && !auth.safeEqual(String(body.token || ''), String(env.WEBSSH_SETUP_TOKEN))) {
+            return json({ error: 'bad_token', message: '初始化口令不正确' }, 403);
+        }
         const username = String(body.username || '').trim();
         const password = String(body.password || '');
         if (!/^[a-zA-Z0-9_.@-]{3,32}$/.test(username)) {
             return json({ error: 'bad_username', message: '用户名需为 3-32 位字母、数字或 _ . @ -' }, 400);
         }
-        if (password.length < 8) return json({ error: 'weak_password', message: '密码至少 8 位' }, 400);
+        const pwError = checkPassword(password, username);
+        if (pwError) return json({ error: 'weak_password', message: pwError }, 400);
         await auth.createAdmin(env, username, password);
         const token = await auth.createSession(env, username, request);
         return json({ ok: true }, 200, { 'set-cookie': auth.sessionCookie(token, request) });
     }
 
     if (path === '/api/login' && method === 'POST') {
-        const ip = request.headers.get('cf-connecting-ip') || '';
+        const ip = request.headers.get('cf-connecting-ip') || 'local';
         const throttle = await auth.checkThrottle(env, ip);
         if (throttle.locked) {
             return json(
@@ -259,12 +308,28 @@ async function handleApi(request, env, url) {
     }
 
     if (path === '/api/password' && method === 'POST') {
+        const ip = request.headers.get('cf-connecting-ip') || 'local';
+        const throttle = await auth.checkThrottle(env, ip);
+        if (throttle.locked) {
+            return json(
+                { error: 'locked', message: `尝试次数过多，请 ${Math.ceil(throttle.retryAfter / 60)} 分钟后再试` },
+                429,
+                { 'retry-after': String(throttle.retryAfter) }
+            );
+        }
         const body = await readJSON(request);
         const admin = await auth.verifyLogin(env, session.u, body.current);
-        if (!admin) return json({ error: 'bad_credentials', message: '当前密码不正确' }, 401);
-        if (String(body.next || '').length < 8) return json({ error: 'weak_password', message: '新密码至少 8 位' }, 400);
-        await auth.createAdmin(env, admin.username, String(body.next));
-        await auth.destroySession(env, session.token);
+        if (!admin) {
+            await auth.recordFailure(env, ip);
+            return json({ error: 'bad_credentials', message: '当前密码不正确' }, 401);
+        }
+        const next = String(body.next || '');
+        const pwError = checkPassword(next, admin.username);
+        if (pwError) return json({ error: 'weak_password', message: pwError }, 400);
+        await auth.clearFailures(env, ip);
+        await auth.createAdmin(env, admin.username, next);
+        // 改密意味着旧凭据可能已泄露：踢掉所有设备，再给当前浏览器发一枚新 token
+        await auth.destroyAllSessions(env);
         const token = await auth.createSession(env, admin.username, request);
         return json({ ok: true }, 200, { 'set-cookie': auth.sessionCookie(token, request) });
     }
@@ -438,6 +503,9 @@ async function handleApi(request, env, url) {
         if (method === 'POST') {
             const body = await readJSON(request);
             const base = cleanHostInput(body);
+            if (body.id != null && !/^[a-zA-Z0-9]{1,40}$/.test(String(body.id))) {
+                return json({ error: 'bad_id', message: '无效的主机 ID' }, 400);
+            }
             const id = body.id || 'h' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
             const existing = body.id ? await getJSON(env, 'hosts/' + id) : null;
             if (body.id && !existing) return json({ error: 'not_found', message: '主机不存在' }, 404);
@@ -507,7 +575,7 @@ async function handleApi(request, env, url) {
             const clean = list
                 .filter((s) => s && typeof s.command === 'string' && s.command.trim())
                 .map((s) => ({
-                    id: String(s.id || 's' + Math.random().toString(36).slice(2, 9)).slice(0, 24),
+                    id: /^[a-zA-Z0-9]{1,24}$/.test(String(s.id || '')) ? String(s.id) : 's' + auth.randomHex(4),
                     name: String(s.name || '').slice(0, 60) || s.command.slice(0, 30),
                     command: String(s.command).slice(0, 2000),
                 }));
@@ -529,7 +597,9 @@ async function handleApi(request, env, url) {
         }
         if (method === 'DELETE') {
             const key = url.searchParams.get('key') || '';
-            if (!key.startsWith('known/')) return json({ error: 'bad_key', message: '无效的记录' }, 400);
+            if (!/^known\/[a-zA-Z0-9._:\-\[\]]{1,300}$/.test(key) || key.includes('..')) {
+                return json({ error: 'bad_key', message: '无效的记录' }, 400);
+            }
             await del(env, key);
             return json({ ok: true });
         }
@@ -553,17 +623,28 @@ async function handleApi(request, env, url) {
         }
         if (method === 'DELETE') {
             const key = url.searchParams.get('key') || '';
-            if (!key.startsWith('logs/') || key.includes('..')) return json({ error: 'bad_key', message: '无效的记录' }, 400);
+            if (!/^logs\/[a-zA-Z0-9._\-]{1,120}$/.test(key) || key.includes('..')) {
+                return json({ error: 'bad_key', message: '无效的记录' }, 400);
+            }
             await del(env, key);
             return json({ ok: true });
         }
     }
 
     if (path.startsWith('/api/logs/') && method === 'GET') {
-        const key = decodeURIComponent(path.slice('/api/logs/'.length));
-        if (!key.startsWith('logs/') || key.includes('..')) return json({ error: 'bad_key', message: '无效的记录' }, 400);
-        const text = await getText(env, key);
-        if (text == null) return json({ error: 'not_found', message: '记录不存在' }, 404);
+        let key;
+        try {
+            key = decodeURIComponent(path.slice('/api/logs/'.length));
+        } catch (_) {
+            return json({ error: 'bad_key', message: '无效的记录' }, 400);
+        }
+        if (!/^logs\/[a-zA-Z0-9._\-]{1,120}$/.test(key) || key.includes('..')) {
+            return json({ error: 'bad_key', message: '无效的记录' }, 400);
+        }
+        const obj = await getBytes(env, key);
+        if (!obj) return json({ error: 'not_found', message: '记录不存在' }, 404);
+        // 新记录以主密钥加密落盘；旧记录仍是明文，直接原样返回
+        const text = obj.meta.enc ? new TextDecoder().decode(await auth.decryptBytes(env, obj.bytes)) : new TextDecoder().decode(obj.bytes);
         return new Response(text, {
             headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', ...SECURITY_HEADERS },
         });
@@ -577,6 +658,7 @@ async function handleApi(request, env, url) {
 async function handleWebSocket(request, env) {
     const upgrade = request.headers.get('upgrade') || '';
     if (upgrade.toLowerCase() !== 'websocket') return json({ error: 'upgrade_required' }, 426);
+    assertSameOrigin(request);
     const session = await auth.getSession(env, request);
     if (!session) return json({ error: 'unauthorized', message: '登录已过期，请重新登录' }, 401);
 
@@ -644,18 +726,26 @@ export default {
                 return html(
                     '<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;padding:40px;line-height:1.7">' +
                         '<h2>缺少 R2 存储绑定</h2><p>这个 Worker 需要 R2 绑定 <code>BUCKET</code>。' +
-                        '在 wrangler.jsonc 中声明 <code>{ "binding": "BUCKET" }</code> 后重新部署即可自动创建。</p></body>'
+                        '在 wrangler.jsonc 中声明 <code>{ "binding": "BUCKET" }</code> 后重新部署即可自动创建。</p></body>',
+                    request
                 );
             }
             if (path === '/ws') return await handleWebSocket(request, env);
             if (path.startsWith('/api/')) return await handleApi(request, env, url);
-            if (path === '/' || path === '/index.html') return html(renderShell());
-            if (env.ASSETS) return env.ASSETS.fetch(request);
-            return new Response('Not found', { status: 404 });
+            if (path === '/' || path === '/index.html') return html(renderShell(), request);
+            if (env.ASSETS) {
+                const res = await env.ASSETS.fetch(request);
+                const headers = new Headers(res.headers);
+                for (const [k, v] of Object.entries(securityHeaders(request))) {
+                    if (!headers.has(k)) headers.set(k, v);
+                }
+                return new Response(res.body, { status: res.status, statusText: res.statusText, headers });
+            }
+            return new Response('Not found', { status: 404, headers: SECURITY_HEADERS });
         } catch (e) {
             const status = e instanceof HttpError ? e.status : 500;
-            if (path.startsWith('/api/')) {
-                return json({ error: 'internal', message: String((e && e.message) || e) }, status);
+            if (path.startsWith('/api/') || path === '/ws') {
+                return json({ error: status === 500 ? 'internal' : 'rejected', message: String((e && e.message) || e) }, status);
             }
             return new Response('Error: ' + String((e && e.message) || e), { status });
         }

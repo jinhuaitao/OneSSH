@@ -470,13 +470,19 @@ export class SSHClient {
         );
 
         const sigResult = await C.verifyHostKeySignature(hostKeyBlob, sigBlob, H);
+        // 签名对不上说明对面拿不出这把主机私钥（典型 MITM），无论用户怎么点都不该继续
+        if (!sigResult.verified) {
+            throw new Error(
+                '主机密钥签名校验失败：' + (sigResult.reason || '无有效签名') + '，已中止连接（可能是中间人攻击）'
+            );
+        }
         const fp = await C.fingerprint(hostKeyBlob);
         const accepted = await this.onHostKey({
             type: sigResult.type,
             fingerprint: fp,
             keyBlob: hostKeyBlob,
-            signatureValid: sigResult.verified,
-            signatureError: sigResult.reason,
+            signatureValid: true,
+            signatureError: null,
         });
         if (!accepted) throw new Error('主机密钥未被接受，连接已中止');
 

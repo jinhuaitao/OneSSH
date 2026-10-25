@@ -137,7 +137,7 @@ function bindAuth() {
         const btn = setupForm.querySelector('button[type="submit"]');
         btn.disabled = true;
         try {
-            await api('/api/setup', { method: 'POST', body: { username, password } });
+            await api('/api/setup', { method: 'POST', body: { username, password, token: String(fd.get('token') || '') } });
             state.setup = true;
             state.authed = true;
             state.user = username;
@@ -1411,7 +1411,7 @@ function openSettings() {
     const recordIn = el('input', { type: 'checkbox', checked: !!state.settings.record });
 
     const curIn = el('input', { type: 'password', autocomplete: 'current-password' });
-    const nextIn = el('input', { type: 'password', autocomplete: 'new-password', placeholder: '至少 8 位' });
+    const nextIn = el('input', { type: 'password', autocomplete: 'new-password', placeholder: '至少 10 位' });
     const pwMsg = el('p', { class: 'form-error', style: 'margin:0' });
 
     const body = el('div', { style: 'display:flex;flex-direction:column;gap:16px' }, [
@@ -1419,7 +1419,7 @@ function openSettings() {
             el('div', { class: 'muted-sm', text: '终端字号' }),
             el('div', { style: 'display:flex;align-items:center;gap:10px' }, [sizeIn, sizeVal]),
         ]),
-        el('label', { class: 'check' }, [recordIn, el('span', { text: '默认录制会话输出（保存在 R2，可随时回看）' })]),
+        el('label', { class: 'check' }, [recordIn, el('span', { text: '默认录制会话输出（加密后保存在 R2，可随时回看）' })]),
         el('hr', { style: 'border:0;border-top:1px solid #f0ebe2;margin:2px 0' }),
         el('div', { class: 'eyebrow', style: 'margin:0', text: 'CHANGE PASSWORD' }),
         field('当前密码', curIn),
@@ -1435,8 +1435,8 @@ function openSettings() {
             text: '修改密码',
             onclick: async () => {
                 pwMsg.textContent = '';
-                if (!nextIn.value || nextIn.value.length < 8) {
-                    pwMsg.textContent = '新密码至少 8 位';
+                if (!nextIn.value || nextIn.value.length < 10) {
+                    pwMsg.textContent = '新密码至少 10 位';
                     return;
                 }
                 const res = await safe(() => api('/api/password', { method: 'POST', body: { current: curIn.value, next: nextIn.value } }));
@@ -1634,7 +1634,9 @@ async function boot() {
     }
     state.setup = !!info.setup;
     state.authed = !!info.authed;
-    state.user = info.user || info.username || '';
+    state.user = info.user || '';
+    const tokenField = $('#setup-token-field');
+    if (tokenField) tokenField.hidden = !info.needsSetupToken;
     if (!state.setup) showAuth('setup');
     else if (!state.authed) showAuth('login');
     else enterApp();

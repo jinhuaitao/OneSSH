@@ -19,5 +19,7 @@ export function normalizeHost(input) {
         return inner && isIPv6(inner) ? '[' + inner.toLowerCase() + ']' : '';
     }
     if (raw.includes(':')) return isIPv6(raw) ? '[' + raw.toLowerCase() + ']' : '';
-    return /^[a-zA-Z0-9._-]+$/.test(raw) ? raw : '';
+    if (!/^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$/.test(raw)) return '';
+    if (raw.includes('..') || raw.length > 253) return '';
+    return raw;
 }

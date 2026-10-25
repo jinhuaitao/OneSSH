@@ -20,7 +20,7 @@
 | :---: | :---: | :---: |
 | 域名 / IPv4 / IPv6<br><sub>密码或私钥认证</sub> | 多标签 · 实时监控<br><sub>按键条 · 代码片段</sub> | SFTP 全功能<br><sub>浏览 / 上传 / 在线编辑</sub> |
 | **🗺️ 仪表盘** | **🔑 凭据库** | **🛡️ 安全** |
-| 分组收起 · 地区筛选<br><sub>可拖拽点阵地球</sub> | 账号与私钥复用<br><sub>AES-GCM 加密存储</sub> | 主机密钥 TOFU<br><sub>登录限流 · CSRF</sub> |
+| 分组收起 · 地区筛选<br><sub>可拖拽点阵地球</sub> | 账号与私钥复用<br><sub>AES-GCM 加密存储</sub> | 主机密钥强校验<br><sub>同源防护 · 日志加密</sub> |
 
 ## 🚀 部署
 
@@ -65,7 +65,7 @@ npm test                        # 端到端：本地 sshd + wrangler dev + 真 C
 node tests/e2e.mjs --headful    # 想看着它点
 ```
 
-`npm test` 覆盖初始化、分组、凭据库、主机密钥确认、终端交互、监控、代码片段、文件管理、刷新保持登录、退出登录；依赖 `ssh2` 与 `playwright-core`（用本机 Chrome）。删掉 `.wrangler/state` 会清空本地全部数据。
+`npm test` 覆盖初始化（含初始化口令）、分组、凭据库、主机密钥确认、终端交互、监控、代码片段、文件管理、刷新保持登录、退出登录，以及安全项：响应头、跨站写请求 / WebSocket 被拒、改密踢掉其它设备、加密日志读回。依赖 `ssh2` 与 `playwright-core`（用本机 Chrome）。删掉 `.wrangler/state` 会清空本地全部数据。
 
 ## 🧭 使用
 
@@ -112,16 +112,24 @@ node tests/e2e.mjs --headful    # 想看着它点
 
 ## 🔐 安全
 
-- 👤 **单管理员**：第一个完成初始化的账号就是唯一账号，没有注册入口。忘记密码只能删掉 R2 里的 `sys/admin` 和 `sess/*` 重新初始化（已存凭据会丢）。
-- 🔒 **加密边界**：凭据用 AES-GCM 加密，主密钥默认也在同一个桶的 `sys/master`。这能防「桶被人翻到」，但防不了「Cloudflare 账号被攻破」。可以自带密钥：
+- 👤 **单管理员**：第一个完成初始化的账号就是唯一账号，没有注册入口。忘记密码只能删掉 R2 里的 `sys/admin` 和 `sess/*` 重新初始化（主密钥不变，已存凭据仍能解开）。
+- 🎟️ **初始化口令（建议公开部署时设置）**：设了 `WEBSSH_SETUP_TOKEN`，第一次初始化必须带上它，陌生人抢不走管理员：
+
+  ```bash
+  npx wrangler secret put WEBSSH_SETUP_TOKEN   # 或在控制台 Workers → 设置 → 变量 里加
+  ```
+
+- 🔑 **口令与会话**：密码至少 10 位、拒绝常见弱口令；PBKDF2-SHA256（10 万次迭代）加盐存储，校验用恒定时间比较。会话是 HttpOnly + SameSite=Lax 的随机 256 位 token，30 天绝对过期、7 天空闲过期，**改密后其它设备立即掉线**。
+- 🧱 **跨站防线**：所有写接口和 WebSocket 升级都校验 `Origin` 同源，挡 CSRF 和跨站 WebSocket 劫持；页面带 `CSP`（`connect-src 'self'`、`object-src 'none'`、`frame-ancestors 'none'`）、`COOP` / `CORP` / `Permissions-Policy`，HTTPS 下加 `HSTS`。
+- 🛡️ **主机密钥强校验**：握手时先验证服务器签名，拿不出这把主机私钥就直接断开（中间人无法用「点继续」绕过）；首次连接记录指纹，之后指纹变化自动拒绝。
+- 🔒 **加密边界**：主机密码、私钥、常用账号、**会话录制**都用 AES-GCM 加密。主密钥默认放在同一个桶的 `sys/master` —— 防「桶被人翻到」，防不了「Cloudflare 账号被攻破」。可以自带密钥：
 
   ```bash
   npx wrangler secret put WEBSSH_MASTER_KEY   # 32 字节 base64 或 64 位 hex
   ```
 
   设置后不再使用 `sys/master`，但**换密钥后旧凭据都解不开**，需要重新录入。
-- 📝 **录制是明文**：记录的是终端原始输出，可能包含命令和打印出来的密钥。
-- 🚦 **登录限流**：同一 IP 10 分钟内失败 6 次，锁 15 分钟；写接口只收 `application/json`，并校验 HttpOnly + SameSite=Lax 的会话 Cookie。
+- 🚦 **登录限流**：同一 IP 10 分钟内失败 6 次，锁 15 分钟；写接口只收 `application/json` 且限制请求体大小；账号是否存在不体现在响应内容或耗时上。
 - 🌍 **连不了内网**：Workers 只能连公网地址，Cloudflare 自家网段、localhost、内网地址都会被拒。
 
 <details>
@@ -173,15 +181,15 @@ R2 数据布局：
 
 ```
 sys/admin           管理员账号（PBKDF2-SHA256 + 随机盐）
-sys/master          凭据加密主密钥
+sys/master          凭据加密主密钥（可用 WEBSSH_MASTER_KEY 覆盖）
 sys/snippets        代码片段
 sys/groups          分组名称列表
 sys/keys            凭据库里的私钥（AES-GCM 密文 + 算法 / 指纹）
 sys/creds           凭据库里的常用账号（密码为 AES-GCM 密文）
-sess/<token>        登录会话（30 天）
+sess/<token>        登录会话（30 天绝对过期 / 7 天空闲过期）
 hosts/<id>          主机配置（密码 / 私钥为密文，或引用 sys/keys / sys/creds）
 known/<host>_<port> 已信任的主机密钥指纹
-logs/<id>.log       会话录制（纯文本 + 元数据）
+logs/<id>.log       会话录制（AES-GCM 密文 + 元数据）
 throttle/<ip>       登录失败计数
 ```
 

@@ -469,23 +469,15 @@ export function createTerminalView(cfg) {
     /* ------------------------------------------------------- auth dialogs */
 
     function askHostKey(s, msg) {
-        const ok = msg.signatureValid !== false;
         const body = el('div', { style: 'display:flex;flex-direction:column;gap:12px' }, [
             el('p', {
                 class: 'note-box',
                 style: 'margin:0',
-                html:
-                    '首次连接到 <b>' + msg.host + ':' + msg.port + '</b>，请确认下面这台主机的身份。' +
+                text:
+                    '首次连接到 ' + msg.host + ':' + msg.port + '，请确认下面这台主机的身份。' +
                     '接受后会记入「主机密钥」，之后指纹变化将自动拒绝连接。',
             }),
             el('div', { class: 'fp', text: (msg.type || '') + '\n' + (msg.fingerprint || '') }),
-            ok
-                ? null
-                : el('p', {
-                      class: 'note-box',
-                      style: 'margin:0;color:#d9402f',
-                      html: '<b>警告：</b>服务器签名校验失败 —— ' + (msg.signatureError || '签名无效') + '，这可能不是一台正常的 SSH 服务器。',
-                  }),
         ]);
         const foot = el('div', { style: 'display:flex;gap:8px' }, [
             el('button', {
@@ -498,9 +490,9 @@ export function createTerminalView(cfg) {
                 },
             }),
             el('button', {
-                class: 'btn ' + (ok ? 'primary' : 'danger'),
+                class: 'btn primary',
                 type: 'button',
-                text: ok ? '信任并保存' : '仍然继续',
+                text: '信任并保存',
                 onclick: () => {
                     send(s, { t: 'hostkey', id: msg.id, accept: true });
                     m.close();

@@ -2,8 +2,8 @@
 import { connect } from 'cloudflare:sockets';
 import { SSHClient } from './ssh/client.js';
 import { SFTPClient, OPEN, b64encode, b64decode, isDirMode, isLinkMode, modeString } from './ssh/sftp.js';
-import { getJSON, putJSON, putText } from './store.js';
-import { decryptSecret, randomHex } from './auth.js';
+import { getJSON, putJSON, putBytes } from './store.js';
+import { decryptSecret, randomHex, encryptBytes } from './auth.js';
 import { normalizeHost } from './hostaddr.js';
 
 const MAX_FILE = 64 * 1024 * 1024;
@@ -603,7 +603,9 @@ export class Terminal {
                 this.start(data);
                 break;
             case 'input':
-                if (this.client && data.data) this.client.write(data.data);
+                if (this.client && typeof data.data === 'string' && data.data.length <= 1024 * 1024) {
+                    this.client.write(data.data);
+                }
                 break;
             case 'resize':
                 if (this.client) this.client.resize(clampInt(data.cols, 20, 500, 80), clampInt(data.rows, 5, 200, 24));
@@ -658,13 +660,15 @@ export class Terminal {
         if (this.recording && this.recBytes > 0) {
             try {
                 const id = new Date().toISOString().replace(/[:.]/g, '-') + '-' + randomHex(4);
-                await putText(this.env, 'logs/' + id + '.log', this.recChunks.join(''), {
+                const bytes = enc.encode(this.recChunks.join(''));
+                await putBytes(this.env, 'logs/' + id + '.log', await encryptBytes(this.env, bytes), {
                     host: this.meta.host,
                     port: String(this.meta.port),
                     user: this.meta.user,
                     started: new Date().toISOString(),
                     bytes: String(this.recBytes),
                     reason: String(reason || ''),
+                    enc: 'v1',
                 });
             } catch (_) {}
         }

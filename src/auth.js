@@ -7,6 +7,10 @@ const SESSION_PREFIX = 'sess/';
 // Workers 生产运行时拒绝 >100000 的 PBKDF2 迭代（NotSupportedError），本地 dev 不检查
 const PBKDF2_ITER = 100000;
 const SESSION_TTL = 30 * 24 * 3600 * 1000;
+const SESSION_IDLE = 7 * 24 * 3600 * 1000;
+const SESSION_TOUCH = 3600 * 1000;
+// 用户名不存在时也跑一次 PBKDF2，避免用响应时间判断账号是否存在
+const DUMMY_SALT = '00112233445566778899aabbccddeeff';
 
 const te = new TextEncoder();
 
@@ -65,9 +69,11 @@ export async function createAdmin(env, username, password) {
 
 export async function verifyLogin(env, username, password) {
     const admin = await getAdmin(env);
+    const salt = admin && admin.salt ? admin.salt : DUMMY_SALT;
+    const iterations = (admin && admin.iterations) || PBKDF2_ITER;
+    const hash = await hashPassword(String(password || ''), salt, iterations);
     if (!admin) return null;
-    if (String(admin.username).toLowerCase() !== String(username || '').toLowerCase()) return null;
-    const hash = await hashPassword(password || '', admin.salt, admin.iterations || PBKDF2_ITER);
+    if (!safeEqual(String(admin.username).toLowerCase(), String(username || '').toLowerCase())) return null;
     if (!safeEqual(hash, admin.hash)) return null;
     return admin;
 }
@@ -84,7 +90,14 @@ export function parseCookies(header) {
     for (const part of header.split(';')) {
         const i = part.indexOf('=');
         if (i < 0) continue;
-        out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+        const name = part.slice(0, i).trim();
+        let value = part.slice(i + 1).trim();
+        try {
+            value = decodeURIComponent(value);
+        } catch (_) {
+            // 保留原始值：畸形编码只影响这一个 cookie，不该让整个请求 500
+        }
+        out[name] = value;
     }
     return out;
 }
@@ -116,6 +129,7 @@ export async function createSession(env, username, request) {
         u: username,
         exp: Date.now() + SESSION_TTL,
         created: Date.now(),
+        seen: Date.now(),
         ip,
         ua: (request.headers.get('user-agent') || '').slice(0, 160),
     });
@@ -127,12 +141,34 @@ export async function getSession(env, request) {
     const token = cookies[cookieName()];
     if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
     const rec = await getJSON(env, SESSION_PREFIX + token);
-    if (!rec || !rec.exp || rec.exp < Date.now()) return null;
+    if (!rec || !rec.exp) return null;
+    const now = Date.now();
+    if (rec.exp < now) {
+        await del(env, SESSION_PREFIX + token);
+        return null;
+    }
+    const seen = rec.seen || rec.created || 0;
+    if (now - seen > SESSION_IDLE) {
+        await del(env, SESSION_PREFIX + token);
+        return null;
+    }
+    if (now - seen > SESSION_TOUCH) {
+        rec.seen = now;
+        await putJSON(env, SESSION_PREFIX + token, rec);
+    }
     return { token, ...rec };
 }
 
 export async function destroySession(env, token) {
     if (token && /^[a-f0-9]{64}$/.test(token)) await del(env, SESSION_PREFIX + token);
+}
+
+/** 改密后调用：让所有已登录设备失效（可保留当前 token） */
+export async function destroyAllSessions(env, exceptToken) {
+    for (const o of await list(env, SESSION_PREFIX)) {
+        if (exceptToken && o.key === SESSION_PREFIX + exceptToken) continue;
+        await del(env, o.key);
+    }
 }
 
 export async function pruneSessions(env) {
@@ -240,4 +276,23 @@ export async function decryptSecret(env, blob) {
     const ct = b64decode(parts[2]);
     const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
     return new TextDecoder().decode(pt);
+}
+
+/* 会话日志里可能粘着密码/令牌，落盘同样走主密钥加密：iv(12) || ciphertext */
+export async function encryptBytes(env, bytes) {
+    const key = await getMasterKey(env);
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes));
+    const out = new Uint8Array(12 + ct.length);
+    out.set(iv, 0);
+    out.set(ct, 12);
+    return out;
+}
+
+export async function decryptBytes(env, buf) {
+    const u8 = new Uint8Array(buf);
+    if (u8.length < 13) throw new Error('密文格式不正确');
+    const key = await getMasterKey(env);
+    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u8.subarray(0, 12) }, key, u8.subarray(12));
+    return new Uint8Array(pt);
 }

@@ -26,14 +26,15 @@ export async function putJSON(env, key, value, meta) {
     });
 }
 
-export async function getText(env, key) {
+export async function getBytes(env, key) {
     const obj = await bucket(env).get(key);
-    return obj ? await obj.text() : null;
+    if (!obj) return null;
+    return { bytes: new Uint8Array(await obj.arrayBuffer()), meta: obj.customMetadata || {} };
 }
 
-export async function putText(env, key, text, meta) {
-    await bucket(env).put(key, text, {
-        httpMetadata: { contentType: 'text/plain; charset=utf-8' },
+export async function putBytes(env, key, bytes, meta) {
+    await bucket(env).put(key, bytes, {
+        httpMetadata: { contentType: 'application/octet-stream' },
         customMetadata: meta,
     });
 }
