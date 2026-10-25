@@ -4,6 +4,7 @@ import { $, $$, el, esc, icon, toast, api, modal, confirmModal, fmtBytes, fmtDat
 import { COUNTRIES, CITIES, countryOf, flagOf, regionLabel, locate } from './geo.js';
 import { createGlobe } from './globe.js';
 import { createTerminalView } from './term.js';
+import { openFiles } from './files.js';
 
 const SETTINGS_KEY = 'webssh.settings';
 
@@ -12,6 +13,8 @@ const state = {
     authed: false,
     user: null,
     hosts: [],
+    groups: [],
+    keys: [],
     snippets: [],
     filter: 'all',
     settings: { fontSize: 13, record: false },
@@ -82,6 +85,36 @@ async function safe(fn) {
         toast((e && e.message) || '操作失败', 'err');
         return null;
     }
+}
+
+function promptText(title, label, value, okLabel, hint) {
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = (v) => {
+            if (done) return;
+            done = true;
+            m.close();
+            resolve(v);
+        };
+        const input = el('input', { type: 'text', value: value || '' });
+        const submit = () => {
+            const v = input.value.trim();
+            if (!v) {
+                toast('不能为空', 'err');
+                return;
+            }
+            finish(v);
+        };
+        const form = el('form', { onsubmit: (ev) => { ev.preventDefault(); submit(); } }, [
+            el('label', { text: label }, [input]),
+            hint ? el('p', { class: 'note-box', style: 'margin:8px 0 0', text: hint }) : null,
+        ]);
+        const foot = el('div', { style: 'display:flex;gap:8px' }, [
+            el('button', { class: 'btn', type: 'button', text: '取消', onclick: () => finish(null) }),
+            el('button', { class: 'btn primary', type: 'submit', text: okLabel || '确定', onclick: submit }),
+        ]);
+        const m = modal({ title, body: form, footer: foot, onClose: () => finish(null) });
+    });
 }
 
 /* ------------------------------------------------------------------- auth */
@@ -442,10 +475,27 @@ function openHostEditor(host) {
     const isNew = !host;
 
     const nameIn = el('input', { type: 'text', value: h.name || '', placeholder: '例如 香港生产机' });
-    const groupIn = el('input', { type: 'text', value: h.group || '', placeholder: '例如 生产环境', list: 'group-list' });
-    const datalist = el('datalist', { id: 'group-list' });
-    const groups = new Set(state.hosts.map(groupOf).filter((g) => g !== '未分组'));
-    groups.forEach((g) => datalist.appendChild(el('option', { value: g })));
+    if (h.group && !state.groups.includes(h.group)) state.groups.push(h.group);
+    const groupSel = el('select', { name: 'group' });
+    const fillGroups = (selected) => {
+        groupSel.textContent = '';
+        groupSel.appendChild(el('option', { value: '', text: '未分组' }));
+        for (const g of state.groups) groupSel.appendChild(el('option', { value: g, text: g }));
+        groupSel.appendChild(el('option', { value: '__new', text: '＋ 新建分组…' }));
+        groupSel.value = selected && state.groups.includes(selected) ? selected : '';
+    };
+    fillGroups(h.group || '');
+    groupSel.addEventListener('change', async () => {
+        if (groupSel.value !== '__new') return;
+        groupSel.value = h.group && state.groups.includes(h.group) ? h.group : '';
+        const name = await promptText('新建分组', '分组名称', '', '创建', '创建后可在「分组」面板里管理，所有主机下拉框都会同步。');
+        if (!name) return;
+        const res = await safe(() => api('/api/groups', { method: 'POST', body: { op: 'add', name } }));
+        if (!res) return;
+        state.groups = res.groups || state.groups;
+        fillGroups(name);
+        toast('分组已创建');
+    });
 
     const userIn = el('input', { type: 'text', value: h.username || 'root', placeholder: 'root', autocomplete: 'off' });
     const hostIn = el('input', { type: 'text', value: h.host || '', placeholder: '192.0.2.10 或 example.com', spellcheck: 'false' });
@@ -455,12 +505,52 @@ function openHostEditor(host) {
     const keyIn = el('textarea', { placeholder: h.hasSecret ? '已保存私钥，留空则不修改' : '-----BEGIN OPENSSH PRIVATE KEY-----', spellcheck: 'false' });
     const passIn = el('input', { type: 'password', autocomplete: 'off', placeholder: '私钥没有口令可留空' });
 
+    let keyId = h.keyId && state.keys.some((k) => k.id === h.keyId) ? h.keyId : '';
+    const keySel = el('select', { name: 'keyId' });
+    const keyMeta = el('div', { class: 'fp', style: 'font-size:11px;padding:8px 10px' });
+    const keyField = field('私钥（PEM）', keyIn);
+    const passField = field('私钥口令', passIn);
+    const keyNote = el('p', { class: 'muted-sm', style: 'margin:0', text: '在「密钥库」里可以复用同一把私钥，主机只需要引用。' });
+    const applyKey = () => {
+        const entry = state.keys.find((k) => k.id === keyId);
+        keyMeta.hidden = !entry;
+        if (entry) keyMeta.textContent = (entry.algo || '') + ' · ' + (entry.fingerprint || '');
+        keyField.hidden = !!entry;
+        passField.hidden = !!entry;
+        keyNote.textContent = entry ? '这把私钥在「密钥库」中统一管理。' : '在「密钥库」里可以复用同一把私钥，主机只需要引用。';
+    };
+    const fillKeys = (selected) => {
+        keySel.textContent = '';
+        keySel.appendChild(el('option', { value: '', text: '手动填写私钥' }));
+        for (const k of state.keys) keySel.appendChild(el('option', { value: k.id, text: k.name + (k.algo ? ' · ' + k.algo : '') }));
+        keySel.appendChild(el('option', { value: '__new', text: '＋ 新建密钥…' }));
+        keyId = selected && state.keys.some((k) => k.id === selected) ? selected : '';
+        keySel.value = keyId;
+        applyKey();
+    };
+    keySel.addEventListener('change', async () => {
+        if (keySel.value === '__new') {
+            keySel.value = keyId;
+            keyEditor(null, (meta) => fillKeys(meta.id));
+            return;
+        }
+        keyId = keySel.value;
+        applyKey();
+    });
+    fillKeys(h.keyId || '');
+
     let authType = h.authType === 'key' ? 'key' : 'password';
     const segPw = el('button', { type: 'button', text: '密码' });
     const segKey = el('button', { type: 'button', text: '私钥' });
     const seg = el('div', { class: 'seg' }, [segPw, segKey]);
     const pwBox = el('div', {}, [field('密码', pwIn)]);
-    const keyBox = el('div', {}, [field('私钥（PEM）', keyIn), field('私钥口令', passIn)]);
+    const keyBox = el('div', { style: 'display:flex;flex-direction:column;gap:10px' }, [
+        field('私钥来源', keySel),
+        keyMeta,
+        keyField,
+        passField,
+        keyNote,
+    ]);
 
     const applyAuth = () => {
         segPw.classList.toggle('on', authType === 'password');
@@ -543,7 +633,7 @@ function openHostEditor(host) {
 
     const body = el('div', { style: 'display:flex;flex-direction:column;gap:12px' }, [
         field('名称', nameIn),
-        el('div', { class: 'grid-2' }, [field('分组', groupIn), field('认证方式', seg)]),
+        el('div', { class: 'grid-2' }, [field('分组', groupSel), field('认证方式', seg)]),
         el('div', { class: 'grid-2' }, [field('用户名', userIn), field('端口', portIn)]),
         field('主机地址', hostIn),
         pwBox,
@@ -553,14 +643,13 @@ function openHostEditor(host) {
         el('div', {}, [el('div', { class: 'muted-sm', style: 'margin-bottom:6px', text: '标签颜色' }), swatches]),
         field('备注', noteIn),
         saveSecretLabel,
-        datalist,
         cityList,
     ]);
 
     const submit = async () => {
         const payload = {
             name: nameIn.value.trim(),
-            group: groupIn.value.trim(),
+            group: groupSel.value === '__new' ? '' : groupSel.value,
             username: userIn.value.trim(),
             host: hostIn.value.trim(),
             port: parseInt(portIn.value, 10) || 22,
@@ -581,6 +670,8 @@ function openHostEditor(host) {
         }
         if (authType === 'password') {
             if (pwIn.value) payload.password = pwIn.value;
+        } else if (keyId) {
+            payload.keyId = keyId;
         } else {
             if (keyIn.value.trim()) payload.privateKey = keyIn.value.trim();
             if (passIn.value) payload.passphrase = passIn.value;
@@ -618,6 +709,7 @@ async function loadHosts() {
     state.hosts = res.hosts || [];
     if (state.filter !== 'all' && !state.hosts.some((h) => h.country === state.filter)) state.filter = 'all';
     renderDash();
+    loadGroups();
 }
 
 async function loadSnippets() {
@@ -625,6 +717,226 @@ async function loadSnippets() {
     if (!res) return;
     state.snippets = res.snippets || [];
     return state.snippets;
+}
+
+async function loadGroups() {
+    const res = await safe(() => api('/api/groups'));
+    if (!res) return;
+    state.groups = res.groups || [];
+    return state.groups;
+}
+
+async function loadKeys() {
+    const res = await safe(() => api('/api/keys'));
+    if (!res) return;
+    state.keys = res.keys || [];
+    return state.keys;
+}
+
+/* ---------------------------------------------------------------- groups */
+
+function openGroups() {
+    setNav('groups');
+    const box = el('div', { class: 'list' });
+    const render = () => {
+        box.textContent = '';
+        const counts = new Map();
+        for (const h of state.hosts) {
+            const g = String(h.group || '').trim();
+            counts.set(g, (counts.get(g) || 0) + 1);
+        }
+        if (!state.groups.length) {
+            box.appendChild(el('div', { class: 'empty-hint', html: '还没有分组。<br>把主机按环境或项目归类，列表会更清爽。' }));
+            return;
+        }
+        for (const g of state.groups) {
+            const n = counts.get(g) || 0;
+            const edit = el('button', { class: 'act icon-only', type: 'button', title: '重命名', html: icon('edit', 14) });
+            edit.addEventListener('click', async () => {
+                const name = await promptText('重命名分组', '新的名称', g, '保存');
+                if (!name || name === g) return;
+                const res = await safe(() => api('/api/groups', { method: 'POST', body: { op: 'rename', from: g, to: name } }));
+                if (!res) return;
+                state.groups = res.groups || state.groups;
+                await loadHosts();
+                render();
+                toast(res.updated ? '已重命名，' + res.updated + ' 台主机已同步' : '已重命名');
+            });
+            const del = el('button', { class: 'act icon-only', type: 'button', title: '删除', html: icon('trash', 14) });
+            del.addEventListener('click', async () => {
+                const ok = await confirmModal(
+                    '删除分组',
+                    '确定删除 <b>' + esc(g) + '</b> 吗？' + (n ? '组内 ' + n + ' 台主机会移到「未分组」。' : ''),
+                    '删除',
+                    true
+                );
+                if (!ok) return;
+                const res = await safe(() => api('/api/groups', { method: 'POST', body: { op: 'remove', name: g } }));
+                if (!res) return;
+                state.groups = res.groups || state.groups;
+                await loadHosts();
+                render();
+                toast(res.moved ? '已删除，' + res.moved + ' 台主机移到未分组' : '已删除');
+            });
+            box.appendChild(
+                el('div', { class: 'list-row' }, [
+                    el('span', { class: 'flag', text: '📁' }),
+                    el('div', { class: 'grow' }, [el('div', { class: 'ttl', text: g }), el('div', { class: 'mono', text: n + ' 台主机' })]),
+                    edit,
+                    del,
+                ])
+            );
+        }
+    };
+    const addBtn = el('button', {
+        class: 'btn',
+        type: 'button',
+        html: icon('plus', 14) + ' 新建分组',
+        onclick: async () => {
+            const name = await promptText('新建分组', '分组名称', '', '创建');
+            if (!name) return;
+            const res = await safe(() => api('/api/groups', { method: 'POST', body: { op: 'add', name } }));
+            if (!res) return;
+            state.groups = res.groups || state.groups;
+            render();
+            toast('分组已创建');
+        },
+    });
+    modal({
+        title: '分组',
+        body: el('div', {}, [
+            el('p', {
+                class: 'note-box',
+                style: 'margin:0 0 10px',
+                text: '分组用来归类主机；重命名会同步更新组内主机，删除后主机会回到「未分组」。',
+            }),
+            box,
+        ]),
+        footer: el('div', { style: 'display:flex;gap:8px;align-items:center;width:100%' }, [addBtn]),
+        onClose: () => setNav('overview'),
+    });
+    render();
+    loadGroups().then(render);
+}
+
+/* ------------------------------------------------------------------ keys */
+
+function openKeys() {
+    setNav('keys');
+    const box = el('div', { class: 'list' });
+    const render = () => {
+        box.textContent = '';
+        const used = new Map();
+        for (const h of state.hosts) {
+            if (!h.keyId) continue;
+            used.set(h.keyId, (used.get(h.keyId) || 0) + 1);
+        }
+        if (!state.keys.length) {
+            box.appendChild(el('div', { class: 'empty-hint', html: '密钥库还是空的。<br>把常用的 SSH 私钥存进来，多台主机可以共用同一把。' }));
+            return;
+        }
+        for (const k of state.keys) {
+            const n = used.get(k.id) || 0;
+            const edit = el('button', { class: 'act icon-only', type: 'button', title: '编辑', html: icon('edit', 14) });
+            edit.addEventListener('click', () => keyEditor(k, render));
+            const del = el('button', { class: 'act icon-only', type: 'button', title: '删除', html: icon('trash', 14) });
+            del.addEventListener('click', async () => {
+                const ok = await confirmModal(
+                    '删除密钥',
+                    '确定删除 <b>' + esc(k.name) + '</b> 吗？' + (n ? '<br>它正被 ' + n + ' 台主机使用，删除后这些主机会连不上。' : ''),
+                    '删除',
+                    true
+                );
+                if (!ok) return;
+                const res = await safe(() => api('/api/keys/' + encodeURIComponent(k.id), { method: 'DELETE' }));
+                if (!res) return;
+                state.keys = state.keys.filter((x) => x.id !== k.id);
+                render();
+                toast('已删除');
+            });
+            box.appendChild(
+                el('div', { class: 'list-row' }, [
+                    el('span', { class: 'flag', text: '🔑' }),
+                    el('div', { class: 'grow' }, [
+                        el('div', { class: 'ttl', text: k.name + (n ? '  ·  ' + n + ' 台主机' : '') }),
+                        el('div', { class: 'mono', text: (k.algo || '') + ' · ' + (k.fingerprint || '') }),
+                    ]),
+                    edit,
+                    del,
+                ])
+            );
+        }
+    };
+    const addBtn = el('button', {
+        class: 'btn primary',
+        type: 'button',
+        html: icon('plus', 14) + ' 添加密钥',
+        onclick: () => keyEditor(null, render),
+    });
+    modal({
+        title: '密钥库',
+        body: el('div', {}, [
+            el('p', {
+                class: 'note-box',
+                style: 'margin:0 0 10px',
+                text: '私钥用 AES-GCM 加密后保存在你的 R2；主机可以引用这里的密钥，无需重复粘贴。',
+            }),
+            box,
+        ]),
+        footer: el('div', { style: 'display:flex;gap:8px;align-items:center;width:100%' }, [addBtn]),
+        onClose: () => setNav('overview'),
+    });
+    render();
+    loadKeys().then(render);
+}
+
+function keyEditor(key, after) {
+    const nameIn = el('input', { type: 'text', value: key ? key.name : '', placeholder: '例如 生产服务器密钥' });
+    const keyIn = el('textarea', { placeholder: key ? '已保存，留空则不修改' : '-----BEGIN OPENSSH PRIVATE KEY-----', spellcheck: 'false' });
+    const passIn = el('input', { type: 'password', autocomplete: 'off', placeholder: '私钥没有口令可留空' });
+    const body = el('div', { style: 'display:flex;flex-direction:column;gap:12px' }, [
+        field('名称', nameIn),
+        key
+            ? el('div', { class: 'fp', style: 'font-size:11px;padding:8px 10px', text: (key.algo || '') + ' · ' + (key.fingerprint || '') })
+            : null,
+        field('私钥（PEM）', keyIn),
+        field('私钥口令', passIn),
+        el('p', {
+            class: 'note-box',
+            style: 'margin:0',
+            text: '支持 ed25519、RSA（OpenSSH / PEM）；暂不支持带口令的 OpenSSH 私钥和 ECDSA。',
+        }),
+    ]);
+    const foot = el('div', { style: 'display:flex;gap:8px' }, [
+        el('button', { class: 'btn', type: 'button', text: '取消', onclick: () => m.close() }),
+        el('button', {
+            class: 'btn primary',
+            type: 'button',
+            text: '保存',
+            onclick: async () => {
+                const name = nameIn.value.trim();
+                if (!name) {
+                    toast('密钥名称不能为空', 'err');
+                    return;
+                }
+                if (!key && !keyIn.value.trim()) {
+                    toast('请粘贴私钥内容', 'err');
+                    return;
+                }
+                const payload = { name };
+                if (key) payload.id = key.id;
+                if (keyIn.value.trim()) payload.privateKey = keyIn.value.trim();
+                if (passIn.value) payload.passphrase = passIn.value;
+                const res = await safe(() => api('/api/keys', { method: 'POST', body: payload }));
+                if (!res) return;
+                m.close();
+                toast(key ? '密钥已更新' : '密钥已添加');
+                await loadKeys();
+                if (after) after(res.key);
+            },
+        }),
+    ]);
+    const m = modal({ title: key ? '编辑密钥' : '新建密钥', body, footer: foot, width: '620px' });
 }
 
 /* -------------------------------------------------------------- snippets */
@@ -998,6 +1310,11 @@ function enterApp() {
             onSettings: openSettings,
             onLogout: logout,
             onSnippets: (useFn) => openSnippets(useFn),
+            onFiles: (session) =>
+                openFiles({
+                    title: '文件管理 · ' + (session.name || session.host || '会话'),
+                    request: (payload, timeout) => state.term.sftpRequest(session, payload, timeout),
+                }),
             onLogs: (session) => {
                 const host = session && session.hostId ? state.hosts.find((h) => h.id === session.hostId) : null;
                 openLogs(host || null);
@@ -1009,6 +1326,7 @@ function enterApp() {
     showDash();
     loadHosts();
     loadSnippets();
+    loadKeys();
 }
 
 async function logout() {
@@ -1034,9 +1352,11 @@ function bindStatic() {
             if (nav === 'overview') {
                 setNav('overview');
                 showDash();
-            } else if (nav === 'snippets') openSnippets(state.term && !$('#view-term').hidden ? (cmd) => state.term.sendToActive(cmd) : null);
+            } else if (nav === 'groups') openGroups();
+            else if (nav === 'snippets') openSnippets(state.term && !$('#view-term').hidden ? (cmd) => state.term.sendToActive(cmd) : null);
             else if (nav === 'quick') openQuickConnect();
             else if (nav === 'known') openKnown();
+            else if (nav === 'keys') openKeys();
             else if (nav === 'settings') openSettings();
             else if (nav === 'logout') logout();
         });

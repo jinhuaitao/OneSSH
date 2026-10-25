@@ -2,10 +2,20 @@
 
 在浏览器里使用的 SSH 客户端。整个应用跑在 Cloudflare Workers 上：一个 Worker + 一个 R2 存储桶，**不需要服务器**。
 
+![总览](docs/dashboard.png)
+
+![终端](docs/terminal.png)
+
+![文件管理](docs/files.png)
+
+![密钥库](docs/keys.png)
+
 - 首次打开让你设置管理员账号密码，之后用它登录
-- 浅色仪表盘：主机分组、地区筛选、点阵地球（每台主机一个可点的城市标签）
-- 深色终端页：多标签、实时监控（CPU / 内存 / 网络 / RTT / 负载）、底部特殊按键条、代码片段一键发送
+- 浅色仪表盘：独立分组面板（改名自动同步主机）、地区筛选、点阵地球（每台主机一个可点的城市标签）
+- 深色终端页：多标签、实时监控（CPU / 内存 / 网络 / RTT / 负载）、底部特殊按键条、代码片段一键发送、文件管理
 - 主机列表（密码 / 私钥两种认证），凭据 AES-GCM 加密后存在你自己的 R2 里
+- 全局密钥库：私钥命名保存并显示算法 + SHA256 指纹，主机直接引用，不用重复粘贴
+- 文件管理（SFTP）：浏览、上传、下载、新建文件夹、重命名、删除、在线编辑文本文件
 - 主机密钥 TOFU 校验：首次连接弹指纹确认，之后指纹变化直接拒绝（防中间人）
 - 可选的会话录制，保存在 R2 里随时回看
 
@@ -57,13 +67,16 @@ npm test                # 端到端：起一个本地 sshd + wrangler dev + 真 
 node tests/e2e.mjs --headful   # 想看着它点的话
 ```
 
-`tests/e2e.mjs` 覆盖：初始化 → 添加主机 → 分组/筛选 → 主机密钥确认 → 终端交互 → 监控指标 → 代码片段 → 特殊按键 → 多标签 → 刷新保持登录 → 退出登录。依赖 `ssh2`（本地 SSH 服务端）与 `playwright-core`（用你机器上的 Chrome，不额外下载浏览器）。
+`tests/e2e.mjs` 覆盖：初始化 → 新建分组 → 添加主机 → 分组/筛选 → 密钥库 + 密钥登录 → 主机密钥确认 → 终端交互 → 监控指标 → 代码片段 → 特殊按键 → 多标签 → 文件管理（列目录/上传/编辑/下载/重命名/删除）→ 分组改名与删除 → 刷新保持登录 → 退出登录。依赖 `ssh2`（本地 SSH 服务端）与 `playwright-core`（用你机器上的 Chrome，不额外下载浏览器）。
 
 ---
 
 ## 用起来
 
 - **添加主机**：名称、分组、主机、端口、用户名，选密码或私钥，再选地区和城市。地区和城市决定它在筛选标签和地球上的位置。
+- **分组**：左侧「分组」面板里新建 / 重命名 / 删除。改名会同步所有主机，删除后主机回到「未分组」；主机编辑框的下拉里也能直接「＋ 新建分组…」。
+- **密钥库**：左侧「密钥库」保存常用私钥，自动识别算法并计算 `SHA256:` 指纹。主机认证选「密钥库」里的条目即可复用；密钥被主机引用时不会被删除。
+- **文件管理**：进入终端后点顶部「文件」，走 SFTP 子系统浏览远程目录，支持上传、下载、新建文件夹、重命名、删除和在线编辑文本文件。单个文件上限 64 MB，在线编辑读取 512 KB 以内的文本。
 - **连接**：点主机行或「连接」。凭据保存在 R2 的话一键直连；没保存则弹窗临时输入（只在内存里用）。
 - **快速连接**：左侧 ⚡，临时连接不落库，可以顺手勾选「同时保存到我的主机」。
 - **代码片段**：左侧「代码片段」里维护常用命令；终端页右上角也能打开，点一下直接发送到当前会话。
@@ -80,21 +93,23 @@ node tests/e2e.mjs --headful   # 想看着它点的话
 ```
 浏览器 (xterm.js)  ──WebSocket──▶  Worker  ──TCP(cloudflare:sockets)──▶  sshd:22
                                      │
-                                     ├── 同一条 SSH 连接：shell 通道 + exec 通道（采样 /proc）
-                                     └── R2：账号 / 会话 / 主机 / 已知主机密钥 / 录制 / 片段
+                                     ├── 同一条 SSH 连接：shell 通道 + exec 通道（采样 /proc）+ sftp 子系统（文件管理）
+                                     └── R2：账号 / 会话 / 主机 / 分组 / 密钥库 / 已知主机密钥 / 录制 / 片段
 ```
 
 | 文件 | 作用 |
 | --- | --- |
 | `src/worker.js` | 路由：页面、`/api/*`、`/ws` 升级；在 fetch 处理器内建立 TCP 连接 |
 | `src/session.js` | WebSocket ↔ SSH 桥接：状态推送、主机密钥确认、窗口调整、录制、保活、监控采样 |
-| `src/ssh/client.js` | SSH-2 传输层 / 密钥交换 / 认证 / 多通道（shell + exec） |
+| `src/ssh/client.js` | SSH-2 传输层 / 密钥交换 / 认证 / 多通道（shell + exec + sftp） |
+| `src/ssh/sftp.js` | SFTP v3 客户端：读目录、读写文件、原子保存（临时文件 + 重命名） |
 | `src/ssh/crypto.js` | CTR 密钥流（按包偏移连续）、HMAC、密钥派生、主机密钥签名校验 |
 | `src/ssh/keys.js` | OpenSSH / PKCS#1 / PKCS#8 私钥解析与签名 |
 | `src/auth.js` | PBKDF2 口令、会话 Cookie、登录限流、凭据加解密 |
 | `src/store.js` | R2 读写封装 |
 | `src/pages.js` | 单页骨架（所有数据都走 `/api/*`，HTML 里没有任何秘密） |
-| `public/js/app.js` | 前端主控：登录、主机增删改、分组筛选、弹窗、设置 |
+| `public/js/app.js` | 前端主控：登录、主机增删改、分组与密钥库面板、弹窗、设置 |
+| `public/js/files.js` | 文件管理弹窗：目录浏览、上传 / 下载、在线编辑 |
 | `public/js/globe.js` | 点阵地球：正交投影 + 拖拽旋转 + 标签跟随 |
 | `public/js/land.js` | 2°×2° 陆地掩码（构建期从 geo 数据光栅化生成，运行时零依赖） |
 | `public/js/term.js` | 终端页：多标签、WebSocket 会话、监控面板、按键条 |
@@ -106,8 +121,10 @@ R2 里的数据布局：
 sys/admin           管理员账号（PBKDF2-SHA256 + 随机盐）
 sys/master          凭据加密用的主密钥
 sys/snippets        代码片段
+sys/groups          分组名称列表
+sys/keys            密钥库（私钥为 AES-GCM 密文 + 算法 / 指纹）
 sess/<token>        登录会话（30 天）
-hosts/<id>          主机配置（密码/私钥字段为 AES-GCM 密文）
+hosts/<id>          主机配置（密码/私钥字段为 AES-GCM 密文，或引用 sys/keys）
 known/<host>_<port> 已信任的主机密钥指纹
 logs/<id>.log       会话录制（纯文本 + 元数据）
 throttle/<ip>       登录失败计数
@@ -130,15 +147,12 @@ throttle/<ip>       登录失败计数
 - **CSRF**：写接口只接受 `application/json`，并校验 `HttpOnly` + `SameSite=Lax` 的会话 Cookie。
 - **出口限制**：Workers 只能连公网地址（Cloudflare 自家 IP 段、localhost、内网地址都会被拒绝）。所以这个工具**连不了内网机器**，除非那台机器有公网入口。
 
-![总览](docs/dashboard.png)
-
-![终端](docs/terminal.png)
-
 ## 已知限制
 
 - 免费计划每个请求的 CPU 时间有限（10ms），长时间大流量输出（比如 `yes`、`cat` 大文件）可能被中断；日常运维够用，重度使用建议上 Paid 计划（$5/月，30s CPU）。
 - 监控面板依赖 Linux 的 `/proc`，BSD / macOS / Windows 主机上会显示「不可用」（终端本身照常可用）。
-- 暂不支持：SFTP 传文件、端口转发、Agent 转发、带口令的 OpenSSH 私钥（`bcrypt_pbkdf`）。带口令的私钥请先用 `ssh-keygen -p -m PEM` 转成无口令 PEM。
+- 暂不支持：端口转发、Agent 转发、带口令的 OpenSSH 私钥（`bcrypt_pbkdf`）。带口令的私钥请先用 `ssh-keygen -p -m PEM` 转成无口令 PEM。
+- 文件管理走 SFTP 子系统，需要服务器启用 `sftp-server`（OpenSSH 默认开启）。浏览器内单文件上限 64 MB，在线编辑只适合 512 KB 以内的文本文件。
 - 只支持 `curve25519-sha256` 系列密钥交换和 CTR 系列加密算法。非常老的服务器（只支持 `diffie-hellman-group1-sha1` / `3des-cbc`）连不上。
 
 ## 许可

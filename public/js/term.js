@@ -91,6 +91,47 @@ export function createTerminalView(cfg) {
         send(s, { t: 'input', data });
     }
 
+    /* ------------------------------------------------------------- sftp */
+
+    function sftpRequest(s, payload, timeoutMs) {
+        return new Promise((resolve, reject) => {
+            if (!s || !s.ws || s.ws.readyState !== 1) {
+                reject(new Error('会话尚未就绪'));
+                return;
+            }
+            const id = 'q' + ++s.sftpSeq;
+            const timer = setTimeout(() => {
+                s.sftpPending.delete(id);
+                reject(new Error('文件操作超时'));
+            }, timeoutMs || 30000);
+            s.sftpPending.set(id, {
+                resolve: (v) => {
+                    clearTimeout(timer);
+                    s.sftpPending.delete(id);
+                    resolve(v);
+                },
+                reject: (e) => {
+                    clearTimeout(timer);
+                    s.sftpPending.delete(id);
+                    reject(e);
+                },
+            });
+            try {
+                s.ws.send(JSON.stringify(Object.assign({ t: 'sftp', id }, payload)));
+            } catch (e) {
+                clearTimeout(timer);
+                s.sftpPending.delete(id);
+                reject(e);
+            }
+        });
+    }
+
+    function failSftp(s, reason) {
+        if (!s || !s.sftpPending) return;
+        for (const p of s.sftpPending.values()) p.reject(new Error(reason));
+        s.sftpPending.clear();
+    }
+
     function sysLine(s, text, color) {
         const col = color || '38;5;245';
         s.term.write('\r\n\x1b[' + col + 'm· ' + text + '\x1b[0m\r\n');
@@ -310,6 +351,7 @@ export function createTerminalView(cfg) {
         ws.onclose = () => {
             if (s.pingTimer) clearInterval(s.pingTimer);
             s.pingTimer = null;
+            failSftp(s, '会话已断开');
             if (s.status !== 'err') s.status = s.status === 'ready' ? 'closed' : 'err';
             updateTab(s);
             if (s.id === state.activeId) renderHostbar();
@@ -410,6 +452,14 @@ export function createTerminalView(cfg) {
             case 'passphrase':
                 askPassphrase(s, msg);
                 break;
+
+            case 'sftp': {
+                const pending = s.sftpPending.get(msg.id);
+                if (!pending) break;
+                if (msg.ok) pending.resolve(msg);
+                else pending.reject(new Error(msg.error || '文件操作失败'));
+                break;
+            }
 
             default:
                 break;
@@ -553,6 +603,8 @@ export function createTerminalView(cfg) {
             pingTimer: null,
             tabEl: null,
             _ui: null,
+            sftpPending: new Map(),
+            sftpSeq: 0,
         };
         state.sessions.push(s);
         renderTabs();
@@ -601,6 +653,7 @@ export function createTerminalView(cfg) {
         const idx = state.sessions.findIndex((s) => s.id === id);
         if (idx < 0) return;
         const s = state.sessions[idx];
+        failSftp(s, '会话已关闭');
         try {
             if (s.ws && s.ws.readyState === 1) s.ws.send(JSON.stringify({ t: 'close' }));
             if (s.ws) s.ws.close();
@@ -624,6 +677,7 @@ export function createTerminalView(cfg) {
     function restart() {
         const s = active();
         if (!s) return;
+        failSftp(s, '会话已重连');
         try {
             if (s.ws) {
                 s.ws.onclose = null;
@@ -701,6 +755,18 @@ export function createTerminalView(cfg) {
         on('.term-top-actions [data-act="settings"]', 'click', () => c.onSettings && c.onSettings());
         on('.term-top-actions [data-act="logout"]', 'click', () => c.onLogout && c.onLogout());
         on('#btn-snippets', 'click', () => c.onSnippets && c.onSnippets(sendToActive));
+        on('#btn-files', 'click', () => {
+            const s = active();
+            if (!s) {
+                toast('当前没有打开的会话', 'err');
+                return;
+            }
+            if (s.status !== 'ready') {
+                toast('会话还没连接就绪，请稍后再试', 'err');
+                return;
+            }
+            if (c.onFiles) c.onFiles(s);
+        });
         on('#btn-dup', 'click', duplicate);
         on('#btn-reconnect', 'click', restart);
         on('#btn-disconnect', 'click', () => {
@@ -812,6 +878,9 @@ export function createTerminalView(cfg) {
         duplicate,
         sendToActive,
         active,
+        sftpRequest(session, payload, timeoutMs) {
+            return sftpRequest(session || active(), payload, timeoutMs);
+        },
         sessions: () => state.sessions,
         setFontSize(size) {
             for (const s of state.sessions) {

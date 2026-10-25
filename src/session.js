@@ -1,8 +1,14 @@
 // WebSocket <-> SSH bridge. One Durable-less session per socket.
 import { connect } from 'cloudflare:sockets';
 import { SSHClient } from './ssh/client.js';
+import { SFTPClient, OPEN, b64encode, b64decode, isDirMode, isLinkMode, modeString } from './ssh/sftp.js';
 import { getJSON, putJSON, putText } from './store.js';
 import { decryptSecret, randomHex } from './auth.js';
+
+const MAX_FILE = 64 * 1024 * 1024;
+const READ_CHUNK = 128 * 1024;
+const WRITE_CHUNK = 64 * 1024;
+const EDIT_MAX = 512 * 1024;
 
 export function knownKey(host, port) {
     return 'known/' + String(host).toLowerCase().replace(/[^a-z0-9.\-:]/g, '_') + '_' + port;
@@ -86,6 +92,10 @@ export class Terminal {
         this.sampling = false;
         this.prevSample = null;
         this.meta = { host: '', port: 22, user: '' };
+        this.sftp = null;
+        this.sftpPromise = null;
+        this.handles = new Map();
+        this.handleSeq = 0;
     }
 
     /* ------------------------------------------------------------- plumbing */
@@ -177,7 +187,13 @@ export class Terminal {
             }
             username = saved.username;
             if (!password && !privateKey) {
-                if (saved.authType === 'key' && saved.keyEnc) {
+                if (saved.authType === 'key' && saved.keyId) {
+                    const vault = await getJSON(this.env, 'sys/keys');
+                    const key = vault && Array.isArray(vault.keys) ? vault.keys.find((k) => k.id === saved.keyId) : null;
+                    if (!key || !key.keyEnc) throw new Error('密钥库里找不到该主机使用的密钥，请在主机设置中重新选择');
+                    privateKey = await decryptSecret(this.env, key.keyEnc);
+                    if (key.passphraseEnc) passphrase = await decryptSecret(this.env, key.passphraseEnc);
+                } else if (saved.authType === 'key' && saved.keyEnc) {
                     privateKey = await decryptSecret(this.env, saved.keyEnc);
                     if (saved.passphraseEnc) passphrase = await decryptSecret(this.env, saved.passphraseEnc);
                 } else if (saved.secretEnc) {
@@ -272,6 +288,201 @@ export class Terminal {
         } catch (_) {
         } finally {
             this.sampling = false;
+        }
+    }
+
+    /* ---------------------------------------------------------------- sftp */
+
+    _sftpClient() {
+        if (!this.client || !this.client.ready) return Promise.reject(new Error('SSH 会话尚未就绪'));
+        if (this.sftp) return Promise.resolve(this.sftp);
+        if (!this.sftpPromise) {
+            const c = new SFTPClient(this.client);
+            this.sftpPromise = c
+                .ready()
+                .then(() => {
+                    this.sftp = c;
+                    return c;
+                })
+                .catch((e) => {
+                    this.sftpPromise = null;
+                    throw e;
+                });
+        }
+        return this.sftpPromise;
+    }
+
+    _trackHandle(h) {
+        const token = 'h' + ++this.handleSeq;
+        this.handles.set(token, h);
+        return token;
+    }
+
+    async _closeHandle(token) {
+        const h = this.handles.get(token);
+        if (!h) return;
+        this.handles.delete(token);
+        try {
+            await this.sftp.close(h);
+        } catch (_) {}
+    }
+
+    async _sftpOp(msg) {
+        const sftp = await this._sftpClient();
+        const cleanPath = (v) => {
+            const p = String(v == null ? '' : v);
+            if (!p || p.length > 4096 || p.includes('\0')) throw new Error('路径不合法');
+            return p;
+        };
+        const reply = (extra) => this.send(Object.assign({ t: 'sftp', id: msg.id, ok: true }, extra));
+
+        switch (msg.op) {
+            case 'realpath': {
+                reply({ path: await sftp.realpath(cleanPath(msg.path)) });
+                return;
+            }
+            case 'list': {
+                const real = await sftp.realpath(cleanPath(msg.path));
+                const raw = await sftp.list(real);
+                const entries = [];
+                let links = 0;
+                for (const e of raw) {
+                    const attrs = e.attrs || {};
+                    const link = isLinkMode(attrs.perms);
+                    let dir = isDirMode(attrs.perms);
+                    if (link && links++ < 20) {
+                        try {
+                            const st = await sftp.stat(real.replace(/\/+$/, '') + '/' + e.name);
+                            dir = isDirMode(st.perms);
+                        } catch (_) {}
+                    }
+                    entries.push({
+                        name: e.name,
+                        size: attrs.size == null ? null : attrs.size,
+                        modeText: modeString(attrs.perms),
+                        mtime: attrs.mtime ? attrs.mtime * 1000 : null,
+                        isDir: dir,
+                        isLink: link,
+                    });
+                }
+                reply({ path: real, entries });
+                return;
+            }
+            case 'mkdir': {
+                await sftp.mkdir(cleanPath(msg.path));
+                reply({});
+                return;
+            }
+            case 'remove': {
+                const p = cleanPath(msg.path);
+                if (msg.isDir) await sftp.rmdir(p);
+                else await sftp.remove(p);
+                reply({});
+                return;
+            }
+            case 'rename': {
+                await sftp.rename(cleanPath(msg.from), cleanPath(msg.to));
+                reply({});
+                return;
+            }
+            case 'open-read': {
+                const p = cleanPath(msg.path);
+                const st = await sftp.stat(p);
+                if (isDirMode(st.perms)) throw new Error('不能下载目录');
+                if ((st.size || 0) > MAX_FILE) throw new Error('文件超过 64 MB，暂不支持在浏览器中下载');
+                const handle = await sftp.open(p, OPEN.READ);
+                reply({ handle: this._trackHandle(handle), size: st.size || 0 });
+                return;
+            }
+            case 'read': {
+                const h = this.handles.get(String(msg.handle));
+                if (!h) throw new Error('文件句柄无效，请重新打开');
+                const offset = Math.max(0, Number(msg.offset) || 0);
+                const len = Math.min(262144, Math.max(1, parseInt(msg.len, 10) || READ_CHUNK));
+                const res = await sftp.read(h, offset, len);
+                if (res.eof) reply({ eof: true });
+                else reply({ data: b64encode(res.data), length: res.data.length });
+                return;
+            }
+            case 'open-write': {
+                const handle = await sftp.open(cleanPath(msg.path), OPEN.WRITE | OPEN.CREAT | OPEN.TRUNC);
+                reply({ handle: this._trackHandle(handle) });
+                return;
+            }
+            case 'write': {
+                const h = this.handles.get(String(msg.handle));
+                if (!h) throw new Error('文件句柄无效，请重新打开');
+                const data = b64decode(msg.data);
+                if (data.length > 1024 * 1024) throw new Error('单次写入的数据过大');
+                await sftp.write(h, Math.max(0, Number(msg.offset) || 0), data);
+                reply({});
+                return;
+            }
+            case 'close': {
+                await this._closeHandle(String(msg.handle));
+                reply({});
+                return;
+            }
+            case 'read-text': {
+                const p = cleanPath(msg.path);
+                const st = await sftp.stat(p);
+                if (isDirMode(st.perms)) throw new Error('这是一个目录');
+                const cap = Math.min(2 * 1024 * 1024, Math.max(1, parseInt(msg.max, 10) || EDIT_MAX));
+                if ((st.size || 0) > cap) throw new Error('文件超过 ' + Math.round(cap / 1024) + ' KB，暂不支持在线编辑');
+                const handle = await sftp.open(p, OPEN.READ);
+                try {
+                    const chunks = [];
+                    let offset = 0;
+                    for (;;) {
+                        const res = await sftp.read(handle, offset, READ_CHUNK);
+                        if (res.eof) break;
+                        if (!res.data || !res.data.length) break;
+                        chunks.push(res.data);
+                        offset += res.data.length;
+                        if (offset > cap) throw new Error('文件超过在线编辑上限');
+                    }
+                    const all = new Uint8Array(offset);
+                    let o = 0;
+                    for (const c of chunks) {
+                        all.set(c, o);
+                        o += c.length;
+                    }
+                    reply({ data: b64encode(all), size: offset });
+                } finally {
+                    await sftp.close(handle).catch(() => {});
+                }
+                return;
+            }
+            case 'write-text': {
+                const data = b64decode(msg.data);
+                if (data.length > 2 * 1024 * 1024) throw new Error('内容超过 2 MB，无法保存');
+                await this._writeAtomic(sftp, cleanPath(msg.path), data);
+                reply({ size: data.length });
+                return;
+            }
+            default:
+                throw new Error('未知的文件操作: ' + msg.op);
+        }
+    }
+
+    async _writeAtomic(sftp, path, data) {
+        const slash = path.lastIndexOf('/');
+        const dir = slash >= 0 ? path.slice(0, slash) : '.';
+        const base = path.slice(slash + 1);
+        const tmp = dir + '/.' + base + '.webssh-' + randomHex(3);
+        let handle = null;
+        try {
+            handle = await sftp.open(tmp, OPEN.WRITE | OPEN.CREAT | OPEN.TRUNC | OPEN.EXCL);
+            for (let off = 0; off < data.length; off += WRITE_CHUNK) {
+                await sftp.write(handle, off, data.subarray(off, off + WRITE_CHUNK));
+            }
+            await sftp.close(handle);
+            handle = null;
+            await sftp.rename(tmp, path);
+        } catch (e) {
+            if (handle) await sftp.close(handle).catch(() => {});
+            await sftp.remove(tmp).catch(() => {});
+            throw e;
         }
     }
 
@@ -397,6 +608,10 @@ export class Terminal {
             case 'ping':
                 this.send({ t: 'pong', ts: data.ts });
                 break;
+            case 'sftp':
+                if (!data.id) break;
+                this._sftpOp(data).catch((e) => this.send({ t: 'sftp', id: data.id, ok: false, error: String((e && e.message) || e) }));
+                break;
             case 'close':
                 this.cleanup('client');
                 break;
@@ -418,6 +633,12 @@ export class Terminal {
         if (this.statsTimer) clearInterval(this.statsTimer);
         for (const w of this.waiters.values()) w.reject(new Error('连接已关闭'));
         this.waiters.clear();
+        try {
+            for (const token of Array.from(this.handles.keys())) await this._closeHandle(token);
+        } catch (_) {}
+        try {
+            if (this.sftp) this.sftp.closeChannel();
+        } catch (_) {}
         try {
             if (this.client && !this.client.closed) await this.client.close('bye');
         } catch (_) {}

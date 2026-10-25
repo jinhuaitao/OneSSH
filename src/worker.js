@@ -4,6 +4,8 @@ import { connect } from 'cloudflare:sockets';
 import * as auth from './auth.js';
 import { getJSON, putJSON, del, list, getText } from './store.js';
 import { renderShell } from './pages.js';
+import { loadPrivateKey } from './ssh/keys.js';
+import { fingerprint } from './ssh/crypto.js';
 
 const VERSION = '1.0.0';
 
@@ -85,7 +87,84 @@ function cleanHostInput(body) {
 
 function publicHost(h) {
     const { secretEnc, keyEnc, passphraseEnc, ...rest } = h;
-    return { ...rest, hasSecret: Boolean(secretEnc || keyEnc) };
+    return { ...rest, hasSecret: Boolean(secretEnc || keyEnc || h.keyId) };
+}
+
+/* ---------------------------------------------------------------- groups */
+
+const GROUP_MAX = 40;
+
+function cleanGroupName(v) {
+    const name = String(v == null ? '' : v).trim();
+    if (!name || name.length > GROUP_MAX) throw new HttpError(400, '分组名称需为 1-40 个字符');
+    if (/[\\/\r\n\t]/.test(name)) throw new HttpError(400, '分组名称不能包含斜杠、制表符或换行');
+    return name;
+}
+
+async function storedGroups(env) {
+    const rec = await getJSON(env, 'sys/groups');
+    return rec && Array.isArray(rec.groups) ? rec.groups.filter((g) => typeof g === 'string' && g.trim()) : [];
+}
+
+async function saveGroups(env, groups) {
+    await putJSON(env, 'sys/groups', { groups, updatedAt: Date.now() });
+}
+
+async function listGroups(env) {
+    const out = [];
+    const seen = new Set();
+    for (const g of await storedGroups(env)) {
+        const name = g.trim();
+        if (name && !seen.has(name)) {
+            seen.add(name);
+            out.push(name);
+        }
+    }
+    // hosts saved before groups were a first-class concept still count
+    for (const o of await list(env, 'hosts/')) {
+        const rec = await getJSON(env, o.key);
+        const name = rec && String(rec.group || '').trim();
+        if (name && !seen.has(name)) {
+            seen.add(name);
+            out.push(name);
+        }
+    }
+    return out;
+}
+
+async function retagHosts(env, from, to) {
+    let n = 0;
+    for (const o of await list(env, 'hosts/')) {
+        const rec = await getJSON(env, o.key);
+        if (!rec || String(rec.group || '').trim() !== from) continue;
+        rec.group = to;
+        rec.updatedAt = Date.now();
+        await putJSON(env, o.key, rec);
+        n++;
+    }
+    return n;
+}
+
+/* ------------------------------------------------------------------ keys */
+
+function cleanKeyName(v) {
+    const name = String(v == null ? '' : v).trim();
+    if (!name || name.length > 60) throw new HttpError(400, '密钥名称需为 1-60 个字符');
+    return name;
+}
+
+async function storedKeys(env) {
+    const rec = await getJSON(env, 'sys/keys');
+    return rec && Array.isArray(rec.keys) ? rec.keys : [];
+}
+
+function publicKeyMeta(k) {
+    return { id: k.id, name: k.name, algo: k.algo || '', fingerprint: k.fingerprint || '', createdAt: k.createdAt || 0 };
+}
+
+async function inspectKey(privateKey) {
+    const key = await loadPrivateKey(privateKey);
+    return { algo: key.alg, fingerprint: await fingerprint(key.publicBlob) };
 }
 
 /* -------------------------------------------------------------------- api */
@@ -166,6 +245,104 @@ async function handleApi(request, env, url) {
         return json({ ok: true }, 200, { 'set-cookie': auth.sessionCookie(token, request) });
     }
 
+    if (path === '/api/groups') {
+        if (method === 'GET') {
+            return json({ groups: await listGroups(env) });
+        }
+        if (method === 'POST') {
+            const body = await readJSON(request);
+            const stored = await storedGroups(env);
+            const groups = await listGroups(env);
+            const op = String(body.op || '');
+            if (op === 'add') {
+                const name = cleanGroupName(body.name);
+                if (groups.includes(name)) return json({ error: 'dup', message: '同名分组已存在' }, 409);
+                stored.push(name);
+                await saveGroups(env, stored);
+                return json({ groups: await listGroups(env), updated: 0 });
+            }
+            if (op === 'rename') {
+                const from = String(body.from || '').trim();
+                const to = cleanGroupName(body.to);
+                if (!groups.includes(from)) return json({ error: 'not_found', message: '分组不存在' }, 404);
+                if (to !== from && groups.includes(to)) return json({ error: 'dup', message: '同名分组已存在' }, 409);
+                const next = stored.filter((g) => g !== from);
+                if (!next.includes(to)) next.push(to);
+                await saveGroups(env, next);
+                const updated = await retagHosts(env, from, to);
+                return json({ groups: await listGroups(env), updated });
+            }
+            if (op === 'remove') {
+                const name = String(body.name || '').trim();
+                if (!groups.includes(name)) return json({ error: 'not_found', message: '分组不存在' }, 404);
+                await saveGroups(env, stored.filter((g) => g !== name));
+                const moved = await retagHosts(env, name, '');
+                return json({ groups: await listGroups(env), moved });
+            }
+            return json({ error: 'bad_op', message: '未知操作' }, 400);
+        }
+    }
+
+    if (path === '/api/keys') {
+        if (method === 'GET') {
+            return json({ keys: (await storedKeys(env)).map(publicKeyMeta) });
+        }
+        if (method === 'POST') {
+            const body = await readJSON(request);
+            const keys = await storedKeys(env);
+            const id = String(body.id || '').trim();
+            const name = cleanKeyName(body.name);
+            const keyText = body.privateKey ? String(body.privateKey) : '';
+            const entry = id ? keys.find((k) => k.id === id) : null;
+            if (id && !entry) return json({ error: 'not_found', message: '密钥不存在' }, 404);
+            if (keys.some((k) => k.name === name && k.id !== id)) {
+                return json({ error: 'dup', message: '同名密钥已存在' }, 409);
+            }
+            let meta = null;
+            if (keyText) {
+                try {
+                    meta = await inspectKey(keyText);
+                } catch (e) {
+                    return json({ error: 'bad_key', message: String((e && e.message) || e) }, 400);
+                }
+            } else if (!entry) {
+                return json({ error: 'bad_key', message: '请粘贴私钥内容' }, 400);
+            }
+            const rec = {
+                id: entry ? entry.id : 'k' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+                name,
+                algo: meta ? meta.algo : entry.algo,
+                fingerprint: meta ? meta.fingerprint : entry.fingerprint,
+                keyEnc: keyText ? await auth.encryptSecret(env, keyText) : entry.keyEnc,
+                passphraseEnc: body.passphrase
+                    ? await auth.encryptSecret(env, String(body.passphrase))
+                    : entry
+                      ? entry.passphraseEnc || null
+                      : null,
+                createdAt: entry ? entry.createdAt : Date.now(),
+                updatedAt: Date.now(),
+            };
+            const next = entry ? keys.map((k) => (k.id === rec.id ? rec : k)) : keys.concat(rec);
+            await putJSON(env, 'sys/keys', { keys: next, updatedAt: Date.now() });
+            return json({ key: publicKeyMeta(rec) });
+        }
+    }
+
+    if (path.startsWith('/api/keys/') && method === 'DELETE') {
+        const id = path.slice('/api/keys/'.length);
+        if (!/^[a-zA-Z0-9]+$/.test(id)) return json({ error: 'bad_id', message: '无效的密钥 ID' }, 400);
+        const keys = await storedKeys(env);
+        if (!keys.some((k) => k.id === id)) return json({ error: 'not_found', message: '密钥不存在' }, 404);
+        let used = 0;
+        for (const o of await list(env, 'hosts/')) {
+            const rec = await getJSON(env, o.key);
+            if (rec && rec.keyId === id) used++;
+        }
+        if (used) return json({ error: 'in_use', message: `该密钥正被 ${used} 台主机使用，请先改用其他凭据` }, 409);
+        await putJSON(env, 'sys/keys', { keys: keys.filter((k) => k.id !== id), updatedAt: Date.now() });
+        return json({ ok: true });
+    }
+
     if (path === '/api/hosts') {
         if (method === 'GET') {
             const objs = await list(env, 'hosts/');
@@ -193,8 +370,16 @@ async function handleApi(request, env, url) {
                     rec.secretEnc = existing.secretEnc;
                 }
             } else {
+                const keyId = typeof body.keyId === 'string' ? body.keyId.trim() : '';
                 const keyText = body.privateKey ? String(body.privateKey) : '';
-                if (keyText) {
+                if (keyId) {
+                    const vault = await storedKeys(env);
+                    const entry = vault.find((k) => k.id === keyId);
+                    if (!entry || !entry.keyEnc) {
+                        return json({ error: 'bad_key', message: '所选密钥不存在，请刷新密钥库后重试' }, 400);
+                    }
+                    rec.keyId = keyId;
+                } else if (keyText) {
                     if (!/BEGIN [A-Z ]*PRIVATE KEY/.test(keyText)) {
                         return json({ error: 'bad_key', message: '私钥格式无法识别（需 PEM 格式）' }, 400);
                     }
@@ -205,6 +390,8 @@ async function handleApi(request, env, url) {
                 } else if (existing && existing.keyEnc && saveSecret) {
                     rec.keyEnc = existing.keyEnc;
                     rec.passphraseEnc = existing.passphraseEnc || null;
+                } else if (existing && existing.keyId && saveSecret) {
+                    rec.keyId = existing.keyId;
                 }
             }
             await putJSON(env, 'hosts/' + id, rec);

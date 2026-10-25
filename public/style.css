@@ -336,6 +336,11 @@ textarea {
     gap: 4px;
     width: 100%;
     align-items: center;
+    overflow-y: auto;
+    scrollbar-width: none;
+}
+.rail-nav::-webkit-scrollbar {
+    display: none;
 }
 .rail-item {
     position: relative;
@@ -968,6 +973,117 @@ textarea {
     border-color: var(--ink);
 }
 
+/* ---------------------------------------------------------- file manager */
+
+.btn.sm {
+    padding: 7px 11px;
+    font-size: 12px;
+    border-radius: 8px;
+}
+.fm {
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    min-height: 0;
+}
+.fm-bar {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+.fm-path {
+    flex: 1;
+    min-width: 150px;
+    font-family: var(--mono);
+    font-size: 12px;
+    padding: 8px 10px;
+}
+.fm-list {
+    height: min(48vh, 420px);
+    overflow: auto;
+    border: 1px solid var(--line-2);
+    border-radius: 10px;
+    background: #fff;
+}
+.fm-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--line-2);
+    font-size: 12.5px;
+    cursor: pointer;
+}
+.fm-row:last-child {
+    border-bottom: 0;
+}
+.fm-row:hover {
+    background: var(--paper-2);
+}
+.fm-ic {
+    display: grid;
+    place-items: center;
+    color: var(--muted);
+}
+.fm-row.dir .fm-ic {
+    color: #c98a12;
+}
+.fm-name {
+    flex: 1;
+    min-width: 0;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+.fm-size {
+    width: 72px;
+    text-align: right;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted);
+}
+.fm-time {
+    width: 112px;
+    text-align: right;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--muted-2);
+}
+.fm-acts {
+    display: flex;
+    gap: 1px;
+    opacity: 0.45;
+    transition: opacity 0.15s ease;
+}
+.fm-row:hover .fm-acts,
+.fm-row:focus-within .fm-acts {
+    opacity: 1;
+}
+.fm-status {
+    min-height: 16px;
+    font-size: 11.5px;
+    color: var(--muted);
+    font-family: var(--mono);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.fm-status.err {
+    color: var(--red);
+}
+.fm-edit-wrap {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.fm-edit {
+    min-height: min(52vh, 440px);
+    resize: vertical;
+    font-size: 12px;
+    line-height: 1.55;
+}
+
 /* --------------------------------------------------------------- mobile */
 
 @media (max-width: 1180px) {
@@ -1004,5 +1120,14 @@ textarea {
     }
     .filters {
         gap: 18px;
+    }
+    .fm-time {
+        display: none;
+    }
+    .fm-acts {
+        opacity: 1;
+    }
+    .fm-list {
+        height: min(44vh, 340px);
     }
 }

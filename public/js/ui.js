@@ -59,6 +59,12 @@ const PATHS = {
     trash: '<path d="M4.5 7h15M9.5 7V5.5h5V7M6.5 7l.8 12h9.4l.8-12M10 10.5v6M14 10.5v6"/>',
     down: '<path d="M12 4.5v14M6.5 13 12 18.5 17.5 13"/>',
     check: '<path d="m5 12.5 4.5 4.5L19 7"/>',
+    folder: '<path d="M3.5 6.5h6l1.8 2h9.2v10.5a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1z"/>',
+    file: '<path d="M6.5 3.5h7l4.5 4.5v12.5h-11.5z"/><path d="M13.5 3.5V8H18"/>',
+    upload: '<path d="M12 19.5v-14M6.5 11 12 5.5 17.5 11M5 21h14"/>',
+    download: '<path d="M12 4.5v14M6.5 13 12 18.5 17.5 13M5 21h14"/>',
+    up: '<path d="m6.5 14.5 5.5-5.5 5.5 5.5"/>',
+    lock: '<rect x="4" y="10" width="16" height="10" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
 };
 
 export function icon(name, size) {

@@ -26,6 +26,12 @@ export class Reader {
         this.p = p + 4;
         return v;
     }
+    /** uint64, exact up to 2^53 (file sizes / offsets) */
+    u64() {
+        const hi = this.u32();
+        const lo = this.u32();
+        return hi * 4294967296 + lo;
+    }
     /** length-prefixed byte string */
     str() {
         const n = this.u32();
@@ -74,6 +80,11 @@ export class Writer {
         const a = new Uint8Array(4);
         new DataView(a.buffer).setUint32(0, v >>> 0);
         return this._push(a);
+    }
+    u64(v) {
+        const n = Math.max(0, Number(v) || 0);
+        const hi = Math.floor(n / 4294967296);
+        return this.u32(hi).u32(n - hi * 4294967296);
     }
     raw(u8) {
         return this._push(u8 instanceof Uint8Array ? u8 : new Uint8Array(u8));

@@ -17,6 +17,8 @@ const ICONS = {
     close: '<path d="m6 6 12 12M18 6 6 18"/>',
     edit: '<path d="m4 16.5-.8 4 4-.8L19 8a2.1 2.1 0 0 0-3-3z"/>',
     log: '<path d="M6 3.5h7l5 5v12H6z"/><path d="M13 3.5v5h5M9 13h6M9 16.5h4"/>',
+    folder: '<path d="M3.5 6.5h6l1.8 2h9.2v10.5a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1z"/>',
+    lock: '<rect x="4" y="10" width="16" height="10" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
 };
 
 function icon(name, size) {
@@ -92,9 +94,11 @@ export function renderShell() {
     <div class="rail-brand">${icon('terminal', 20)}</div>
     <nav class="rail-nav">
       <button class="rail-item on" data-nav="overview">${icon('home')}<span>总览</span></button>
+      <button class="rail-item" data-nav="groups">${icon('folder')}<span>分组</span></button>
       <button class="rail-item" data-nav="snippets">${icon('code')}<span>代码片段</span></button>
       <button class="rail-item" data-nav="quick">${icon('bolt')}<span>快速连接</span></button>
       <button class="rail-item" data-nav="known">${icon('key')}<span>主机密钥</span></button>
+      <button class="rail-item" data-nav="keys">${icon('lock')}<span>密钥库</span></button>
       <button class="rail-item" data-nav="settings">${icon('gear')}<span>设置</span></button>
     </nav>
     <button class="rail-item rail-out" data-nav="logout">${icon('logout')}<span>退出</span></button>
@@ -165,7 +169,8 @@ export function renderShell() {
     </div>
     <div class="hb-stats" id="hb-stats"></div>
     <div class="hb-actions">
-      <button class="tbtn ghost" id="btn-snippets">${icon('code', 15)} 代码片段</button>
+      <button class="tbtn ghost" id="btn-files">${icon('folder', 15)}<span>文件</span></button>
+      <button class="tbtn ghost" id="btn-snippets">${icon('code', 15)}<span>代码片段</span></button>
       <button class="tbtn ghost" id="btn-dup" title="新开一个会话">${icon('plus', 15)}</button>
       <button class="tbtn ghost" id="btn-reconnect" title="重连">${icon('refresh', 15)}</button>
       <button class="tbtn ghost" id="btn-fullscreen" title="全屏">${icon('expand', 15)}</button>

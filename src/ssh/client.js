@@ -326,7 +326,10 @@ export class SSHClient {
                 const r = new Reader(p, 1);
                 const ch = this.channels.get(r.u32());
                 const inc = r.u32();
-                if (ch) ch.window += inc;
+                if (ch) {
+                    ch.window += inc;
+                    this._pumpWindow(ch);
+                }
                 return;
             }
             case MSG.CHANNEL_DATA: {
@@ -365,6 +368,9 @@ export class SSHClient {
                 if (!ch) return;
                 ch.closed = true;
                 this.send(new Writer().byte(MSG.CHANNEL_CLOSE).u32(ch.remoteId).bytes()).catch(() => {});
+                if (ch.windowWaiters) {
+                    for (const w of ch.windowWaiters.splice(0)) w.resolve();
+                }
                 if (ch.handlers.onClose) ch.handlers.onClose(ch);
                 ch.done.resolve();
                 this.channels.delete(ch.localId);
@@ -649,6 +655,7 @@ export class SSHClient {
             handlers,
             openWaiter: deferred(),
             reqWaiter: null,
+            windowWaiters: [],
             done: deferred(),
         };
         this.channels.set(localId, ch);
@@ -681,6 +688,43 @@ export class SSHClient {
             const w = new Writer().byte(MSG.CHANNEL_DATA).u32(ch.remoteId).str(chunk);
             this.send(w.bytes()).catch((e) => this._fail(e));
         }
+    }
+
+    _pumpWindow(ch) {
+        if (!ch.windowWaiters) return;
+        while (ch.windowWaiters.length && ch.window >= ch.windowWaiters[0].n) {
+            ch.windowWaiters.shift().resolve();
+        }
+    }
+
+    _waitWindow(ch, n) {
+        if (ch.closed || this.closed) return Promise.reject(new Error('通道已关闭'));
+        if (ch.window >= n) return Promise.resolve();
+        return new Promise((resolve) => ch.windowWaiters.push({ n, resolve }));
+    }
+
+    /** write data respecting the remote window (needed for bulk transfers) */
+    async writeChannelFlow(ch, data) {
+        if (!ch || ch.closed || this.closed) throw new Error('通道已关闭');
+        const u8 = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+        const max = Math.min(ch.maxPacket || MAX_PACKET, 16384);
+        for (let i = 0; i < u8.length; i += max) {
+            const chunk = u8.subarray(i, i + max);
+            await this._waitWindow(ch, chunk.length);
+            if (ch.closed || this.closed) throw new Error('通道已关闭');
+            ch.window -= chunk.length;
+            const w = new Writer().byte(MSG.CHANNEL_DATA).u32(ch.remoteId).str(chunk);
+            await this.send(w.bytes());
+        }
+    }
+
+    /** close a non-shell channel opened with openChannel() */
+    closeChannel(ch) {
+        if (!ch || ch.closed) return;
+        ch.closed = true;
+        this.send(new Writer().byte(MSG.CHANNEL_CLOSE).u32(ch.remoteId).bytes()).catch(() => {});
+        if (ch.windowWaiters) for (const w of ch.windowWaiters.splice(0)) w.resolve();
+        this.channels.delete(ch.localId);
     }
 
     async _openShell() {
