@@ -1,0 +1,24 @@
+{
+    // Cloudflare Workers 配置。R2 绑定故意不写 bucket_name ——
+    // 这样在控制台连接 GitHub 部署（Workers Builds）时会自动创建存储桶并自动绑定。
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "webssh",
+    "main": "src/worker.js",
+    "compatibility_date": "2026-10-20",
+    "workers_dev": true,
+    "observability": {
+        "enabled": true
+    },
+    "upload_source_maps": true,
+    "r2_buckets": [
+        {
+            "binding": "BUCKET"
+            // 不写 "bucket_name"：首次部署时自动创建 <worker-name>-bucket 并绑定
+        }
+    ],
+    "assets": {
+        "directory": "./public",
+        "binding": "ASSETS",
+        "not_found_handling": "none"
+    }
+}
