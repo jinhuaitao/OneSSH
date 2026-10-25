@@ -19,8 +19,8 @@ void main() {
     float r = length(p);
     if (r <= 1.0) discard;
     float ga = 1.0 - smoothstep(1.0, 1.075, r);
-    ga = ga * ga * 0.40;
-    vec3 gc = vec3(0.55, 0.66, 0.80);
+    ga = ga * ga * 0.45;
+    vec3 gc = vec3(0.42, 0.64, 0.92);
     vec2 s = (p - vec2(0.06, -1.03)) / vec2(0.78, 0.14);
     float sa = (1.0 - smoothstep(0.15, 1.0, length(s))) * 0.16;
     vec3 sc = vec3(0.45, 0.39, 0.31);
@@ -55,20 +55,19 @@ varying vec2 vUv;
 varying vec3 vN;
 void main() {
     vec3 n = normalize(vN);
-    // grade the earth toward the page palette: warm paper wash, muted colour
-    vec3 tex = pow(texture2D(uTex, vUv).rgb, vec3(0.56));
-    tex = mix(tex, vec3(0.93, 0.935, 0.93), 0.32);
-    tex = mix(tex, vec3(dot(tex, vec3(0.299, 0.587, 0.114))), 0.10);
+    // lifted and slightly washed out so the globe sits on the light dashboard
+    vec3 tex = pow(texture2D(uTex, vUv).rgb, vec3(0.66));
+    tex = mix(tex, vec3(0.90, 0.94, 0.98), 0.18);
     vec3 L = normalize(vec3(-0.5, 0.58, 0.64));
     float diff = max(dot(n, L), 0.0);
-    float lit = 0.95 + 0.18 * pow(diff, 0.9);
+    float lit = 0.88 + 0.26 * pow(diff, 0.9);
     vec3 H = normalize(L + vec3(0.0, 0.0, 1.0));
     float water = smoothstep(0.02, 0.14, tex.b - tex.r);
-    float glint = pow(max(dot(n, H), 0.0), 110.0) * water * 0.45;
+    float glint = pow(max(dot(n, H), 0.0), 110.0) * water * 0.55;
     float graze = pow(1.0 - max(n.z, 0.0), 3.0);
-    float haze = graze * 0.40 + graze * diff * 0.16;
-    vec3 col = tex * lit + vec3(glint) + vec3(0.82, 0.84, 0.85) * haze;
-    gl_FragColor = vec4(col * vec3(1.03, 1.0, 0.95) + vec3(0.012, 0.008, 0.0), 1.0);
+    float haze = graze * 0.42 + graze * diff * 0.18;
+    vec3 col = tex * lit + vec3(glint) + vec3(0.62, 0.76, 0.92) * haze;
+    gl_FragColor = vec4(col, 1.0);
 }
 `;
 
@@ -329,9 +328,9 @@ export function createGlobe(canvas, labelLayer, opts) {
 
     function drawFallback() {
         const g = ctx.createRadialGradient(cx - R * 0.42, cy - R * 0.46, R * 0.04, cx + R * 0.1, cy + R * 0.14, R * 1.12);
-        g.addColorStop(0, '#c3cdd2');
-        g.addColorStop(0.55, '#a3b4bd');
-        g.addColorStop(1, '#8499a8');
+        g.addColorStop(0, '#5d95bb');
+        g.addColorStop(0.55, '#2f668f');
+        g.addColorStop(1, '#123a5c');
         ctx.beginPath();
         ctx.arc(cx, cy, R, 0, TAU);
         ctx.fillStyle = g;
