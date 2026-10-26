@@ -186,36 +186,44 @@ const THROTTLE_LIMIT = 6;
 const THROTTLE_WINDOW = 10 * 60 * 1000;
 const THROTTLE_LOCK = 15 * 60 * 1000;
 
+// R2 没有 CAS：原来「读计数 → 改 → 写回」在并发下会互相覆盖，6 次锁定形同虚设。
+// 改成每次失败写一个独立对象、用 list 计数 —— 并发写不同的 key 不会丢更新。
+function throttlePrefix(ip) {
+    return 'throttle/' + String(ip).replace(/[^0-9a-zA-Z.:\-_\[\]]/g, '_') + '/';
+}
+
 export async function checkThrottle(env, ip) {
     if (!ip) return { locked: false };
-    const rec = await getJSON(env, 'throttle/' + ip);
-    if (!rec) return { locked: false };
-    if (rec.until && rec.until > Date.now()) {
-        return { locked: true, retryAfter: Math.ceil((rec.until - Date.now()) / 1000) };
+    const prefix = throttlePrefix(ip);
+    const now = Date.now();
+    const stamps = [];
+    for (const o of await list(env, prefix)) {
+        const ts = parseInt(o.key.slice(prefix.length), 10);
+        if (!Number.isFinite(ts)) continue;
+        if (now - ts <= THROTTLE_WINDOW) stamps.push(ts);
+        else del(env, o.key).catch(() => {}); // 顺手清理过期记录（不阻塞判定）
     }
+    if (stamps.length < THROTTLE_LIMIT) return { locked: false };
+    const until = Math.max(...stamps) + THROTTLE_LOCK;
+    if (until > now) return { locked: true, retryAfter: Math.ceil((until - now) / 1000) };
     return { locked: false };
 }
 
 export async function recordFailure(env, ip) {
     if (!ip) return;
-    const key = 'throttle/' + ip;
-    const rec = (await getJSON(env, key)) || { count: 0, first: Date.now() };
-    if (Date.now() - rec.first > THROTTLE_WINDOW) {
-        rec.count = 0;
-        rec.first = Date.now();
-    }
-    rec.count += 1;
-    if (rec.count >= THROTTLE_LIMIT) rec.until = Date.now() + THROTTLE_LOCK;
-    await putJSON(env, key, rec);
+    await putJSON(env, throttlePrefix(ip) + Date.now() + '-' + randomHex(4), 1);
 }
 
 export async function clearFailures(env, ip) {
-    if (ip) await del(env, 'throttle/' + ip);
+    if (!ip) return;
+    const prefix = throttlePrefix(ip);
+    for (const o of await list(env, prefix)) await del(env, o.key).catch(() => {});
 }
 
 /* ------------------------------------------------------- secret at rest */
 
 let cachedMaster = null;
+let cachedMasterTag = null;
 
 function b64encode(u8) {
     let s = '';
@@ -242,11 +250,12 @@ export async function ensureMasterKey(env) {
 }
 
 export async function getMasterKey(env) {
-    if (cachedMaster) return cachedMaster;
+    // 缓存按「密钥来源」区分：轮换 WEBSSH_MASTER_KEY 后不能再拿旧钥继续加解密
+    const tag = env.WEBSSH_MASTER_KEY ? String(env.WEBSSH_MASTER_KEY).trim() : '';
+    if (cachedMaster && cachedMasterTag === tag) return cachedMaster;
     let raw = null;
-    if (env.WEBSSH_MASTER_KEY) {
-        const v = String(env.WEBSSH_MASTER_KEY).trim();
-        raw = /^[a-f0-9]{64}$/i.test(v) ? fromHex(v) : b64decode(v);
+    if (tag) {
+        raw = /^[a-f0-9]{64}$/i.test(tag) ? fromHex(tag) : b64decode(tag);
         if (raw.length !== 32) throw new Error('WEBSSH_MASTER_KEY 必须是 32 字节的 base64 或 64 位 hex');
     } else {
         const rec = await getJSON(env, MASTER_KEY);
@@ -254,6 +263,7 @@ export async function getMasterKey(env) {
         raw = b64decode(rec.key);
     }
     cachedMaster = await importMaster(raw);
+    cachedMasterTag = tag;
     return cachedMaster;
 }
 

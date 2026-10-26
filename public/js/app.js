@@ -460,7 +460,6 @@ function askCredentials(host) {
         const secretInput = isKey
             ? el('textarea', { placeholder: '-----BEGIN OPENSSH PRIVATE KEY-----', spellcheck: 'false' })
             : el('input', { type: 'password', autocomplete: 'off', placeholder: '登录密码' });
-        const passphrase = isKey ? el('input', { type: 'password', autocomplete: 'off', placeholder: '私钥没有口令可留空' }) : null;
         const body = el('div', { style: 'display:flex;flex-direction:column;gap:12px' }, [
             el('p', {
                 class: 'note-box',
@@ -471,7 +470,6 @@ function askCredentials(host) {
                     '本次输入只在内存中使用。',
             }),
             el('label', { text: isKey ? '私钥（PEM）' : '密码' }, [secretInput]),
-            passphrase ? el('label', { text: '私钥口令' }, [passphrase]) : null,
         ]);
         const foot = el('div', { style: 'display:flex;gap:8px' }, [
             el('button', { class: 'btn', type: 'button', text: '取消', onclick: () => finish(null) }),
@@ -485,7 +483,7 @@ function askCredentials(host) {
                         toast('请先填入凭据', 'err');
                         return;
                     }
-                    finish(isKey ? { privateKey: value, passphrase: passphrase ? passphrase.value : '' } : { password: value });
+                    finish(isKey ? { privateKey: value } : { password: value });
                 },
             }),
         ]);
@@ -534,20 +532,17 @@ function openHostEditor(host) {
 
     const pwIn = el('input', { type: 'password', autocomplete: 'new-password', placeholder: h.hasSecret ? '已保存，留空则不修改' : '登录密码' });
     const keyIn = el('textarea', { placeholder: h.hasSecret ? '已保存私钥，留空则不修改' : '-----BEGIN OPENSSH PRIVATE KEY-----', spellcheck: 'false' });
-    const passIn = el('input', { type: 'password', autocomplete: 'off', placeholder: '私钥没有口令可留空' });
 
     let keyId = h.keyId && state.keys.some((k) => k.id === h.keyId) ? h.keyId : '';
     const keySel = el('select', { name: 'keyId' });
     const keyMeta = el('div', { class: 'fp', style: 'font-size:11px;padding:8px 10px' });
-    const keyField = field('私钥（PEM）', keyIn);
-    const passField = field('私钥口令', passIn);
+    const keyField = field('私钥（PEM）', keyIn, 'OpenSSH / PKCS#1 / PKCS#8 均可；不支持带口令的私钥');
     const keyNote = el('p', { class: 'muted-sm', style: 'margin:0', text: '在「凭据库」里可以复用同一把私钥，主机只需要引用。' });
     const applyKey = () => {
         const entry = state.keys.find((k) => k.id === keyId);
         keyMeta.hidden = !entry;
         if (entry) keyMeta.textContent = (entry.algo || '') + ' · ' + (entry.fingerprint || '');
         keyField.hidden = !!entry;
-        passField.hidden = !!entry;
         keyNote.textContent = entry ? '这把私钥在「凭据库」中统一管理。' : '在「凭据库」里可以复用同一把私钥，主机只需要引用。';
     };
     const fillKeys = (selected) => {
@@ -620,7 +615,6 @@ function openHostEditor(host) {
         field('私钥来源', keySel),
         keyMeta,
         keyField,
-        passField,
         keyNote,
     ]);
 
@@ -786,7 +780,6 @@ function openHostEditor(host) {
             payload.keyId = keyId;
         } else {
             if (keyIn.value.trim()) payload.privateKey = keyIn.value.trim();
-            if (passIn.value) payload.passphrase = passIn.value;
         }
         if (host) payload.id = host.id;
         const res = await safe(() => api('/api/hosts', { method: 'POST', body: payload }));
@@ -1143,18 +1136,16 @@ function credEditor(cred, after) {
 function keyEditor(key, after) {
     const nameIn = el('input', { type: 'text', value: key ? key.name : '', placeholder: '例如 生产服务器密钥' });
     const keyIn = el('textarea', { placeholder: key ? '已保存，留空则不修改' : '-----BEGIN OPENSSH PRIVATE KEY-----', spellcheck: 'false' });
-    const passIn = el('input', { type: 'password', autocomplete: 'off', placeholder: '私钥没有口令可留空' });
     const body = el('div', { style: 'display:flex;flex-direction:column;gap:12px' }, [
         field('名称', nameIn),
         key
             ? el('div', { class: 'fp', style: 'font-size:11px;padding:8px 10px', text: (key.algo || '') + ' · ' + (key.fingerprint || '') })
             : null,
         field('私钥（PEM）', keyIn),
-        field('私钥口令', passIn),
         el('p', {
             class: 'note-box',
             style: 'margin:0',
-            text: '支持 ed25519、RSA（OpenSSH / PEM）；暂不支持带口令的 OpenSSH 私钥和 ECDSA。',
+            text: '支持 ed25519 / RSA，格式 OpenSSH、PKCS#1、PKCS#8 都可以；不支持带口令的私钥（请先 ssh-keygen -p -N "" 去掉口令）和 ECDSA。',
         }),
     ]);
     const foot = el('div', { style: 'display:flex;gap:8px' }, [
@@ -1176,7 +1167,6 @@ function keyEditor(key, after) {
                 const payload = { name };
                 if (key) payload.id = key.id;
                 if (keyIn.value.trim()) payload.privateKey = keyIn.value.trim();
-                if (passIn.value) payload.passphrase = passIn.value;
                 const res = await safe(() => api('/api/keys', { method: 'POST', body: payload }));
                 if (!res) return;
                 m.close();
@@ -1309,8 +1299,17 @@ function openKnown() {
         for (const k of items) {
             const del = el('button', { class: 'act icon-only', type: 'button', title: '忘记这台主机', html: icon('trash', 14) });
             del.addEventListener('click', async () => {
-                const ok = await safe(() => api('/api/known?key=' + encodeURIComponent(k.key), { method: 'DELETE' }));
+                // 删除信任记录 = 撤掉这台主机的中间人防护，必须二次确认，不能一键直删
+                const ok = await confirmModal(
+                    '忘记这台主机',
+                    '删除 <b>' + esc(k.host + ':' + k.port) + '</b> 的主机密钥记录后，下次连接会重新询问是否信任，' +
+                        '期间任何人都可能冒充这台服务器。只有在确认服务器重装或换过密钥时才这样做。',
+                    '删除',
+                    true
+                );
                 if (!ok) return;
+                const res = await safe(() => api('/api/known?key=' + encodeURIComponent(k.key), { method: 'DELETE' }));
+                if (!res) return;
                 toast('已移除');
                 openKnownRefresh();
             });
@@ -1473,14 +1472,13 @@ function openQuickConnect() {
     const portIn = el('input', { type: 'number', value: '22', min: '1', max: '65535' });
     const pwIn = el('input', { type: 'password', autocomplete: 'off', placeholder: '登录密码' });
     const keyIn = el('textarea', { placeholder: '-----BEGIN OPENSSH PRIVATE KEY-----', spellcheck: 'false' });
-    const passIn = el('input', { type: 'password', placeholder: '私钥没有口令可留空' });
 
     let authType = 'password';
     const segPw = el('button', { type: 'button', class: 'on', text: '密码' });
     const segKey = el('button', { type: 'button', text: '私钥' });
     const seg = el('div', { class: 'seg' }, [segPw, segKey]);
     const pwBox = el('div', {}, [field('密码', pwIn)]);
-    const keyBox = el('div', { hidden: true }, [field('私钥（PEM）', keyIn), field('私钥口令', passIn)]);
+    const keyBox = el('div', { hidden: true }, [field('私钥（PEM）', keyIn, '不支持带口令的私钥')]);
     segPw.addEventListener('click', () => {
         authType = 'password';
         segPw.classList.add('on');
@@ -1514,7 +1512,7 @@ function openQuickConnect() {
             toast('主机和用户名都不能为空', 'err');
             return;
         }
-        const secret = authType === 'password' ? { password: pwIn.value } : { privateKey: keyIn.value.trim(), passphrase: passIn.value };
+        const secret = authType === 'password' ? { password: pwIn.value } : { privateKey: keyIn.value.trim() };
         if (authType === 'password' && !pwIn.value) {
             toast('请输入密码', 'err');
             return;

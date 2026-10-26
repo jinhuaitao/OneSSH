@@ -80,7 +80,7 @@ node tests/e2e.mjs --headful    # 想看着它点
 | ➕ **添加主机** | 名称、分组、地址、端口、用户名，选密码或私钥，再选地区和城市；同一分组内按添加先后排列 |
 | 🌐 **IPv6** | 填 `2001:db8::1` 或 `[2001:db8::1]` 都行，列表统一显示为 `user@[addr]:port` |
 | 🔌 **连接** | 点主机行一键直连；没存凭据则弹窗临时输入，只在内存里用 |
-| ⚡ **快速连接** | 左侧闪电图标，临时连接不落库，可顺手保存到我的主机 |
+| ⚡ **快速连接** | 左侧闪电图标，临时连接不落库，可顺手保存到我的主机；为防止被当成端口扫描器，同一登录会话 10 分钟内最多连 10 个临时目标 |
 | 🔑 **主机密钥** | 首次连接弹 `SHA256:...` 指纹确认（与 `ssh-keygen -lf` 一致）；服务器重装后先删旧记录 |
 
 ### 🗂️ 组织与凭据
@@ -157,7 +157,7 @@ node tests/e2e.mjs --headful    # 想看着它点
 
 - 免费计划单请求 CPU 只有 10ms，`yes`、`cat` 大文件这类持续大输出可能被中断；重度使用建议 Paid 计划（$5/月，30s CPU）。
 - 监控依赖 Linux 的 `/proc`，BSD / macOS / Windows 显示「不可用」（终端本身照常可用）。
-- 暂不支持端口转发、Agent 转发、带口令的 OpenSSH 私钥（`bcrypt_pbkdf`）。带口令私钥请先 `ssh-keygen -p -m PEM` 转成无口令 PEM。
+- 暂不支持端口转发、Agent 转发、带口令的私钥（OpenSSH 用 `bcrypt_pbkdf`、传统 PEM 用 MD5 派生，WebCrypto 都没有）。带口令的私钥请先去掉口令：`ssh-keygen -p -N "" -f <私钥文件>`（会覆盖原文件，先备份）。
 - 只支持 `curve25519-sha256` 系列密钥交换和 CTR 系列加密，非常老的服务器（`diffie-hellman-group1-sha1` / `3des-cbc`）连不上。
 
 </details>
@@ -181,7 +181,7 @@ SSH 协议栈是自己实现的（`src/ssh/`），只依赖 WebCrypto：`curve25
 | `src/worker.js` | 路由：页面、`/api/*`、`/ws` 升级；在 fetch 处理器内建立 TCP 连接 |
 | `src/session.js` | WebSocket ↔ SSH 桥接：状态推送、主机密钥确认、窗口调整、录制、保活、监控采样 |
 | `src/hostaddr.js` | 主机地址规范化：域名 / IPv4 / IPv6（IPv6 统一补方括号） |
-| `src/ssh/client.js` | SSH-2 传输层 / 密钥交换 / 认证 / 多通道（shell + exec + sftp） |
+| `src/ssh/client.js` | SSH-2 传输层 / 密钥交换 / 认证 / 多通道（shell + exec + sftp）；协商 `kex-strict-*`（Terrapin 缓解）与 `ext-info-c` |
 | `src/ssh/sftp.js` | SFTP v3 客户端：读目录、读写文件、原子保存（临时文件 + 重命名） |
 | `src/ssh/crypto.js` | CTR 密钥流（按包偏移连续）、HMAC、密钥派生、主机密钥签名校验 |
 | `src/ssh/keys.js` | OpenSSH / PKCS#1 / PKCS#8 私钥解析与签名 |

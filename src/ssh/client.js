@@ -38,6 +38,8 @@ export const MSG = {
 };
 
 const KEX_ALGS = ['curve25519-sha256', 'curve25519-sha256@libssh.org'];
+// 只用来「通告」，不参与 pick()：这两个不是真正的密钥交换算法
+const KEX_EXTRA = ['ext-info-c', 'kex-strict-c-v00@openssh.com'];
 const CIPHERS = ['aes128-ctr', 'aes192-ctr', 'aes256-ctr'];
 const MACS = ['hmac-sha2-256', 'hmac-sha2-512', 'hmac-sha1'];
 const CIPHER_KEYLEN = { 'aes128-ctr': 16, 'aes192-ctr': 24, 'aes256-ctr': 32 };
@@ -45,6 +47,17 @@ const MAC_LEN = { 'hmac-sha2-256': 32, 'hmac-sha2-512': 64, 'hmac-sha1': 20 };
 
 const WINDOW = 2 * 1024 * 1024;
 const MAX_PACKET = 32 * 1024;
+
+/** 给任意 promise 加超时：SSH 里"对方不说话"是最常见的失败方式，不能无限等 */
+function withTimeout(promise, ms, message) {
+    let timer;
+    return Promise.race([
+        promise,
+        new Promise((_, reject) => {
+            timer = setTimeout(() => reject(new Error(message)), ms);
+        }),
+    ]).finally(() => clearTimeout(timer));
+}
 
 function deferred() {
     let resolve, reject;
@@ -105,11 +118,24 @@ export class SSHClient {
         this.ready = false;
         this.authFailures = [];
         this.readyDeferred = deferred();
+        this.lastInbound = Date.now();
+        this.strictKex = false;
+        this.kexActive = false;
+        this._watchdog = null;
     }
 
     /** resolves once the interactive shell is up */
     connect() {
+        // 总超时兜底：连 banner 都不发的服务器也必须能被放弃，否则连接会一直挂着
+        this._watchdog = setTimeout(() => this._fail(new Error('SSH 握手超时（40 秒内未完成）')), 40000);
+        const done = () => clearTimeout(this._watchdog);
+        this.readyDeferred.promise.then(done, done);
         return this.readyDeferred.promise;
+    }
+
+    /** 外部主动放弃（例如保活超时） */
+    abort(reason) {
+        this._fail(new Error(String(reason || '连接已中止')));
     }
 
     /* ================================================================ input */
@@ -177,11 +203,14 @@ export class SSHClient {
             this.buf = this.buf.slice(this.off);
             this.off = 0;
         }
+        this.lastInbound = Date.now();
         const padLen = pkt[4];
+        // RFC 4253 §6：padding 至少 4 字节，且必须给 payload 留出至少 1 字节（报文类型）
+        if (padLen < 4 || padLen > packetLen - 1) throw new Error('bad padding length ' + padLen);
         return pkt.subarray(5, 4 + packetLen - padLen);
     }
 
-    async send(payload) {
+    async send(payload, opts) {
         const run = async () => {
             const block = this.encOut ? 16 : 8;
             let padLen = block - ((payload.length + 5) % block);
@@ -199,6 +228,9 @@ export class SSHClient {
             if (this.encOut) out = await this.encOut.crypt(pkt);
             if (mac) out = concat(out, mac);
             await this.opts.write(out);
+            // strict kex：NEWKEYS 之后序号从 0 重新开始。必须在本包写完之后重置，
+            // 且要和发包在同一个串行任务里，否则后面的包会用错序号。
+            if (opts && opts.resetSeq) this.seqOut = 0;
         };
         this.sendChain = this.sendChain.then(run, run);
         return this.sendChain;
@@ -217,16 +249,17 @@ export class SSHClient {
     async _beginHandshake() {
         await this.opts.write(concat(new TextEncoder().encode(this.clientVersion + '\r\n')));
         await this._sendKexInit();
-        await this.kexDone.promise;
-        await this._authenticate();
-        await this._openShell();
+        await withTimeout(this.kexDone.promise, 20000, '密钥交换超时：服务器 20 秒内没有完成 KEX');
+        await withTimeout(this._authenticate(), 45000, '认证超时：服务器 45 秒内没有回应');
+        await withTimeout(this._openShell(), 15000, '打开 shell 超时');
     }
 
     async _sendKexInit() {
         const w = new Writer();
         w.byte(MSG.KEXINIT);
         w.raw(randomBytes(16));
-        w.nameList(KEX_ALGS);
+        // 后两个只是能力通告（ext-info-c / strict-kex），不参与 pick()
+        w.nameList(KEX_ALGS.concat(KEX_EXTRA));
         w.nameList(C.HOST_KEY_ALGS);
         w.nameList(CIPHERS);
         w.nameList(CIPHERS);
@@ -241,6 +274,7 @@ export class SSHClient {
         const payload = w.bytes();
         this.iC = payload;
         this.kexInitSent = true;
+        this.kexActive = true;
         this.kexDone = deferred();
         await this.send(payload);
     }
@@ -257,6 +291,10 @@ export class SSHClient {
             case MSG.IGNORE:
             case MSG.DEBUG:
             case MSG.UNIMPLEMENTED:
+                // strict kex 下，KEX 期间出现这类报文只可能是中间人注入（Terrapin）
+                if (this.strictKex && this.kexActive) {
+                    throw new Error('strict kex: 密钥交换期间收到非法报文 (type ' + type + ')，已中止连接');
+                }
                 return;
             case MSG.KEXINIT:
                 return this._onKexInit(p);
@@ -337,7 +375,9 @@ export class SSHClient {
                 const ch = this.channels.get(r.u32());
                 const data = r.str();
                 if (!ch) return;
-                ch.window -= data.length;
+                // 注意：这里只维护「本地接收窗口」（localUsed）。ch.window 是
+                // 对端允许我们发多少的发送额度，收到数据绝不能扣它 —— 否则下载
+                // 累计到服务端初始窗口（OpenSSH 2MB）后，后续 writeChannelFlow 会死等。
                 ch.localUsed += data.length;
                 if (ch.localUsed >= WINDOW / 2) {
                     const inc = ch.localUsed;
@@ -437,6 +477,13 @@ export class SSHClient {
         if (!hostKeyAlg) throw new Error('没有共同支持的主机密钥算法');
 
         this.neg = { kex, encC2S: enc1, encS2C: enc2, macC2S: mac1, macS2C: mac2, hostKeyAlg };
+        // Terrapin（CVE-2023-48795）：双方都通告 strict-kex 时，KEX 期间禁止注入
+        // IGNORE/DEBUG/UNIMPLEMENTED，且 NEWKEYS 之后序号归零。只在首次 KEX 决定一次。
+        if (this.strictDecided === undefined) {
+            this.strictDecided = true;
+            this.strictKex = kexAlgs.includes('kex-strict-s-v00@openssh.com');
+        }
+        this.kexActive = true;
         if (!this.kexInitSent) await this._sendKexInit();
 
         const kp = await C.curve25519Keypair();
@@ -503,7 +550,7 @@ export class SSHClient {
         const macIn = await new C.Mac(n.macS2C, macKeyS2C).ready();
 
         // outgoing keys take effect right after NEWKEYS is flushed
-        await this.send(new Writer().byte(MSG.NEWKEYS).bytes());
+        await this.send(new Writer().byte(MSG.NEWKEYS).bytes(), { resetSeq: this.strictKex });
         this.encOut = encOut;
         this.macOut = macOut;
         this.blockOut = 16;
@@ -519,6 +566,8 @@ export class SSHClient {
         this.blockIn = 16;
         this.macInLen = this.macIn.len;
         this._pendingIn = null;
+        if (this.strictKex) this.seqIn = 0; // NEWKEYS 自身已用旧序号校验，之后归零
+        this.kexActive = false;
         if (this.kexDone) this.kexDone.resolve();
         this.kexInitSent = false;
     }
@@ -605,7 +654,7 @@ export class SSHClient {
     }
 
     async _authPublicKey(user, service, auth) {
-        const key = await loadPrivateKey(auth.privateKey, auth.passphrase);
+        const key = await loadPrivateKey(auth.privateKey);
         const blob = key.publicBlob;
         const alg = key.alg;
         // 1) query whether the key is acceptable
@@ -667,7 +716,21 @@ export class SSHClient {
         this.channels.set(localId, ch);
         const w = new Writer().byte(MSG.CHANNEL_OPEN).str('session').u32(localId).u32(WINDOW).u32(MAX_PACKET);
         await this.send(w.bytes());
-        return ch.openWaiter.promise;
+        // 服务端不回 CONFIRMATION/FAILURE 时不能永远挂着：15 秒放弃并清理通道表
+        let timer;
+        try {
+            return await Promise.race([
+                ch.openWaiter.promise,
+                new Promise((_, reject) => {
+                    timer = setTimeout(() => reject(new Error('打开通道超时：服务器 15 秒内没有响应')), 15000);
+                }),
+            ]);
+        } catch (e) {
+            this.channels.delete(localId);
+            throw e;
+        } finally {
+            clearTimeout(timer);
+        }
     }
 
     async channelRequest(ch, type, wantReply, extra) {
@@ -703,10 +766,22 @@ export class SSHClient {
         }
     }
 
-    _waitWindow(ch, n) {
+    _waitWindow(ch, n, timeoutMs = 30000) {
         if (ch.closed || this.closed) return Promise.reject(new Error('通道已关闭'));
         if (ch.window >= n) return Promise.resolve();
-        return new Promise((resolve) => ch.windowWaiters.push({ n, resolve }));
+        return new Promise((resolve, reject) => {
+            let wrapped;
+            const timer = setTimeout(() => {
+                const i = ch.windowWaiters.findIndex((w) => w.resolve === wrapped);
+                if (i >= 0) ch.windowWaiters.splice(i, 1);
+                reject(new Error('等待对端窗口超时（连接可能已假死）'));
+            }, timeoutMs);
+            wrapped = () => {
+                clearTimeout(timer);
+                resolve();
+            };
+            ch.windowWaiters.push({ n, resolve: wrapped });
+        });
     }
 
     /** write data respecting the remote window (needed for bulk transfers) */

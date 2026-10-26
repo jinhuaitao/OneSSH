@@ -10,6 +10,7 @@ const T = {
     WRITE: 6,
     LSTAT: 7,
     FSTAT: 8,
+    FSETSTAT: 10,
     OPENDIR: 11,
     READDIR: 12,
     REMOVE: 13,
@@ -146,29 +147,35 @@ export class SFTPClient {
             versionWaiter.resolve = resolve;
             versionWaiter.reject = reject;
         });
+        versionWaiter.promise.catch(() => {}); // 失败路径可能没人 await，避免 unhandled rejection
         const ch = await this.client.openChannel({
             onData: (data) => this._feed(data),
             onClose: () => this._abortAll(new Error('SFTP 通道已关闭')),
         });
         this.ch = ch;
         this._versionWaiter = versionWaiter;
-        const ok = await this.client.channelRequest(ch, 'subsystem', true, (w) => w.str('sftp'));
-        if (ok === false) {
-            this._versionWaiter = null;
-            throw new Error('服务器拒绝启动 SFTP 子系统（可能未启用 sftp-server）');
-        }
-
-        const timer = setTimeout(() => versionWaiter.reject(new Error('SFTP 握手超时')), 15000);
+        let timer = null;
         try {
+            const ok = await this.client.channelRequest(ch, 'subsystem', true, (w) => w.str('sftp'));
+            if (ok === false) throw new Error('服务器拒绝启动 SFTP 子系统（可能未启用 sftp-server）');
+
+            timer = setTimeout(() => versionWaiter.reject(new Error('SFTP 握手超时')), 15000);
             // INIT has no request id: byte type + uint32 version
             await this._frame(T.INIT, null, (w) => w.u32(3));
             this.version = await versionWaiter.promise;
+            if (this.version < 3) throw new Error('服务器只支持 SFTP v' + this.version + '，需要 v3 及以上');
+            return this;
+        } catch (e) {
+            // 握手失败必须把通道关掉，否则每重试一次就漏一条 SSH 通道
+            this._abortAll(e);
+            try {
+                this.client.closeChannel(ch);
+            } catch (_) {}
+            throw e;
         } finally {
-            clearTimeout(timer);
+            if (timer) clearTimeout(timer);
             this._versionWaiter = null;
         }
-        if (this.version < 3) throw new Error('服务器只支持 SFTP v' + this.version + '，需要 v3 及以上');
-        return this;
     }
 
     _frame(type, id, fill) {
@@ -334,6 +341,20 @@ export class SFTPClient {
 
     async close(handle) {
         await this._request(T.CLOSE, (w) => w.str(handle), 15000, '关闭文件');
+    }
+
+    /** 按句柄改权限位（原子保存后还原原文件 mode 用） */
+    async fchmod(handle, mode) {
+        await this._request(
+            T.FSETSTAT,
+            (w) => {
+                w.str(handle);
+                w.u32(4); // SSH_FILEXFER_ATTR_PERMISSIONS
+                w.u32(mode >>> 0);
+            },
+            15000,
+            '设置文件权限'
+        );
     }
 
     async _closeHandleQuiet(handle) {

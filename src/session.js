@@ -10,6 +10,9 @@ const MAX_FILE = 64 * 1024 * 1024;
 const READ_CHUNK = 128 * 1024;
 const WRITE_CHUNK = 64 * 1024;
 const EDIT_MAX = 512 * 1024;
+// 单会话内并发的 SFTP 请求上限 / 同时打开的文件句柄上限
+const SFTP_CONCURRENCY = 4;
+const MAX_HANDLES = 64;
 
 export function knownKey(host, port) {
     return 'known/' + String(host).toLowerCase().replace(/[^a-z0-9.\-:\[\]]/g, '_') + '_' + port;
@@ -94,8 +97,11 @@ export class Terminal {
         this.meta = { host: '', port: 22, user: '' };
         this.sftp = null;
         this.sftpPromise = null;
+        this.sftpActive = 0;
+        this.sftpWaiters = [];
         this.handles = new Map();
         this.handleSeq = 0;
+        this.started = false;
     }
 
     /* ------------------------------------------------------------- plumbing */
@@ -145,7 +151,6 @@ export class Terminal {
         if (!w) return false;
         if (w.kind === 'hostkey') w.resolve(!!msg.accept);
         else if (w.kind === 'kbd') w.resolve(Array.isArray(msg.answers) ? msg.answers : null);
-        else if (w.kind === 'passphrase') w.resolve(msg.value || '');
         return true;
     }
 
@@ -175,7 +180,6 @@ export class Terminal {
         let username = String(cfg.username || '').trim();
         let password = cfg.password || '';
         let privateKey = cfg.privateKey || '';
-        let passphrase = cfg.passphrase || '';
         let record = !!cfg.record;
 
         if (cfg.hostId) {
@@ -192,10 +196,8 @@ export class Terminal {
                     const key = vault && Array.isArray(vault.keys) ? vault.keys.find((k) => k.id === saved.keyId) : null;
                     if (!key || !key.keyEnc) throw new Error('密钥库里找不到该主机使用的密钥，请在主机设置中重新选择');
                     privateKey = await decryptSecret(this.env, key.keyEnc);
-                    if (key.passphraseEnc) passphrase = await decryptSecret(this.env, key.passphraseEnc);
                 } else if (saved.authType === 'key' && saved.keyEnc) {
                     privateKey = await decryptSecret(this.env, saved.keyEnc);
-                    if (saved.passphraseEnc) passphrase = await decryptSecret(this.env, saved.passphraseEnc);
                 } else if (saved.authType === 'password' && saved.credId) {
                     const vault = await getJSON(this.env, 'sys/creds');
                     const cred = vault && Array.isArray(vault.creds) ? vault.creds.find((c) => c.id === saved.credId) : null;
@@ -228,7 +230,7 @@ export class Terminal {
 
         this.client = new SSHClient({
             username,
-            auth: { password, privateKey, passphrase },
+            auth: { password, privateKey },
             cols: clampInt(cfg.cols, 20, 500, 80),
             rows: clampInt(cfg.rows, 5, 200, 24),
             term: 'xterm-256color',
@@ -248,6 +250,13 @@ export class Terminal {
         this.send({ t: 'ready' });
         this.keepaliveTimer = setInterval(() => {
             try {
+                // 一直在发保活却长时间收不到任何报文 → 连接已假死。主动断开，
+                // 而不是让界面永远显示「已连接」却打不出字。
+                if (Date.now() - (this.client.lastInbound || 0) > 150000) {
+                    this.send({ t: 'error', message: '连接已无响应（保活超时 150 秒），已断开' });
+                    this.cleanup('keepalive-timeout');
+                    return;
+                }
                 this.client.keepalive();
             } catch (_) {}
         }, 45000);
@@ -320,7 +329,14 @@ export class Terminal {
         return this.sftpPromise;
     }
 
-    _trackHandle(h) {
+    async _trackHandle(h) {
+        if (this.handles.size >= MAX_HANDLES) {
+            // 句柄表不设上限的话，客户端只要 open 不 close 就能把服务端 fd 吃光
+            try {
+                await this.sftp.close(h);
+            } catch (_) {}
+            throw new Error('同时打开的文件过多（上限 ' + MAX_HANDLES + '），请先关闭部分文件');
+        }
         const token = 'h' + ++this.handleSeq;
         this.handles.set(token, h);
         return token;
@@ -335,7 +351,30 @@ export class Terminal {
         } catch (_) {}
     }
 
+    async _acquireSftp() {
+        while (this.sftpActive >= SFTP_CONCURRENCY) {
+            await new Promise((r) => this.sftpWaiters.push(r));
+        }
+        this.sftpActive++;
+    }
+
+    _releaseSftp() {
+        this.sftpActive--;
+        const next = this.sftpWaiters.shift();
+        if (next) next();
+    }
+
+    /** 入口：限制并发，避免客户端一次灌上千个请求把内存和通道打满 */
     async _sftpOp(msg) {
+        await this._acquireSftp();
+        try {
+            return await this._sftpOpInner(msg);
+        } finally {
+            this._releaseSftp();
+        }
+    }
+
+    async _sftpOpInner(msg) {
         const sftp = await this._sftpClient();
         const cleanPath = (v) => {
             const p = String(v == null ? '' : v);
@@ -399,7 +438,7 @@ export class Terminal {
                 if (isDirMode(st.perms)) throw new Error('不能下载目录');
                 if ((st.size || 0) > MAX_FILE) throw new Error('文件超过 64 MB，暂不支持在浏览器中下载');
                 const handle = await sftp.open(p, OPEN.READ);
-                reply({ handle: this._trackHandle(handle), size: st.size || 0 });
+                reply({ handle: await this._trackHandle(handle), size: st.size || 0 });
                 return;
             }
             case 'read': {
@@ -414,7 +453,7 @@ export class Terminal {
             }
             case 'open-write': {
                 const handle = await sftp.open(cleanPath(msg.path), OPEN.WRITE | OPEN.CREAT | OPEN.TRUNC);
-                reply({ handle: this._trackHandle(handle) });
+                reply({ handle: await this._trackHandle(handle) });
                 return;
             }
             case 'write': {
@@ -478,9 +517,17 @@ export class Terminal {
         const dir = slash >= 0 ? path.slice(0, slash) : '.';
         const base = path.slice(slash + 1);
         const tmp = dir + '/.' + base + '.webssh-' + randomHex(3);
+        // rename 换的是 inode：不还原 mode 的话，0600 的私钥保存一次就变成 0644（全局可读），
+        // sshd 还会拒绝使用。先记住原文件的权限位，写临时文件时就套上。
+        const prev = await sftp.stat(path).catch(() => null);
         let handle = null;
         try {
             handle = await sftp.open(tmp, OPEN.WRITE | OPEN.CREAT | OPEN.TRUNC | OPEN.EXCL);
+            if (prev && prev.perms != null) {
+                try {
+                    await sftp.fchmod(handle, prev.perms & 0o7777);
+                } catch (_) {}
+            }
             for (let off = 0; off < data.length; off += WRITE_CHUNK) {
                 await sftp.write(handle, off, data.subarray(off, off + WRITE_CHUNK));
             }
@@ -601,6 +648,9 @@ export class Terminal {
         }
         switch (data.t) {
             case 'init':
+                // 只接受一次：重复 init 会二次 getWriter() 抛错，把好好的连接拆掉
+                if (this.started) return;
+                this.started = true;
                 this.start(data);
                 break;
             case 'input':
@@ -646,6 +696,8 @@ export class Terminal {
         if (this.statsTimer) clearInterval(this.statsTimer);
         for (const w of this.waiters.values()) w.reject(new Error('连接已关闭'));
         this.waiters.clear();
+        for (const w of this.sftpWaiters.splice(0)) w(); // 放行排队中的 SFTP 请求，让它们自己失败
+        this.sftpWaiters = [];
         try {
             for (const token of Array.from(this.handles.keys())) await this._closeHandle(token);
         } catch (_) {}

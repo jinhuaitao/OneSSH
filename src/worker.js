@@ -403,11 +403,6 @@ async function handleApi(request, env, url) {
                 algo: meta ? meta.algo : entry.algo,
                 fingerprint: meta ? meta.fingerprint : entry.fingerprint,
                 keyEnc: keyText ? await auth.encryptSecret(env, keyText) : entry.keyEnc,
-                passphraseEnc: body.passphrase
-                    ? await auth.encryptSecret(env, String(body.passphrase))
-                    : entry
-                      ? entry.passphraseEnc || null
-                      : null,
                 createdAt: entry ? entry.createdAt : Date.now(),
                 updatedAt: Date.now(),
             };
@@ -542,12 +537,8 @@ async function handleApi(request, env, url) {
                         return json({ error: 'bad_key', message: '私钥格式无法识别（需 PEM 格式）' }, 400);
                     }
                     rec.keyEnc = saveSecret ? await auth.encryptSecret(env, keyText) : null;
-                    if (body.passphrase) {
-                        rec.passphraseEnc = saveSecret ? await auth.encryptSecret(env, String(body.passphrase)) : null;
-                    }
                 } else if (existing && existing.keyEnc && saveSecret) {
                     rec.keyEnc = existing.keyEnc;
-                    rec.passphraseEnc = existing.passphraseEnc || null;
                 } else if (existing && existing.keyId && saveSecret) {
                     rec.keyId = existing.keyId;
                 }
@@ -655,6 +646,43 @@ async function handleApi(request, env, url) {
 
 /* ------------------------------------------------------------- websocket */
 
+// 「快速连接」允许连任意公网 host:port —— 这也意味着登录态一旦被拿走，
+// 这个 Worker 就是一台免费的端口扫描器。加个按会话的预算：10 分钟 10 个目标。
+const QUICK_LIMIT = 10;
+const QUICK_WINDOW = 10 * 60 * 1000;
+
+async function quickConnectBudget(env, token) {
+    const prefix = 'conn/' + String(token).slice(0, 24) + '/';
+    const now = Date.now();
+    let used = 0;
+    for (const o of await list(env, prefix)) {
+        const ts = parseInt(o.key.slice(prefix.length), 10);
+        if (!Number.isFinite(ts)) continue;
+        if (now - ts < QUICK_WINDOW) used++;
+        else await del(env, o.key).catch(() => {});
+    }
+    if (used >= QUICK_LIMIT) return { ok: false };
+    await putJSON(env, prefix + now + '-' + auth.randomHex(3), 1);
+    return { ok: true };
+}
+
+/** 用一条 WebSocket 把错误送达前端（升级失败的 HTTP 响应浏览器读不到 body） */
+function socketError(message) {
+    const pair = new WebSocketPair();
+    const client = pair[0];
+    const server = pair[1];
+    server.accept();
+    try {
+        server.send(JSON.stringify({ t: 'error', message }));
+    } catch (_) {}
+    setTimeout(() => {
+        try {
+            server.close(1008, 'rejected');
+        } catch (_) {}
+    }, 50);
+    return new Response(null, { status: 101, webSocket: client });
+}
+
 async function handleWebSocket(request, env) {
     const upgrade = request.headers.get('upgrade') || '';
     if (upgrade.toLowerCase() !== 'websocket') return json({ error: 'upgrade_required' }, 426);
@@ -680,6 +708,10 @@ async function handleWebSocket(request, env) {
         const addr = normalizeHost(qHost);
         if (!addr) return json({ error: 'bad_host', message: '主机地址不合法' }, 400);
         if (qPort < 1 || qPort > 65535) return json({ error: 'bad_port', message: '端口不合法' }, 400);
+        const budget = await quickConnectBudget(env, session.token);
+        if (!budget.ok) {
+            return socketError(`临时连接过于频繁（${QUICK_WINDOW / 60000} 分钟内最多 ${QUICK_LIMIT} 个目标）。请先把常用主机保存下来再连接。`);
+        }
         target = { host: addr, port: qPort };
     }
 

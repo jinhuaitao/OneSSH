@@ -314,7 +314,6 @@ export function createTerminalView(cfg) {
                 username: s.opts.username || undefined,
                 password: s.opts.password || undefined,
                 privateKey: s.opts.privateKey || undefined,
-                passphrase: s.opts.passphrase || undefined,
                 cols: s.term.cols,
                 rows: s.term.rows,
                 record: !!(c.getSettings && c.getSettings().record),
@@ -449,10 +448,6 @@ export function createTerminalView(cfg) {
                 askKbd(s, msg);
                 break;
 
-            case 'passphrase':
-                askPassphrase(s, msg);
-                break;
-
             case 'sftp': {
                 const pending = s.sftpPending.get(msg.id);
                 if (!pending) break;
@@ -530,23 +525,6 @@ export function createTerminalView(cfg) {
             el('button', { class: 'btn primary', type: 'submit', text: '提交', onclick: submit }),
         ]);
         const m = modal({ title: msg.name || '键盘交互认证', body: form, footer: foot, onClose: () => send(s, { t: 'kbd', id: msg.id, answers: null }) });
-    }
-
-    function askPassphrase(s, msg) {
-        const input = el('input', { type: 'password', autocomplete: 'off' });
-        const body = el('form', { onsubmit: (ev) => { ev.preventDefault(); done(input.value); } }, [
-            el('p', { class: 'note-box', style: 'margin:0 0 10px', text: '这把私钥有口令保护，请输入口令。' }),
-            el('label', { text: '私钥口令' }, [input]),
-        ]);
-        const done = (value) => {
-            send(s, { t: 'passphrase', id: msg.id, value: value || '' });
-            m.close();
-        };
-        const foot = el('div', { style: 'display:flex;gap:8px' }, [
-            el('button', { class: 'btn', type: 'button', text: '取消', onclick: () => done('') }),
-            el('button', { class: 'btn primary', type: 'button', text: '确定', onclick: () => done(input.value) }),
-        ]);
-        const m = modal({ title: '私钥口令', body, footer: foot });
     }
 
     /* ------------------------------------------------------------- create */

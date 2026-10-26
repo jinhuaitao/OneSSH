@@ -46,7 +46,9 @@ export async function del(env, key) {
 export async function list(env, prefix, includeMeta) {
     const out = [];
     let cursor;
-    for (let i = 0; i < 10; i++) {
+    // 必须翻完所有分页：原来只翻 10 页（5000 个对象），超出的部分静默丢失 ——
+    // 会话数超量时「改密踢掉所有设备」会失效，主机/日志列表也会被截断。
+    for (let i = 0; i < 200; i++) {
         const page = await bucket(env).list({
             prefix,
             cursor,
@@ -54,7 +56,7 @@ export async function list(env, prefix, includeMeta) {
             include: includeMeta ? ['customMetadata', 'httpMetadata'] : undefined,
         });
         for (const o of page.objects) out.push(o);
-        if (!page.truncated) break;
+        if (!page.truncated) return out;
         cursor = page.cursor;
     }
     return out;

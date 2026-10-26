@@ -14,12 +14,14 @@ export class Reader {
         return this.p >= this.b.length;
     }
     byte() {
+        if (this.p >= this.b.length) throw new Error('ssh: truncated packet');
         return this.b[this.p++];
     }
     bool() {
-        return this.b[this.p++] !== 0;
+        return this.byte() !== 0;
     }
     u32() {
+        if (this.p + 4 > this.b.length) throw new Error('ssh: truncated uint32');
         const b = this.b,
             p = this.p;
         const v = ((b[p] << 24) | (b[p + 1] << 16) | (b[p + 2] << 8) | b[p + 3]) >>> 0;

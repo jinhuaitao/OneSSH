@@ -53,25 +53,26 @@ function parseDer(bytes) {
             len = 0;
             for (let i = 0; i < n; i++) len = (len << 8) | bytes[p++];
         }
-        const start = p;
-        const value = bytes.subarray(start, start + len);
-        p = start + len;
-        return { tag, value };
-    }
-    const root = node();
-    root.children = [];
-    if (root.tag & 0x20) {
-        let q = 0;
-        while (q < root.value.length) {
-            const save = p;
-            p = q;
-            const child = node();
-            root.children.push(child);
-            q = p;
-            p = save;
+        const from = p;
+        const to = from + len;
+        const value = bytes.subarray(from, to);
+        p = to;
+        const out = { tag, value, from, to, children: [] };
+        // constructed（SEQUENCE/SET）：递归解析子节点。
+        // 偏移必须从内容区绝对起点算，不能从 0 重新开始，否则会读回自己的 tag。
+        if (tag & 0x20) {
+            let q = from;
+            while (q < to) {
+                const save = p;
+                p = q;
+                out.children.push(node());
+                q = p;
+                p = save;
+            }
         }
+        return out;
     }
-    return root;
+    return node();
 }
 
 function bigFromBytes(u8) {
@@ -117,7 +118,7 @@ function parseOpenSSH(text) {
     for (let i = 0; i < nkeys; i++) r.str(); // public keys
     const priv = r.str();
     if (cipher !== 'none' || kdf !== 'none') {
-        throw new Error('暂不支持带口令的 OpenSSH 私钥，请使用 ssh-keygen -p -m PEM 转为无口令密钥后重试');
+        throw new Error(ENCRYPTED_HINT);
     }
     const pr = new Reader(priv);
     const c1 = pr.u32();
@@ -152,8 +153,11 @@ function parseOpenSSH(text) {
 
 /**
  * @returns {Promise<{alg:string, publicBlob:Uint8Array, sign:(d:Uint8Array)=>Promise<Uint8Array>}>}
+ *
+ * 注意：不支持带口令（已加密）的私钥 —— 解密它们需要 bcrypt_pbkdf（Blowfish）或 MD5 派生，
+ * WebCrypto 两者都没有。所以这里明确报错，而不是收一个用不上的 passphrase 假装支持。
  */
-export async function loadPrivateKey(text, passphrase) {
+export async function loadPrivateKey(text) {
     if (!text || !text.trim()) throw new Error('私钥内容为空');
     const pem = text.trim();
     if (/BEGIN OPENSSH PRIVATE KEY/.test(pem)) {
@@ -163,33 +167,48 @@ export async function loadPrivateKey(text, passphrase) {
         if (k.kind === 'ecdsa') throw new Error('暂不支持 ECDSA 私钥，请改用 ed25519 或密码登录');
     }
     if (/BEGIN RSA PRIVATE KEY/.test(pem)) {
+        assertNotEncrypted(pem);
         const der = fromBase64(pemBody(pem));
         const root = parseDer(der);
         const ints = root.children.map((c) => c.value);
         // version, n, e, d, p, q, dP, dQ, qInv
+        if (ints.length < 3) throw new Error('私钥结构异常（RSAPrivateKey 字段不足）');
         return rsaFromPkcs1(der, ints[1], ints[2]);
     }
+    if (/BEGIN ENCRYPTED PRIVATE KEY/.test(pem)) throw new Error(ENCRYPTED_HINT);
     if (/BEGIN PRIVATE KEY/.test(pem)) {
         const der = fromBase64(pemBody(pem));
         const root = parseDer(der);
         const algSeq = root.children[1];
+        const inner = root.children[2];
+        if (!algSeq || !algSeq.children.length || !inner) throw new Error('私钥结构异常（PKCS#8 字段缺失）');
         const oid = algSeq.children[0].value;
-        const inner = root.children[2].value;
         if (bytesToHex(oid) === bytesToHex(OID_ED25519)) {
-            const seed = parseDer(inner).value;
+            const seed = parseDer(inner.value).value;
             return ed25519FromSeed(seed);
         }
         if (bytesToHex(oid) === bytesToHex(OID_RSA)) {
-            const k = parseDer(inner);
+            const k = parseDer(inner.value);
             const ints = k.children.map((c) => c.value);
-            return rsaFromPkcs1(inner, ints[1], ints[2]);
+            if (ints.length < 3) throw new Error('私钥结构异常（RSAPrivateKey 字段不足）');
+            return rsaFromPkcs1(inner.value, ints[1], ints[2]);
         }
         throw new Error('不支持的 PKCS#8 密钥类型');
     }
     if (/BEGIN EC PRIVATE KEY/.test(pem)) {
+        assertNotEncrypted(pem);
         throw new Error('暂不支持 EC 私钥，请改用 ed25519 或密码登录');
     }
     throw new Error('无法识别的私钥格式（支持 OpenSSH / PEM PKCS#1 / PKCS#8）');
+}
+
+const ENCRYPTED_HINT =
+    '这个私钥带口令（已加密），本工具不支持口令私钥。请先在本机去掉口令再粘贴：\n' +
+    'ssh-keygen -p -N "" -f <你的私钥文件>（会覆盖原文件，先备份）';
+
+/** 传统 PEM 加密：头部带 "Proc-Type: 4,ENCRYPTED" 与 "DEK-Info" */
+function assertNotEncrypted(pem) {
+    if (/Proc-Type:\s*4\s*,\s*ENCRYPTED/i.test(pem) || /DEK-Info:/i.test(pem)) throw new Error(ENCRYPTED_HINT);
 }
 
 async function ed25519FromSeed(seed) {
