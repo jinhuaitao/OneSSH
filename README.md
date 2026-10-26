@@ -114,6 +114,20 @@ node tests/e2e.mjs --headful    # 想看着它点
 | <kbd>Alt</kbd> + <kbd>1</kbd> … <kbd>9</kbd> | 切换标签 |
 | 右键 | 粘贴 |
 
+### 📲 安装到桌面（PWA）
+
+地址栏右侧的「安装」图标（Chrome / Edge），或 Safari「分享 → 添加到主屏幕」，就能把 WebSSH 当独立应用打开，有自己的图标和窗口。
+
+| 项 | 位置 / 值 |
+| :--- | :--- |
+| 清单 | `public/manifest.webmanifest`（`display: standalone`、主题色 `#f03d08`、底色 `#faf8f4`） |
+| 图标 | `public/icons/`：192 / 512（`any`）+ 192 / 512（`maskable`）+ iOS 的 `apple-touch-icon.png` |
+| 重生成 | 改 `tools/make-icons.mjs` 里的坐标或配色后跑 `npm run icons` |
+
+图标图形与 `public/favicon.svg` 同源（同一套 64 单位坐标），`tools/make-icons.mjs` 是零依赖的：SDF 光栅化 + 手写 PNG 编码，只用 Node 自带的 `zlib`。
+
+**故意没有 Service Worker**：离线时本来也连不上 SSH 服务器；而 `worker-src 'none'` 的 CSP 会拦掉 SW 注册，为装个图标去放宽 CSP 不划算。现代 Chrome 已不再要求 SW 才能安装，manifest + 图标即可。
+
 ## 🔐 安全
 
 - 👤 **单管理员**：第一个完成初始化的账号就是唯一账号，没有注册入口。忘记密码只能删掉 R2 里的 `sys/admin` 和 `sess/*` 重新初始化（主密钥不变，已存凭据仍能解开）。

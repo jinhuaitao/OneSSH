@@ -8,6 +8,7 @@
         "dev": "wrangler dev",
         "deploy": "wrangler deploy",
         "check": "wrangler deploy --dry-run --outdir=.wrangler/dry-run",
+        "icons": "node tools/make-icons.mjs",
         "test": "node tests/e2e.mjs"
     },
     "devDependencies": {

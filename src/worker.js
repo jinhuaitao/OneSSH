@@ -736,6 +736,11 @@ export default {
             if (env.ASSETS) {
                 const res = await env.ASSETS.fetch(request);
                 const headers = new Headers(res.headers);
+                // .webmanifest 的 MIME 取决于托管方的映射表，这里兜底成标准类型：
+                // 类型不对时部分浏览器会直接忽略 manifest，PWA 就装不上。
+                if (path.endsWith('.webmanifest') && !/manifest\+json/.test(headers.get('content-type') || '')) {
+                    headers.set('content-type', 'application/manifest+json; charset=utf-8');
+                }
                 for (const [k, v] of Object.entries(securityHeaders(request))) {
                     if (!headers.has(k)) headers.set(k, v);
                 }
