@@ -1567,6 +1567,8 @@ function enterApp() {
                 const host = session && session.hostId ? state.hosts.find((h) => h.id === session.hostId) : null;
                 openLogs(host || null);
             },
+            // 终端页「主机密钥已变更」弹窗里的「删除旧记录并重连」走这里
+            onForgetHostKey: (key) => api('/api/known?key=' + encodeURIComponent(key), { method: 'DELETE' }),
             onEmpty: showDash,
         });
         state.term.init();

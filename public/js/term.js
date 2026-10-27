@@ -134,7 +134,9 @@ export function createTerminalView(cfg) {
 
     function sysLine(s, text, color) {
         const col = color || '38;5;245';
-        s.term.write('\r\n\x1b[' + col + 'm· ' + text + '\x1b[0m\r\n');
+        // 服务端的多行错误用 \n 分隔，而 xterm 只认 \r\n：不转换的话后几行会阶梯状错位
+        const body = String(text == null ? '' : text).replace(/\r?\n/g, '\r\n');
+        s.term.write('\r\n\x1b[' + col + 'm· ' + body + '\x1b[0m\r\n');
     }
 
     function fontSize() {
@@ -436,7 +438,10 @@ export function createTerminalView(cfg) {
             case 'error':
                 s.status = 'err';
                 updateTab(s);
-                sysLine(s, msg.message || '发生未知错误', '38;5;203');
+                // 指纹变了：除了在终端留一行说明，再给一个「删除旧记录并重连」的出口，
+                // 省掉「切到主机密钥页 → 找到这条 → 删掉 → 回来重连」的四步操作。
+                if (msg.hostKeyMismatch) askReplaceHostKey(s, msg.hostKeyMismatch);
+                else sysLine(s, msg.message || '发生未知错误', '38;5;203');
                 if (s.id === state.activeId) renderHostbar();
                 break;
 
@@ -495,6 +500,67 @@ export function createTerminalView(cfg) {
             }),
         ]);
         const m = modal({ title: '验证主机密钥', body, footer: foot, onClose: () => send(s, { t: 'hostkey', id: msg.id, accept: false }) });
+    }
+
+    /**
+     * 指纹和本地记录不一致（典型场景：机器重装系统后 sshd 重新生成了主机密钥）。
+     * 服务端已经把 key / 新旧指纹一起带过来了，这里直接给「删除并重连」，
+     * 但删除动作仍然要用户自己点，绝不自动放行新指纹。
+     */
+    function askReplaceHostKey(s, info) {
+        const addr = (info.host || s.host || '') + ':' + (info.port || s.port || 22);
+        sysLine(s, addr + ' 的主机密钥已变更，连接已在认证前中止', '38;5;203');
+
+        const body = el('div', { style: 'display:flex;flex-direction:column;gap:12px' }, [
+            el('p', {
+                class: 'note-box',
+                style: 'margin:0',
+                text:
+                    addr +
+                    ' 的主机密钥和本地记录不一致，连接在认证之前就被中止了。' +
+                    '机器重装系统、重装 sshd、或换过主机密钥都会出现这种情况；' +
+                    '如果不是你做的，请直接取消 —— 那可能是中间人在冒充这台服务器。',
+            }),
+            el('div', {
+                class: 'fp',
+                text:
+                    '已保存  ' + (info.saved || '(空)') +
+                    '\n服务器  ' + (info.current || '(空)') +
+                    (info.type ? '\n算法    ' + info.type : ''),
+            }),
+            el('p', {
+                class: 'note-box',
+                style: 'margin:0',
+                text: '删除后会立即重连，并重新弹出「验证主机密钥」——那一步仍然需要你自己核对指纹，不会自动信任。',
+            }),
+        ]);
+
+        let busy = false;
+        async function forget() {
+            if (busy) return;
+            if (!c.onForgetHostKey) {
+                toast('请到「主机密钥」页手动删除该记录后重连', 'err');
+                return;
+            }
+            busy = true;
+            try {
+                await c.onForgetHostKey(info.key);
+            } catch (e) {
+                busy = false;
+                toast(String((e && e.message) || e), 'err');
+                return;
+            }
+            m.close();
+            toast('已删除旧的主机密钥记录，正在重连 …');
+            // 弹窗开着的时候标签可能已经被关掉了，这时只删记录、不重连
+            if (state.sessions.indexOf(s) >= 0) restartSession(s);
+        }
+
+        const foot = el('div', { style: 'display:flex;gap:8px' }, [
+            el('button', { class: 'btn', type: 'button', text: '取消', onclick: () => m.close() }),
+            el('button', { class: 'btn danger', type: 'button', text: '删除旧记录并重连', onclick: forget }),
+        ]);
+        const m = modal({ title: '主机密钥已变更', body, footer: foot, width: '540px' });
     }
 
     function askKbd(s, msg) {
@@ -645,7 +711,10 @@ export function createTerminalView(cfg) {
     }
 
     function restart() {
-        const s = active();
+        restartSession(active());
+    }
+
+    function restartSession(s) {
         if (!s) return;
         failSftp(s, '会话已重连');
         try {

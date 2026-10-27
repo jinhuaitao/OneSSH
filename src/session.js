@@ -95,6 +95,9 @@ export class Terminal {
         this.sampling = false;
         this.prevSample = null;
         this.meta = { host: '', port: 22, user: '' };
+        // 指纹不一致时留下的上下文，供前端直接给出「删除旧记录并重连」
+        this.hostKeyMismatch = null;
+        this.hostKeyMismatchSent = false;
         this.sftp = null;
         this.sftpPromise = null;
         this.sftpActive = 0;
@@ -169,7 +172,12 @@ export class Terminal {
             await this._connect(cfg);
         } catch (e) {
             const message = String((e && e.message) || e);
-            this.send({ t: 'error', message });
+            // 指纹不一致时，_fail() 通常已经把带 hostKeyMismatch 上下文的 error 发出去过一次了；
+            // 万一那条路径没走到（比如 client 已关闭），这里补发，避免变成「静默失败」。
+            if (!this.hostKeyMismatch) this.send({ t: 'error', message });
+            else if (!this.hostKeyMismatchSent) {
+                this.send({ t: 'error', message, hostKeyMismatch: this.hostKeyMismatch });
+            }
             await this.cleanup(message);
         }
     }
@@ -546,6 +554,17 @@ export class Terminal {
         const known = await getJSON(this.env, key);
         if (known) {
             if (known.fingerprint === info.fingerprint) return true;
+            // 仍然默认拒绝（fail-closed），但把「哪条记录、旧指纹、新指纹」一并带上，
+            // 前端才能直接给一个「删除并重连」，不用让人自己去「主机密钥」页里翻。
+            this.hostKeyMismatch = {
+                key,
+                host,
+                port,
+                type: info.type || known.type || '',
+                saved: known.fingerprint,
+                current: info.fingerprint,
+                savedAt: known.addedAt || 0,
+            };
             throw new Error(
                 `主机密钥与已保存的不一致！\n已保存: ${known.fingerprint}\n服务器: ${info.fingerprint}\n` +
                     '如确认服务器已重装，请先在「主机密钥」中删除该记录后重试。'
@@ -608,9 +627,14 @@ export class Terminal {
             case 'exit-status':
                 this.send({ t: 'exit-status', code: ev.code });
                 break;
-            case 'error':
-                this.send({ t: 'error', message: ev.message });
+            case 'error': {
+                // 指纹变更时把上下文附在同一条 error 上：认识它的前端弹窗，
+                // 不认识的老前端照旧显示文本，不会变成「什么都没发生」。
+                const mismatch = this.hostKeyMismatch;
+                if (mismatch) this.hostKeyMismatchSent = true;
+                this.send(mismatch ? { t: 'error', message: ev.message, hostKeyMismatch: mismatch } : { t: 'error', message: ev.message });
                 break;
+            }
             default:
                 break;
         }
