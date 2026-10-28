@@ -191,12 +191,16 @@ export class Terminal {
         let record = !!cfg.record;
 
         if (cfg.hostId) {
-            const saved = await getJSON(this.env, 'hosts/' + cfg.hostId);
+            const saved = await getJSON(this.env, 'hosts/' + String(cfg.hostId));
             if (!saved) throw new Error('主机配置不存在');
-            if (!this.target) {
-                host = saved.host;
-                port = saved.port || 22;
+            // 目标一律以记录为准。TCP 已经按 URL 参数连上了，所以这里必须核对：
+            // 允许「记录里的凭据 + 查询参数里的地址」混用，等于把存好的 SSH 密码
+            // 送去任意 host:port（会话被偷后可以借此把整库凭据钓走）。
+            if (this.target && (normalizeHost(saved.host) !== this.target.host || (saved.port || 22) !== this.target.port)) {
+                throw new Error('主机配置与连接目标不一致，已中止（请从主机列表重新连接）');
             }
+            host = saved.host;
+            port = saved.port || 22;
             username = saved.username;
             if (!password && !privateKey) {
                 if (saved.authType === 'key' && saved.keyId) {

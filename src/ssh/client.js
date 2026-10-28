@@ -501,6 +501,10 @@ export class SSHClient {
         const sigBlob = r.str();
 
         const shared = await C.curve25519Shared(this.kex.privateKey, serverPub);
+        // RFC 8731 §3：共享密钥全零说明服务器用了低阶点，密钥协商已被降级（典型中间人）
+        if (!shared.length || shared.every((b) => b === 0)) {
+            throw new Error('密钥交换失败：X25519 共享密钥全零，已中止连接（可能是中间人攻击）');
+        }
         const kMpint = new Writer().mpint(shared).bytes();
         const str = (b) => new Writer().str(b).bytes();
         const H = await C.sha256(

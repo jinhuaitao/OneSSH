@@ -256,9 +256,22 @@ async function handleApi(request, env, url) {
     if (path === '/api/setup' && method === 'POST') {
         const admin = await auth.getAdmin(env);
         if (admin) return json({ error: 'already_setup', message: '系统已经完成初始化' }, 409);
+        const ip = request.headers.get('cf-connecting-ip') || 'local';
+        // 初始化口令和登录密码走同一套失败计数：否则它就是唯一一个可以无限次猜测的口令
+        if (env.WEBSSH_SETUP_TOKEN) {
+            const throttle = await auth.checkThrottle(env, ip);
+            if (throttle.locked) {
+                return json(
+                    { error: 'locked', message: `尝试次数过多，请 ${Math.ceil(throttle.retryAfter / 60)} 分钟后再试` },
+                    429,
+                    { 'retry-after': String(throttle.retryAfter) }
+                );
+            }
+        }
         const body = await readJSON(request);
         // 公开部署时防止陌生人抢先初始化：设置了 WEBSSH_SETUP_TOKEN 就必须带上它
         if (env.WEBSSH_SETUP_TOKEN && !auth.safeEqual(String(body.token || ''), String(env.WEBSSH_SETUP_TOKEN))) {
+            await auth.recordFailure(env, ip);
             return json({ error: 'bad_token', message: '初始化口令不正确' }, 403);
         }
         const username = String(body.username || '').trim();
@@ -269,6 +282,7 @@ async function handleApi(request, env, url) {
         const pwError = checkPassword(password, username);
         if (pwError) return json({ error: 'weak_password', message: pwError }, 400);
         await auth.createAdmin(env, username, password);
+        await auth.clearFailures(env, ip);
         const token = await auth.createSession(env, username, request);
         return json({ ok: true }, 200, { 'set-cookie': auth.sessionCookie(token, request) });
     }
