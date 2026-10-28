@@ -12,10 +12,8 @@ function isIPv6(s) {
 }
 
 export function normalizeHost(input) {
-    let raw = String(input == null ? '' : input).trim();
+    const raw = String(input == null ? '' : input).trim();
     if (!raw) return '';
-    // FQDN 的根点（example.com.）是合法写法，但没必要存下来
-    if (raw.length > 1 && raw.endsWith('.') && !raw.endsWith('..')) raw = raw.slice(0, -1);
     if (raw.startsWith('[')) {
         const inner = raw.endsWith(']') ? raw.slice(1, -1) : '';
         return inner && isIPv6(inner) ? '[' + inner.toLowerCase() + ']' : '';

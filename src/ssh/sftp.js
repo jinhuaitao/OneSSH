@@ -1,5 +1,5 @@
 // Minimal SFTP v3 client (draft-ietf-secsh-filexfer-02) over an SSH session channel.
-import { Reader, Writer, concat } from './buf.js';
+import { Reader, Writer, concat, bytesToHex } from './buf.js';
 
 const T = {
     INIT: 1,
@@ -19,6 +19,7 @@ const T = {
     REALPATH: 16,
     STAT: 17,
     RENAME: 18,
+    EXTENDED: 200,
     STATUS: 101,
     HANDLE: 102,
     DATA: 103,
@@ -39,6 +40,17 @@ const S = {
 };
 
 export const OPEN = { READ: 0x01, WRITE: 0x02, APPEND: 0x04, CREAT: 0x08, TRUNC: 0x10, EXCL: 0x20 };
+
+// OpenSSH 的「原子覆盖改名」扩展；普通 RENAME 在 v3 里不允许覆盖已存在的目标
+const POSIX_RENAME = 'posix-rename@openssh.com';
+
+/** 同目录下的隐藏临时文件名：跨目录 rename 会 EXDEV，所以目录必须和原文件一致 */
+export function tempName(path, tag) {
+    const slash = path.lastIndexOf('/');
+    const dir = slash > 0 ? path.slice(0, slash) : slash === 0 ? '' : '.';
+    const base = path.slice(slash + 1);
+    return dir + '/.' + base + '.' + tag + '-' + bytesToHex(crypto.getRandomValues(new Uint8Array(3)));
+}
 
 const STATUS_TEXT = {
     2: '文件或目录不存在',
@@ -131,6 +143,7 @@ export class SFTPClient {
         this.buf = new Uint8Array(0);
         this.closed = false;
         this.version = null;
+        this.extensions = new Map();
         this.readyPromise = null;
     }
 
@@ -227,6 +240,14 @@ export class SFTPClient {
         const type = r.byte();
         if (type === T.VERSION) {
             const v = r.u32();
+            // VERSION 后面跟着成对的 extension_name / extension_data，能力判断靠它
+            try {
+                while (r.left >= 8) {
+                    const name = r.text();
+                    const data = r.text();
+                    this.extensions.set(name, data);
+                }
+            } catch (_) {}
             if (this._versionWaiter) this._versionWaiter.resolve(v);
             return;
         }
@@ -322,6 +343,64 @@ export class SFTPClient {
             20000,
             '重命名'
         );
+    }
+
+    supports(name) {
+        return this.extensions.has(name);
+    }
+
+    /** SSH_FXP_EXTENDED：服务器在 VERSION 里声明过的扩展才发，响应同样是 STATUS */
+    async _extended(name, args, label) {
+        await this._request(
+            T.EXTENDED,
+            (w) => {
+                w.str(name);
+                for (const a of args) w.str(a);
+            },
+            20000,
+            label
+        );
+    }
+
+    /**
+     * 覆盖式改名，给「原子保存」用。
+     * draft-ietf-secsh-filexfer-02 明确规定目标已存在时 RENAME 必须报错，只有 OpenSSH
+     * 按 POSIX 语义覆盖；所以不能直接 rename(tmp, path)，否则合规的服务器（dropbear、
+     * 各类 NAS / 嵌入式 sshd）一律回 SSH_FX_FAILURE，保存就变成「服务器拒绝了该操作：Failure」。
+     */
+    async renameOverwrite(from, to) {
+        if (this.supports(POSIX_RENAME)) {
+            try {
+                await this._extended(POSIX_RENAME, [from, to], '覆盖重命名');
+                return;
+            } catch (e) {
+                if (!(e instanceof SFTPError) || e.code !== S.OP_UNSUPPORTED) throw e;
+            }
+        }
+        try {
+            await this.rename(from, to);
+            return;
+        } catch (e) {
+            // 目标已存在时合规服务器就是回 FAILURE；别的失败（跨设备、权限）照旧抛出
+            if (!(e instanceof SFTPError) || e.code !== S.FAILURE) throw e;
+        }
+        const backup = tempName(to, 'webssh-bak');
+        try {
+            await this.rename(to, backup);
+        } catch (e) {
+            throw new Error('目标已存在，服务器不支持覆盖重命名，备份旧文件也失败：' + e.message);
+        }
+        try {
+            await this.rename(from, to);
+        } catch (e) {
+            try {
+                await this.rename(backup, to);
+            } catch (_) {
+                throw new Error('目标已存在，服务器不支持覆盖重命名，换名失败：' + e.message + '；旧文件保留在 ' + backup);
+            }
+            throw new Error('目标已存在，服务器不支持覆盖重命名，换名失败：' + e.message + '（旧文件已还原）');
+        }
+        await this.remove(backup).catch(() => {});
     }
 
     async open(path, pflags) {

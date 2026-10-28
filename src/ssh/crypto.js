@@ -178,6 +178,7 @@ export const HOST_KEY_ALGS = [
     'ecdsa-sha2-nistp256',
     'rsa-sha2-512',
     'rsa-sha2-256',
+    'ssh-rsa',
 ];
 
 /** SHA256 fingerprint in the same shape `ssh-keygen -lf` prints. */
@@ -244,13 +245,7 @@ export async function verifyHostKeySignature(keyBlob, sigBlob, exchangeHash) {
             return { type, verified: ok, reason: ok ? null : 'signature mismatch' };
         }
         if (imported.rsa) {
-            // ssh-rsa 用 SHA-1 签 exchange hash，早已被列为可伪造的弱算法；
-            // 密钥本身（ssh-rsa 公钥格式）仍可用于 rsa-sha2-* 握手。
-            if (sigAlg === 'ssh-rsa') {
-                return { type, verified: false, reason: 'ssh-rsa (SHA-1) 签名已被拒绝，请在服务器上启用 rsa-sha2-256/512' };
-            }
-            const hash = sigAlg === 'rsa-sha2-512' ? 'SHA-512' : sigAlg === 'rsa-sha2-256' ? 'SHA-256' : null;
-            if (!hash) return { type, verified: false, reason: 'unexpected RSA signature algorithm: ' + sigAlg };
+            const hash = sigAlg === 'rsa-sha2-512' ? 'SHA-512' : sigAlg === 'ssh-rsa' ? 'SHA-1' : 'SHA-256';
             const key = await subtle().importKey(
                 'spki',
                 rsaSpkiFromBlob(keyBlob),

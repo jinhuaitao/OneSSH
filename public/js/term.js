@@ -827,8 +827,6 @@ export function createTerminalView(cfg) {
 
         document.addEventListener('keydown', (ev) => {
             if ($('#view-term').hidden) return;
-            // 弹窗（设置 / 片段 / 文件管理）里正在输入时，全局快捷键不该抢键
-            if ($('.modal-backdrop')) return;
             const mod = ev.ctrlKey || ev.metaKey;
             if (mod && ev.shiftKey && ev.key.toLowerCase() === 'c') {
                 const s = active();
@@ -866,8 +864,6 @@ export function createTerminalView(cfg) {
                 return;
             }
             if (ev.altKey && /^[1-9]$/.test(ev.key)) {
-                const tag = (ev.target && ev.target.tagName) || '';
-                if (/^(INPUT|TEXTAREA|SELECT)$/.test(tag) || (ev.target && ev.target.isContentEditable)) return;
                 const s = state.sessions[Number(ev.key) - 1];
                 if (s) {
                     setActive(s.id);

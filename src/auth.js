@@ -50,7 +50,7 @@ export async function hashPassword(password, saltHex, iterations = PBKDF2_ITER) 
 }
 
 export async function getAdmin(env) {
-    return getJSON(env, ADMIN_KEY, { strict: true });
+    return getJSON(env, ADMIN_KEY);
 }
 
 export async function createAdmin(env, username, password) {
@@ -80,10 +80,8 @@ export async function verifyLogin(env, username, password) {
 
 /* --------------------------------------------------------------- sessions */
 
-// HTTPS 下用 __Host- 前缀：浏览器会拒绝任何带 Domain 的同名 Cookie，挡住
-// 同一父域（例如 *.workers.dev 上的其它租户）往我们这里种会话 Cookie 的尝试。
-export function cookieName(secure) {
-    return secure ? '__Host-wssh_session' : 'wssh_session';
+export function cookieName() {
+    return 'wssh_session';
 }
 
 export function parseCookies(header) {
@@ -109,15 +107,14 @@ function isHttps(request) {
 }
 
 export function sessionCookie(token, request, maxAgeSec = SESSION_TTL / 1000) {
-    const secure = isHttps(request);
     const parts = [
-        `${cookieName(secure)}=${token}`,
+        `${cookieName()}=${token}`,
         'Path=/',
         'HttpOnly',
         'SameSite=Lax',
         `Max-Age=${maxAgeSec}`,
     ];
-    if (secure) parts.push('Secure');
+    if (isHttps(request)) parts.push('Secure');
     return parts.join('; ');
 }
 
@@ -141,8 +138,7 @@ export async function createSession(env, username, request) {
 
 export async function getSession(env, request) {
     const cookies = parseCookies(request.headers.get('cookie'));
-    // 老会话仍用无前缀的名字；HTTPS 下新签发的都是 __Host-
-    const token = cookies[cookieName(true)] || cookies[cookieName(false)];
+    const token = cookies[cookieName()];
     if (!token || !/^[a-f0-9]{64}$/.test(token)) return null;
     const rec = await getJSON(env, SESSION_PREFIX + token);
     if (!rec || !rec.exp) return null;
@@ -150,15 +146,6 @@ export async function getSession(env, request) {
     if (rec.exp < now) {
         await del(env, SESSION_PREFIX + token);
         return null;
-    }
-    // 可选：把会话绑到签发时的 IP。移动网络切换会让用户重新登录，默认关闭，
-    // 公开部署且在意会话被盗时可设 WEBSSH_BIND_IP=1 打开。
-    if (env.WEBSSH_BIND_IP === '1' || env.WEBSSH_BIND_IP === 'true') {
-        const ip = request.headers.get('cf-connecting-ip') || '';
-        if (rec.ip && ip && rec.ip !== ip) {
-            await del(env, SESSION_PREFIX + token);
-            return null;
-        }
     }
     const seen = rec.seen || rec.created || 0;
     if (now - seen > SESSION_IDLE) {
@@ -201,16 +188,13 @@ const THROTTLE_LOCK = 15 * 60 * 1000;
 
 // R2 没有 CAS：原来「读计数 → 改 → 写回」在并发下会互相覆盖，6 次锁定形同虚设。
 // 改成每次失败写一个独立对象、用 list 计数 —— 并发写不同的 key 不会丢更新。
-// 同一个 IP 的失败计数按用途分桶：初始化口令和登录密码各自限流，
-// 免得在初始化页试错把管理员登录也一起锁掉。
-function throttlePrefix(ip, scope) {
-    const area = String(scope || 'login').replace(/[^a-z0-9_-]/gi, '') || 'login';
-    return 'throttle/' + area + '/' + String(ip).replace(/[^0-9a-zA-Z.:\-_\[\]]/g, '_') + '/';
+function throttlePrefix(ip) {
+    return 'throttle/' + String(ip).replace(/[^0-9a-zA-Z.:\-_\[\]]/g, '_') + '/';
 }
 
-export async function checkThrottle(env, ip, scope) {
+export async function checkThrottle(env, ip) {
     if (!ip) return { locked: false };
-    const prefix = throttlePrefix(ip, scope);
+    const prefix = throttlePrefix(ip);
     const now = Date.now();
     const stamps = [];
     for (const o of await list(env, prefix)) {
@@ -225,14 +209,14 @@ export async function checkThrottle(env, ip, scope) {
     return { locked: false };
 }
 
-export async function recordFailure(env, ip, scope) {
+export async function recordFailure(env, ip) {
     if (!ip) return;
-    await putJSON(env, throttlePrefix(ip, scope) + Date.now() + '-' + randomHex(4), 1);
+    await putJSON(env, throttlePrefix(ip) + Date.now() + '-' + randomHex(4), 1);
 }
 
-export async function clearFailures(env, ip, scope) {
+export async function clearFailures(env, ip) {
     if (!ip) return;
-    const prefix = throttlePrefix(ip, scope);
+    const prefix = throttlePrefix(ip);
     for (const o of await list(env, prefix)) await del(env, o.key).catch(() => {});
 }
 

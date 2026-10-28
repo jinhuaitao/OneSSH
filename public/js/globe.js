@@ -471,22 +471,8 @@ export function createGlobe(canvas, labelLayer, opts) {
     /* --------------------------------------------------------------- loop */
 
     let last = 0;
-    let visible = true;
-
-    function startLoop() {
-        if (!alive || raf) return;
-        last = 0;
-        raf = requestAnimationFrame(frame);
-    }
-
-    function stopLoop() {
-        if (raf) cancelAnimationFrame(raf);
-        raf = 0;
-        last = 0;
-    }
 
     function frame(t) {
-        raf = 0;
         if (!alive) return;
         const dt = last ? Math.min(60, t - last) : 16;
         last = t;
@@ -568,21 +554,8 @@ export function createGlobe(canvas, labelLayer, opts) {
     const ro = new ResizeObserver(() => resize());
     ro.observe(canvas.parentElement || canvas);
 
-    // 切到终端页 / 标签页在后台时停止 rAF，别让一个看不见的地球每秒烧 60 帧
-    const io = new IntersectionObserver((entries) => {
-        visible = entries.some((e) => e.isIntersecting);
-        if (visible && !document.hidden) startLoop();
-        else stopLoop();
-    });
-    io.observe(canvas);
-    const onVisibility = () => {
-        if (document.hidden) stopLoop();
-        else if (visible) startLoop();
-    };
-    document.addEventListener('visibilitychange', onVisibility);
-
     resize();
-    startLoop();
+    raf = requestAnimationFrame(frame);
 
     return {
         setPoints(list) {
@@ -613,10 +586,8 @@ export function createGlobe(canvas, labelLayer, opts) {
         },
         destroy() {
             alive = false;
-            stopLoop();
+            cancelAnimationFrame(raf);
             ro.disconnect();
-            io.disconnect();
-            document.removeEventListener('visibilitychange', onVisibility);
             canvas.removeEventListener('pointerdown', onDown);
             canvas.removeEventListener('pointermove', onMove);
             canvas.removeEventListener('pointerup', onUp);

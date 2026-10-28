@@ -20,7 +20,7 @@
 | :---: | :---: | :---: |
 | 域名 / IPv4 / IPv6<br><sub>密码或私钥认证</sub> | 多标签 · 实时监控<br><sub>按键条 · 代码片段</sub> | SFTP 全功能<br><sub>浏览 / 上传 / 在线编辑</sub> |
 | **🗺️ 仪表盘** | **🔑 凭据库** | **🛡️ 安全** |
-| 分组收起 · 地区筛选<br><sub>可拖拽 3D 地球</sub> | 账号与私钥复用<br><sub>AES-GCM 加密存储</sub> | 主机密钥强校验<br><sub>同源防护 · 日志加密</sub> |
+| 分组收起 · 地区筛选<br><sub>可拖拽点阵地球</sub> | 账号与私钥复用<br><sub>AES-GCM 加密存储</sub> | 主机密钥强校验<br><sub>同源防护 · 日志加密</sub> |
 
 ## 🚀 部署
 ### 方式一
@@ -65,11 +65,11 @@
 npm install
 npx wrangler dev                # http://127.0.0.1:8787，本地 R2 在 .wrangler/ 下
 npx wrangler deploy             # CLI 部署，需先 wrangler login
-npm test                        # 端到端：内置 ssh2 服务器 + wrangler dev + 真 Chrome
+npm test                        # 端到端：本地 sshd + wrangler dev + 真 Chrome
 node tests/e2e.mjs --headful    # 想看着它点
 ```
 
-`npm test` 覆盖初始化（含初始化口令与并发抢占）、分组、凭据库、主机密钥确认、终端交互、监控、代码片段、文件管理、刷新保持登录、退出登录，以及安全项：响应头、跨站写请求 / WebSocket 被拒、改密踢掉其它设备、加密日志读回。依赖 `ssh2` 与 `playwright-core`（用本机 Chrome）。测试用独立的 `.wrangler/e2e*` 数据，删掉整个 `.wrangler/` 会清空本地全部数据。
+`npm test` 覆盖初始化（含初始化口令）、分组、凭据库、主机密钥确认、终端交互、监控、代码片段、文件管理、刷新保持登录、退出登录，以及安全项：响应头、跨站写请求 / WebSocket 被拒、改密踢掉其它设备、加密日志读回。依赖 `ssh2` 与 `playwright-core`（用本机 Chrome）。删掉 `.wrangler/state` 会清空本地全部数据。
 
 ## 🧭 使用
 
@@ -137,12 +137,8 @@ node tests/e2e.mjs --headful    # 想看着它点
   npx wrangler secret put WEBSSH_SETUP_TOKEN   # 或在控制台 Workers → 设置 → 变量 里加
   ```
 
-- 🔑 **口令与会话**：密码至少 10 位、拒绝常见弱口令；PBKDF2-SHA256（10 万次迭代）加盐存储，校验用恒定时间比较。会话是 HttpOnly + SameSite=Lax 的随机 256 位 token，30 天绝对过期、7 天空闲过期，**改密后其它设备立即掉线**。Cookie 用 `__Host-` 前缀（HTTPS 下自动加 `Secure`）。想更严格可以绑 IP：
-
-  ```bash
-  npx wrangler secret put WEBSSH_BIND_IP   # 值填 1，会话记下登录 IP，换 IP 即失效
-  ```
-- 🧱 **跨站防线**：所有写接口和 WebSocket 升级都校验 `Origin` 同源，挡 CSRF 和跨站 WebSocket 劫持；页面带 `CSP`（`connect-src 'self'`、`object-src 'none'`、`frame-ancestors 'none'`）、`COOP` / `CORP` / `Permissions-Policy`，HTTPS 下加 `HSTS`。静态资源由 Workers 直接下发、不经过 Worker 代码，所以同一套头写在 `public/_headers` 里，两条路径都覆盖。
+- 🔑 **口令与会话**：密码至少 10 位、拒绝常见弱口令；PBKDF2-SHA256（10 万次迭代）加盐存储，校验用恒定时间比较。会话是 HttpOnly + SameSite=Lax 的随机 256 位 token，30 天绝对过期、7 天空闲过期，**改密后其它设备立即掉线**。
+- 🧱 **跨站防线**：所有写接口和 WebSocket 升级都校验 `Origin` 同源，挡 CSRF 和跨站 WebSocket 劫持；页面带 `CSP`（`connect-src 'self'`、`object-src 'none'`、`frame-ancestors 'none'`）、`COOP` / `CORP` / `Permissions-Policy`，HTTPS 下加 `HSTS`。
 - 🛡️ **主机密钥强校验**：握手时先验证服务器签名，拿不出这把主机私钥就直接断开（中间人无法用「点继续」绕过）；首次连接记录指纹，之后指纹变化自动拒绝。
 - 🔒 **加密边界**：主机密码、私钥、常用账号、**会话录制**都用 AES-GCM 加密。主密钥默认放在同一个桶的 `sys/master` —— 防「桶被人翻到」，防不了「Cloudflare 账号被攻破」。可以自带密钥：
 
@@ -151,7 +147,7 @@ node tests/e2e.mjs --headful    # 想看着它点
   ```
 
   设置后不再使用 `sys/master`，但**换密钥后旧凭据都解不开**，需要重新录入。
-- 🚦 **登录限流**：同一 IP 10 分钟内失败 6 次，锁 15 分钟；初始化口令单独计数（在初始化页试错不会锁掉管理员登录）。写接口只收 `application/json` 且限制请求体大小；账号是否存在不体现在响应内容或耗时上。
+- 🚦 **登录限流**：同一 IP 10 分钟内失败 6 次，锁 15 分钟；写接口只收 `application/json` 且限制请求体大小；账号是否存在不体现在响应内容或耗时上。
 - 🌍 **连不了内网**：Workers 只能连公网地址，Cloudflare 自家网段、localhost、内网地址都会被拒。
 
 <details>
@@ -178,7 +174,7 @@ node tests/e2e.mjs --headful    # 想看着它点
                                      └── R2：账号 / 会话 / 主机 / 分组 / 凭据库 / 已知主机密钥 / 录制 / 片段
 ```
 
-SSH 协议栈是自己实现的（`src/ssh/`），只依赖 WebCrypto：`curve25519-sha256` 密钥交换、`aes{128,192,256}-ctr` 加密、`hmac-sha2-{256,512}` / `hmac-sha1` 校验、`ssh-ed25519` / `ecdsa-sha2-nistp256` / `rsa-sha2-{256,512}` 主机密钥（拒绝已淘汰的 `ssh-rsa`/SHA-1），支持密码、公钥（OpenSSH / PKCS#1 / PKCS#8）和 keyboard-interactive 认证。
+SSH 协议栈是自己实现的（`src/ssh/`），只依赖 WebCrypto：`curve25519-sha256` 密钥交换、`aes{128,192,256}-ctr` 加密、`hmac-sha2-{256,512}` / `hmac-sha1` 校验、`ssh-ed25519` / `ecdsa-sha2-nistp256` / `rsa-sha2-{256,512}` / `ssh-rsa` 主机密钥，支持密码、公钥（OpenSSH / PKCS#1 / PKCS#8）和 keyboard-interactive 认证。
 
 | 文件 | 作用 |
 | :--- | :--- |
@@ -194,9 +190,9 @@ SSH 协议栈是自己实现的（`src/ssh/`），只依赖 WebCrypto：`curve25
 | `src/pages.js` | 单页骨架（数据都走 `/api/*`，HTML 里没有任何秘密） |
 | `public/js/app.js` | 前端主控：登录、主机增删改、分组与凭据库面板、弹窗、设置 |
 | `public/js/files.js` | 文件管理弹窗：目录浏览、上传 / 下载、在线编辑 |
-| `public/js/globe.js` | 3D 地球：NASA 蓝色弹珠纹理贴图（WebGL）+ 正交投影 + 拖拽旋转 + 大气层 + 标签跟随 |
+| `public/js/globe.js` | 点阵地球：正交投影 + 拖拽旋转 + 海洋渐变与大气层 + 标签跟随 |
+| `public/js/land.js` | 2°×2° 陆地掩码（构建期光栅化生成，运行时零依赖） |
 | `public/js/term.js` | 终端页：多标签、WebSocket 会话、监控面板、按键条 |
-| `public/_headers` | 静态资源的安全响应头（CSP / HSTS / COOP 等）与 manifest 的 MIME |
 | `public/vendor/` | xterm.js（随仓库内置，不依赖 CDN） |
 
 R2 数据布局：
@@ -208,14 +204,11 @@ sys/snippets        代码片段
 sys/groups          分组名称列表
 sys/keys            凭据库里的私钥（AES-GCM 密文 + 算法 / 指纹）
 sys/creds           凭据库里的常用账号（密码为 AES-GCM 密文）
-sys/setup-claim/    初始化抢占标记（只活 2 分钟，防止并发初始化互相覆盖）
 sess/<token>        登录会话（30 天绝对过期 / 7 天空闲过期）
 hosts/<id>          主机配置（密码 / 私钥为密文，或引用 sys/keys / sys/creds）
-                    列表摘要写在 customMetadata 里，列主机不用逐个读对象
 known/<host>_<port> 已信任的主机密钥指纹
-logs/<id>.log       会话录制（AES-GCM 密文 + 元数据，超过 4 MB 标记截断）
-throttle/<scope>/<ip>/  登录 / 初始化失败计数（每次失败一个对象，无 CAS 也不丢计数）
-conn/<token>/       快速连接预算（10 分钟 10 个临时目标）
+logs/<id>.log       会话录制（AES-GCM 密文 + 元数据）
+throttle/<ip>       登录失败计数
 ```
 
 </details>
