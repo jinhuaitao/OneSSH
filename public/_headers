@@ -1,0 +1,14 @@
+# Workers 静态资源优先于 Worker 返回，所以安全响应头必须写在这里 ——
+# 只靠 worker.js 里的 SECURITY_HEADERS 覆盖不到 /js/*、/style.css 这类真实文件。
+/*
+  X-Content-Type-Options: nosniff
+  X-Frame-Options: DENY
+  Referrer-Policy: no-referrer
+  Cross-Origin-Opener-Policy: same-origin
+  Cross-Origin-Resource-Policy: same-origin
+  Permissions-Policy: geolocation=(), microphone=(), camera=(), payment=(), usb=()
+  Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; font-src 'self' data:; object-src 'none'; frame-src 'none'; worker-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'
+  Strict-Transport-Security: max-age=31536000; includeSubDomains
+
+/manifest.webmanifest
+  Content-Type: application/manifest+json; charset=utf-8

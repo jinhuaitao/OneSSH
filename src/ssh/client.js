@@ -108,6 +108,7 @@ export class SSHClient {
         this.macInLen = 0;
         this.sendChain = Promise.resolve();
         this.drainChain = Promise.resolve();
+        this._writeChain = Promise.resolve();
         this.closed = false;
         this.kexInitSent = false;
         this.sessionId = null;
@@ -408,6 +409,10 @@ export class SSHClient {
                 if (!ch) return;
                 ch.closed = true;
                 this.send(new Writer().byte(MSG.CHANNEL_CLOSE).u32(ch.remoteId).bytes()).catch(() => {});
+                if (ch.reqWaiter) {
+                    ch.reqWaiter.reject(new Error('通道已关闭'));
+                    ch.reqWaiter = null;
+                }
                 if (ch.windowWaiters) {
                     for (const w of ch.windowWaiters.splice(0)) w.resolve();
                 }
@@ -739,23 +744,19 @@ export class SSHClient {
         if (wantReply) ch.reqWaiter = deferred();
         await this.send(w.bytes());
         if (!wantReply) return true;
-        const res = await Promise.race([
-            ch.reqWaiter.promise,
-            new Promise((r) => setTimeout(() => r(true), 4000)),
-        ]);
-        ch.reqWaiter = null;
-        return res;
-    }
-
-    writeChannel(ch, data) {
-        if (!ch || ch.closed || this.closed) return;
-        const u8 = typeof data === 'string' ? new TextEncoder().encode(data) : data;
-        const max = Math.min(ch.maxPacket || MAX_PACKET, 16384);
-        for (let i = 0; i < u8.length; i += max) {
-            const chunk = u8.subarray(i, i + max);
-            ch.window -= chunk.length;
-            const w = new Writer().byte(MSG.CHANNEL_DATA).u32(ch.remoteId).str(chunk);
-            this.send(w.bytes()).catch((e) => this._fail(e));
+        let timer;
+        try {
+            // 超时必须算失败：之前 4 秒后返回 true，服务器其实拒绝了请求
+            // （比如禁用了 shell / exec），却会继续走到一个不存在的通道上。
+            return await Promise.race([
+                ch.reqWaiter.promise,
+                new Promise((_, reject) => {
+                    timer = setTimeout(() => reject(new Error(`服务器 4 秒内没有回应 ${type} 请求`)), 4000);
+                }),
+            ]);
+        } finally {
+            clearTimeout(timer);
+            ch.reqWaiter = null;
         }
     }
 
@@ -841,12 +842,15 @@ export class SSHClient {
     async exec(command, timeoutMs = 8000) {
         const chunks = [];
         let total = 0;
+        let truncated = false;
         let exitCode = null;
         const ch = await this.openChannel({
             onData: (data) => {
                 if (total < 512 * 1024) {
                     chunks.push(data.slice());
                     total += data.length;
+                } else {
+                    truncated = true;
                 }
             },
             onExit: (code) => {
@@ -872,12 +876,18 @@ export class SSHClient {
             buf.set(c, off);
             off += c.length;
         }
-        return { stdout: new TextDecoder().decode(buf), code: exitCode };
+        return { stdout: new TextDecoder().decode(buf), code: exitCode, truncated };
     }
 
     write(data) {
         if (!this.ready || this.closed) return;
-        this.writeChannel(this.shell, data);
+        const u8 = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+        if (!u8.length) return;
+        // 所有输入串行通过发送窗口：大段粘贴超过服务端初始窗口时，硬发会被对端
+        // 当作违规丢弃；串行也保证后续按键不会插到粘贴中间。
+        this._writeChain = this._writeChain
+            .then(() => this.writeChannelFlow(this.shell, u8))
+            .catch(() => {});
     }
 
     resize(cols, rows) {

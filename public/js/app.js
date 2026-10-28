@@ -22,6 +22,7 @@ const state = {
     term: null,
     globe: null,
     nav: 'overview',
+    version: '',
 };
 
 /* --------------------------------------------------------------- settings */
@@ -960,13 +961,17 @@ function openVault() {
             const edit = el('button', { class: 'act icon-only', type: 'button', title: '编辑', html: icon('edit', 14) });
             edit.addEventListener('click', () => credEditor(c, render));
             const del = el('button', { class: 'act icon-only', type: 'button', title: '删除', html: icon('trash', 14) });
+            if (n) {
+                // 服务端会以 409 拒绝删除被引用的条目，界面上就别再给出「删除后主机连不上」的假承诺
+                del.disabled = true;
+                del.title = '正被 ' + n + ' 台主机使用，请先在主机里改用其他凭据';
+            }
             del.addEventListener('click', async () => {
-                const ok = await confirmModal(
-                    '删除常用账号',
-                    '确定删除 <b>' + esc(c.name) + '</b> 吗？' + (n ? '<br>它正被 ' + n + ' 台主机使用，删除后这些主机会连不上。' : ''),
-                    '删除',
-                    true
-                );
+                if (n) {
+                    toast('正被 ' + n + ' 台主机使用，请先在主机设置里改用其他凭据', 'err');
+                    return;
+                }
+                const ok = await confirmModal('删除常用账号', '确定删除 <b>' + esc(c.name) + '</b> 吗？', '删除', true);
                 if (!ok) return;
                 const res = await safe(() => api('/api/creds/' + encodeURIComponent(c.id), { method: 'DELETE' }));
                 if (!res) return;
@@ -1004,13 +1009,16 @@ function openVault() {
             const edit = el('button', { class: 'act icon-only', type: 'button', title: '编辑', html: icon('edit', 14) });
             edit.addEventListener('click', () => keyEditor(k, render));
             const del = el('button', { class: 'act icon-only', type: 'button', title: '删除', html: icon('trash', 14) });
+            if (n) {
+                del.disabled = true;
+                del.title = '正被 ' + n + ' 台主机使用，请先在主机里改用其他凭据';
+            }
             del.addEventListener('click', async () => {
-                const ok = await confirmModal(
-                    '删除密钥',
-                    '确定删除 <b>' + esc(k.name) + '</b> 吗？' + (n ? '<br>它正被 ' + n + ' 台主机使用，删除后这些主机会连不上。' : ''),
-                    '删除',
-                    true
-                );
+                if (n) {
+                    toast('正被 ' + n + ' 台主机使用，请先在主机设置里改用其他凭据', 'err');
+                    return;
+                }
+                const ok = await confirmModal('删除密钥', '确定删除 <b>' + esc(k.name) + '</b> 吗？', '删除', true);
                 if (!ok) return;
                 const res = await safe(() => api('/api/keys/' + encodeURIComponent(k.id), { method: 'DELETE' }));
                 if (!res) return;
@@ -1220,6 +1228,8 @@ function openSnippets(onUse) {
             });
             del.addEventListener('click', async (ev) => {
                 ev.stopPropagation();
+                const ok = await confirmModal('删除片段', '确定删除 <b>' + esc(s.name) + '</b> 吗？', '删除', true);
+                if (!ok) return;
                 state.snippets = state.snippets.filter((x) => x.id !== s.id);
                 await persistSnippets();
                 render();
@@ -1388,7 +1398,7 @@ function openLogs(host) {
                 el('span', { class: 'flag', text: '📄' }),
                 el('div', { class: 'grow' }, [
                     el('div', { class: 'ttl', text: (it.user || '') + '@' + it.host + ':' + it.port }),
-                    el('div', { class: 'mono', text: fmtDate(it.started || it.uploaded) + ' · ' + fmtBytes(it.size) }),
+                    el('div', { class: 'mono', text: fmtDate(it.started || it.uploaded) + ' · ' + fmtBytes(it.size) + (it.truncated ? ' · 已截断（上限 4 MB）' : '') }),
                 ]),
                 el('span', { class: 'muted-sm', text: timeAgo(it.uploaded) }),
             ]);
@@ -1424,7 +1434,7 @@ function openSettings() {
         field('当前密码', curIn),
         field('新密码', nextIn),
         pwMsg,
-        el('div', { class: 'muted-sm', text: '账号：' + (state.user || 'admin') + ' · WebSSH v1.0.0 · 数据保存在你自己的 R2' }),
+        el('div', { class: 'muted-sm', text: '账号：' + (state.user || 'admin') + ' · WebSSH v' + (state.version || '1.0.0') + ' · 数据保存在你自己的 R2' }),
     ]);
 
     const foot = el('div', { style: 'display:flex;gap:8px;width:100%;justify-content:space-between' }, [
@@ -1635,6 +1645,7 @@ async function boot() {
     state.setup = !!info.setup;
     state.authed = !!info.authed;
     state.user = info.user || '';
+    state.version = info.version || '';
     const tokenField = $('#setup-token-field');
     if (tokenField) tokenField.hidden = !info.needsSetupToken;
     if (!state.setup) showAuth('setup');

@@ -10,6 +10,8 @@ const MAX_FILE = 64 * 1024 * 1024;
 const READ_CHUNK = 128 * 1024;
 const WRITE_CHUNK = 64 * 1024;
 const EDIT_MAX = 512 * 1024;
+// 单会话录制的内存上限：超出的部分直接丢弃，但要在元数据里标明「不完整」
+const REC_MAX = 4 * 1024 * 1024;
 // 单会话内并发的 SFTP 请求上限 / 同时打开的文件句柄上限
 const SFTP_CONCURRENCY = 4;
 const MAX_HANDLES = 64;
@@ -74,12 +76,13 @@ export class Terminal {
      * @param {object|null} socket  TCP socket already opened by the fetch handler
      * @param {object|null} target  { host, port } resolved before the upgrade
      */
-    constructor(ws, env, user, socket, target) {
+    constructor(ws, env, user, socket, target, ctx) {
         this.ws = ws;
         this.env = env;
         this.user = user;
         this.socket = socket || null;
         this.target = target || null;
+        this.ctx = ctx || null;
         this.client = null;
         this.writer = null;
         this.writeChain = Promise.resolve();
@@ -88,11 +91,13 @@ export class Terminal {
         this.recording = false;
         this.recChunks = [];
         this.recBytes = 0;
+        this.recTruncated = false;
         this.startedAt = 0;
         this.closed = false;
         this.keepaliveTimer = null;
         this.statsTimer = null;
         this.sampling = false;
+        this.sampleFails = 0;
         this.prevSample = null;
         this.meta = { host: '', port: 22, user: '' };
         // 指纹不一致时留下的上下文，供前端直接给出「删除旧记录并重连」
@@ -121,6 +126,13 @@ export class Terminal {
         try {
             this.ws.send(u8);
         } catch (_) {}
+    }
+
+    /** 清理时还要把录制加密写进 R2，必须挂到 ctx.waitUntil 上活过事件回调 */
+    _detach(reason) {
+        const p = this.cleanup(reason);
+        if (this.ctx) this.ctx.waitUntil(p);
+        return p;
     }
 
     ask(payload, kind, timeoutMs = 120000) {
@@ -178,7 +190,7 @@ export class Terminal {
             else if (!this.hostKeyMismatchSent) {
                 this.send({ t: 'error', message, hostKeyMismatch: this.hostKeyMismatch });
             }
-            await this.cleanup(message);
+            await this._detach(message);
         }
     }
 
@@ -262,7 +274,7 @@ export class Terminal {
                 // 而不是让界面永远显示「已连接」却打不出字。
                 if (Date.now() - (this.client.lastInbound || 0) > 150000) {
                     this.send({ t: 'error', message: '连接已无响应（保活超时 150 秒），已断开' });
-                    this.cleanup('keepalive-timeout');
+                    this._detach('keepalive-timeout');
                     return;
                 }
                 this.client.keepalive();
@@ -307,13 +319,23 @@ export class Terminal {
         try {
             const { stdout } = await this.client.exec(STATS_CMD, 5000);
             const stats = parseStats(stdout, this.prevSample);
-            if (!stats) return;
+            if (!stats) throw new Error('采样结果无法解析');
+            this.sampleFails = 0;
             this.prevSample = stats.raw;
             this.send({ t: 'stats', stats: stats.out });
         } catch (_) {
+            // 连续失败说明 /proc 不可读或通道已废：别每 3 秒再试一次，
+            // 告诉前端「监控不可用」，终端本身不受影响。
+            if (++this.sampleFails >= 3) this._stopStats('sample-failed');
         } finally {
             this.sampling = false;
         }
+    }
+
+    _stopStats(reason) {
+        if (this.statsTimer) clearInterval(this.statsTimer);
+        this.statsTimer = null;
+        this.send({ t: 'stats-off', reason });
     }
 
     /* ---------------------------------------------------------------- sftp */
@@ -515,6 +537,25 @@ export class Terminal {
                 reply({ size: data.length });
                 return;
             }
+            case 'stat': {
+                const st = await sftp.stat(cleanPath(msg.path));
+                reply({
+                    size: st.size == null ? null : st.size,
+                    perms: st.perms == null ? null : st.perms & 0o7777,
+                    mtime: st.mtime || 0,
+                    isDir: isDirMode(st.perms),
+                });
+                return;
+            }
+            case 'chmod': {
+                const h = this.handles.get(String(msg.handle));
+                if (!h) throw new Error('文件句柄无效，请重新打开');
+                const mode = parseInt(msg.mode, 10);
+                if (!Number.isInteger(mode) || mode < 0 || mode > 0o7777) throw new Error('权限值不合法');
+                await sftp.fchmod(h, mode);
+                reply({});
+                return;
+            }
             default:
                 throw new Error('未知的文件操作: ' + msg.op);
         }
@@ -622,7 +663,7 @@ export class Terminal {
             case 'close':
                 this.send({ t: 'exit', code: ev.code });
                 // the remote shell is gone: flush the exit notice, then tear down
-                setTimeout(() => this.cleanup('channel-closed'), 150);
+                setTimeout(() => this._detach('channel-closed'), 150);
                 break;
             case 'exit-status':
                 this.send({ t: 'exit-status', code: ev.code });
@@ -649,11 +690,11 @@ export class Terminal {
                 if (value && value.length) this.client.feed(value);
             }
             this.send({ t: 'status', phase: 'closed', message: '连接已被服务器关闭' });
-            await this.cleanup('eof');
+            await this._detach('eof');
         } catch (e) {
             const message = String((e && e.message) || e);
             this.send({ t: 'error', message });
-            await this.cleanup(message);
+            await this._detach(message);
         }
     }
 
@@ -697,7 +738,7 @@ export class Terminal {
                 this._sftpOp(data).catch((e) => this.send({ t: 'sftp', id: data.id, ok: false, error: String((e && e.message) || e) }));
                 break;
             case 'close':
-                this.cleanup('client');
+                this._detach('client');
                 break;
             default:
                 break;
@@ -705,7 +746,11 @@ export class Terminal {
     }
 
     _record(data) {
-        if (!this.recording || this.recBytes > 4 * 1024 * 1024) return;
+        if (!this.recording) return;
+        if (this.recBytes >= REC_MAX) {
+            this.recTruncated = true;
+            return;
+        }
         // 按原始字节累积。一个 UTF-8 字符（中文 3 字节、emoji 4 字节）完全可能跨 SSH
         // 包边界，逐包 decode 会把它拆成 U+FFFD；收齐后一次性解码才不会打断字符。
         // slice() 不能省：data 是 SSH 接收缓冲上的视图，缓冲区会被后续数据复用。
@@ -749,6 +794,7 @@ export class Terminal {
                     user: this.meta.user,
                     started: new Date(startedAt).toISOString(),
                     bytes: String(this.recBytes),
+                    truncated: this.recTruncated ? '1' : '0',
                     reason: String(reason || ''),
                     enc: 'v1',
                 });

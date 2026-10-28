@@ -139,10 +139,24 @@ export function openFiles(cfg) {
     async function download(entry) {
         const full = joinPath(path, entry.name);
         let handle = null;
+        let writable = null;
         setStatus('读取 ' + entry.name + ' …');
         try {
             const opened = await request({ op: 'open-read', path: full }, 120000);
             handle = opened.handle;
+            // Chrome / Edge：边读边写盘，几十 MB 的文件不用整份堆在内存里
+            if (window.showSaveFilePicker) {
+                try {
+                    const fh = await window.showSaveFilePicker({ suggestedName: entry.name });
+                    writable = await fh.createWritable();
+                } catch (e) {
+                    if (e && e.name === 'AbortError') {
+                        setStatus('已取消下载');
+                        return;
+                    }
+                    writable = null; // 不支持流式保存就退回 Blob
+                }
+            }
             const chunks = [];
             let offset = 0;
             for (;;) {
@@ -150,19 +164,31 @@ export function openFiles(cfg) {
                 if (res.eof) break;
                 const data = unb64(res.data);
                 if (!data.length) break;
-                chunks.push(data);
+                if (writable) await writable.write(data);
+                else chunks.push(data);
                 offset += data.length;
                 setStatus('下载 ' + entry.name + ' · ' + fmtBytes(offset) + (opened.size ? ' / ' + fmtBytes(opened.size) : ''));
             }
-            const blob = new Blob(chunks, { type: 'application/octet-stream' });
-            const url = URL.createObjectURL(blob);
-            const a = el('a', { href: url, download: entry.name, style: 'display:none' });
-            document.body.appendChild(a);
-            a.click();
-            a.remove();
-            setTimeout(() => URL.revokeObjectURL(url), 5000);
+            if (writable) {
+                await writable.close();
+                writable = null;
+            } else {
+                const blob = new Blob(chunks, { type: 'application/octet-stream' });
+                const url = URL.createObjectURL(blob);
+                const a = el('a', { href: url, download: entry.name, style: 'display:none' });
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                setTimeout(() => URL.revokeObjectURL(url), 5000);
+            }
             setStatus('已下载 ' + entry.name + '（' + fmtBytes(offset) + '）');
         } catch (e) {
+            if (writable) {
+                try {
+                    await writable.abort();
+                } catch (_) {}
+                writable = null;
+            }
             setStatus(e.message, true);
             toast(e.message, 'err');
         } finally {
@@ -171,21 +197,35 @@ export function openFiles(cfg) {
     }
 
     async function uploadOne(full, file) {
+        const slash = full.lastIndexOf('/');
+        const dir = slash >= 0 ? full.slice(0, slash) : '.';
+        const base = full.slice(slash + 1);
+        // 先写临时文件再 rename：中途断线不会留下半个文件把原文件覆盖掉
+        const tmp = dir + '/.' + base + '.webssh-' + Math.random().toString(36).slice(2, 8);
         let handle = null;
         try {
-            const opened = await request({ op: 'open-write', path: full }, 60000);
+            // 覆盖已有文件时保留权限位：私钥上传后变成 0644 会被 sshd 拒绝使用
+            const prev = await request({ op: 'stat', path: full }, 30000).catch(() => null);
+            const opened = await request({ op: 'open-write', path: tmp }, 60000);
             handle = opened.handle;
+            if (prev && prev.perms != null) await request({ op: 'chmod', handle, mode: prev.perms }, 30000).catch(() => {});
             for (let offset = 0; offset < file.size; offset += WRITE_CHUNK) {
                 const buf = await file.slice(offset, offset + WRITE_CHUNK).arrayBuffer();
                 await request({ op: 'write', handle, offset, data: b64(new Uint8Array(buf)) }, 120000);
                 setStatus('上传 ' + file.name + ' · ' + fmtBytes(Math.min(file.size, offset + WRITE_CHUNK)) + ' / ' + fmtBytes(file.size));
             }
-        } finally {
+            await request({ op: 'close', handle }, 30000);
+            handle = null;
+            await request({ op: 'rename', from: tmp, to: full }, 30000);
+        } catch (e) {
             if (handle) {
                 try {
                     await request({ op: 'close', handle });
                 } catch (_) {}
+                handle = null;
             }
+            request({ op: 'remove', path: tmp }).catch(() => {});
+            throw e;
         }
     }
 
@@ -307,12 +347,15 @@ export function openFiles(cfg) {
 
         const bytes = unb64(res.data);
         let text = '';
+        let binary = false;
         try {
-            text = new TextDecoder('utf-8').decode(bytes);
+            // fatal 模式：非 UTF-8 字节直接抛错，比「出现 U+FFFD 就算二进制」准确
+            text = new TextDecoder('utf-8', { fatal: true }).decode(bytes);
         } catch (_) {
-            text = '';
+            binary = true;
+            text = new TextDecoder('utf-8').decode(bytes);
         }
-        const binary = text.indexOf('\u0000') >= 0 || text.indexOf('\ufffd') >= 0;
+        if (text.indexOf('\u0000') >= 0) binary = true;
         const area = el('textarea', { class: 'fm-edit', spellcheck: 'false' });
         area.value = text;
 

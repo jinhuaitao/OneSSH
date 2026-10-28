@@ -9,12 +9,14 @@ export function bucket(env) {
     return env.BUCKET;
 }
 
-export async function getJSON(env, key) {
+export async function getJSON(env, key, opts) {
     const obj = await bucket(env).get(key);
     if (!obj) return null;
     try {
         return await obj.json();
     } catch (_) {
+        // 损坏的管理员记录不能被当成「还没初始化」—— 那会让人重建账号并覆盖原数据
+        if (opts && opts.strict) throw new Error('存储记录 ' + key + ' 已损坏（不是合法 JSON），请检查 R2 中的数据');
         return null;
     }
 }

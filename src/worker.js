@@ -25,6 +25,8 @@ const SECURITY_HEADERS = {
 
 const MAX_BODY = 4 * 1024 * 1024;
 const MIN_PASSWORD = 10;
+const SETUP_CLAIM_PREFIX = 'sys/setup-claim/';
+const SETUP_CLAIM_TTL = 2 * 60 * 1000;
 const WEAK_PASSWORDS = new Set([
     '1234567890', '12345678', '123456789', 'password', 'password1', 'password123',
     'qwertyuiop', 'admin12345', 'administrator', 'letmein123', 'iloveyou123', 'webssh12345',
@@ -106,13 +108,15 @@ function cleanHostInput(body) {
     const name = String(body.name || '').trim();
     const host = String(body.host || '').trim();
     const username = String(body.username || '').trim();
-    const port = parseInt(body.port, 10) || 22;
+    const portRaw = body.port == null || body.port === '' ? 22 : Number(body.port);
+    const port = Number.isInteger(portRaw) ? portRaw : NaN;
     const authType = body.authType === 'key' ? 'key' : 'password';
     if (!host) throw new HttpError(400, '主机地址不能为空');
     const addr = normalizeHost(host);
     if (!addr) throw new HttpError(400, '主机地址不合法（支持域名、IPv4、IPv6）');
     if (!username) throw new HttpError(400, '用户名不能为空');
-    if (port < 1 || port > 65535) throw new HttpError(400, '端口范围应为 1-65535');
+    if (username.length > 64 || /\s/.test(username)) throw new HttpError(400, '用户名需为 1-64 个非空白字符');
+    if (!Number.isInteger(port) || port < 1 || port > 65535) throw new HttpError(400, '端口范围应为 1-65535');
     if (name.length > 60) throw new HttpError(400, '名称过长');
     return {
         name: name || `${username}@${addr}`,
@@ -123,15 +127,89 @@ function cleanHostInput(body) {
         group: String(body.group || '').trim().slice(0, 40),
         country: /^[A-Z]{2}$/.test(String(body.country || '')) ? body.country : '',
         city: String(body.city || '').trim().slice(0, 40),
-        icon: String(body.icon || '').slice(0, 4),
+        // 按码点切，避免把 emoji 的代理对劈成两半变成乱码
+        icon: Array.from(String(body.icon || '')).slice(0, 2).join(''),
         color: /^#[0-9a-fA-F]{6}$/.test(String(body.color || '')) ? body.color : '',
         note: String(body.note || '').slice(0, 300),
     };
 }
 
-function publicHost(h) {
-    const { secretEnc, keyEnc, passphraseEnc, ...rest } = h;
-    return { ...rest, host: normalizeHost(h.host) || h.host, hasSecret: Boolean(secretEnc || keyEnc || h.keyId || h.credId) };
+/* ------------------------------------------------------------ host index */
+
+// 列表页只需要摘要，但 R2 每次 list 不带内容 —— 原来要逐条 get，主机一多就是
+// N 次串行往返。把摘要写进对象的 customMetadata，list 一次就能拼出整个列表。
+// 元数据上限 2 KB，base64url 编码让中文备注也能原样往返；装不下的记录退回读正文。
+const HOST_META_FIELD = 'h';
+const HOST_META_MAX = 1800;
+const HOST_PREFIX = 'hosts/';
+
+function hostSummary(rec) {
+    return {
+        id: rec.id,
+        name: rec.name || '',
+        host: normalizeHost(rec.host) || rec.host || '',
+        port: rec.port || 22,
+        username: rec.username || '',
+        authType: rec.authType === 'key' ? 'key' : 'password',
+        group: rec.group || '',
+        country: rec.country || '',
+        city: rec.city || '',
+        icon: rec.icon || '',
+        color: rec.color || '',
+        note: rec.note || '',
+        keyId: rec.keyId || '',
+        credId: rec.credId || '',
+        createdAt: rec.createdAt || 0,
+        updatedAt: rec.updatedAt || 0,
+        hasSecret: Boolean(rec.secretEnc || rec.keyEnc || rec.keyId || rec.credId),
+    };
+}
+
+function encodeMeta(value) {
+    const bytes = new TextEncoder().encode(JSON.stringify(value));
+    let bin = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) bin += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function decodeMeta(text) {
+    try {
+        const b64 = String(text).replace(/-/g, '+').replace(/_/g, '/');
+        const bin = atob(b64 + '==='.slice((b64.length + 3) % 4));
+        const bytes = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+        return JSON.parse(new TextDecoder().decode(bytes));
+    } catch (_) {
+        return null;
+    }
+}
+
+async function putHostRecord(env, rec) {
+    const summary = hostSummary(rec);
+    const meta = encodeMeta(summary);
+    if (meta.length <= HOST_META_MAX) await putJSON(env, HOST_PREFIX + rec.id, rec, { [HOST_META_FIELD]: meta });
+    else await putJSON(env, HOST_PREFIX + rec.id, rec);
+    return summary;
+}
+
+async function listHosts(env) {
+    const objs = await list(env, HOST_PREFIX, true);
+    const out = [];
+    const missing = [];
+    for (const o of objs) {
+        const summary = o.customMetadata && o.customMetadata[HOST_META_FIELD] ? decodeMeta(o.customMetadata[HOST_META_FIELD]) : null;
+        if (summary && summary.id) out.push(summary);
+        else missing.push(o.key);
+    }
+    if (missing.length) {
+        const recs = await Promise.all(missing.map((k) => getJSON(env, k)));
+        recs.forEach((rec, i) => {
+            if (!rec) return;
+            if (!rec.id) rec.id = missing[i].slice(HOST_PREFIX.length);
+            out.push(hostSummary(rec));
+        });
+    }
+    return out;
 }
 
 /* ---------------------------------------------------------------- groups */
@@ -165,9 +243,8 @@ async function listGroups(env) {
         }
     }
     // hosts saved before groups were a first-class concept still count
-    for (const o of await list(env, 'hosts/')) {
-        const rec = await getJSON(env, o.key);
-        const name = rec && String(rec.group || '').trim();
+    for (const h of await listHosts(env)) {
+        const name = String(h.group || '').trim();
         if (name && !seen.has(name)) {
             seen.add(name);
             out.push(name);
@@ -178,12 +255,13 @@ async function listGroups(env) {
 
 async function retagHosts(env, from, to) {
     let n = 0;
-    for (const o of await list(env, 'hosts/')) {
-        const rec = await getJSON(env, o.key);
-        if (!rec || String(rec.group || '').trim() !== from) continue;
+    for (const h of await listHosts(env)) {
+        if (String(h.group || '').trim() !== from) continue;
+        const rec = await getJSON(env, HOST_PREFIX + h.id);
+        if (!rec) continue;
         rec.group = to;
         rec.updatedAt = Date.now();
-        await putJSON(env, o.key, rec);
+        await putHostRecord(env, rec);
         n++;
     }
     return n;
@@ -254,11 +332,20 @@ async function handleApi(request, env, url) {
     }
 
     if (path === '/api/setup' && method === 'POST') {
-        const admin = await auth.getAdmin(env);
-        if (admin) return json({ error: 'already_setup', message: '系统已经完成初始化' }, 409);
+        const ip = request.headers.get('cf-connecting-ip') || 'local';
+        const throttle = await auth.checkThrottle(env, ip, 'setup');
+        if (throttle.locked) {
+            return json(
+                { error: 'locked', message: `尝试次数过多，请 ${Math.ceil(throttle.retryAfter / 60)} 分钟后再试` },
+                429,
+                { 'retry-after': String(throttle.retryAfter) }
+            );
+        }
+        if (await auth.getAdmin(env)) return json({ error: 'already_setup', message: '系统已经完成初始化' }, 409);
         const body = await readJSON(request);
         // 公开部署时防止陌生人抢先初始化：设置了 WEBSSH_SETUP_TOKEN 就必须带上它
         if (env.WEBSSH_SETUP_TOKEN && !auth.safeEqual(String(body.token || ''), String(env.WEBSSH_SETUP_TOKEN))) {
+            await auth.recordFailure(env, ip, 'setup');
             return json({ error: 'bad_token', message: '初始化口令不正确' }, 403);
         }
         const username = String(body.username || '').trim();
@@ -268,9 +355,41 @@ async function handleApi(request, env, url) {
         }
         const pwError = checkPassword(password, username);
         if (pwError) return json({ error: 'weak_password', message: pwError }, 400);
-        await auth.createAdmin(env, username, password);
-        const token = await auth.createSession(env, username, request);
-        return json({ ok: true }, 200, { 'set-cookie': auth.sessionCookie(token, request) });
+
+        // 并发初始化只能有一个赢家。R2 没有 CAS，旧实现「检查 → 写入」不是原子的：
+        // 两个请求都会看到「没有管理员」，后写的那个会把前一个的管理员覆盖掉。
+        // 现在每个请求先写一枚带时间戳的认领记录，等 300ms 让并发写入落定，
+        // 再按 key 排序取最小者（R2 列表强一致），落败者删除自己的认领并退出。
+        const claimKey = SETUP_CLAIM_PREFIX + Date.now() + '-' + auth.randomHex(6);
+        await putJSON(env, claimKey, { at: Date.now() });
+        await new Promise((r) => setTimeout(r, 300));
+        const now = Date.now();
+        const live = (await list(env, SETUP_CLAIM_PREFIX))
+            .map((o) => o.key)
+            .filter((k) => {
+                const ts = parseInt(k.slice(SETUP_CLAIM_PREFIX.length), 10);
+                if (!Number.isFinite(ts)) return false;
+                if (now - ts < SETUP_CLAIM_TTL) return true;
+                del(env, k).catch(() => {});
+                return false;
+            })
+            .sort();
+        if (live[0] !== claimKey || (await auth.getAdmin(env))) {
+            await del(env, claimKey).catch(() => {});
+            return json({ error: 'setup_busy', message: '初始化正在进行，请稍后刷新页面重试' }, 409);
+        }
+        try {
+            const created = await auth.createAdmin(env, username, password);
+            const check = await auth.getAdmin(env);
+            if (!check || check.salt !== created.salt) {
+                return json({ error: 'already_setup', message: '系统已经完成初始化' }, 409);
+            }
+            await auth.clearFailures(env, ip, 'setup');
+            const token = await auth.createSession(env, username, request);
+            return json({ ok: true }, 200, { 'set-cookie': auth.sessionCookie(token, request) });
+        } finally {
+            await del(env, claimKey).catch(() => {});
+        }
     }
 
     if (path === '/api/login' && method === 'POST') {
@@ -418,9 +537,8 @@ async function handleApi(request, env, url) {
         const keys = await storedKeys(env);
         if (!keys.some((k) => k.id === id)) return json({ error: 'not_found', message: '密钥不存在' }, 404);
         let used = 0;
-        for (const o of await list(env, 'hosts/')) {
-            const rec = await getJSON(env, o.key);
-            if (rec && rec.keyId === id) used++;
+        for (const h of await listHosts(env)) {
+            if (h.keyId === id) used++;
         }
         if (used) return json({ error: 'in_use', message: `该密钥正被 ${used} 台主机使用，请先改用其他凭据` }, 409);
         await putJSON(env, 'sys/keys', { keys: keys.filter((k) => k.id !== id), updatedAt: Date.now() });
@@ -456,13 +574,13 @@ async function handleApi(request, env, url) {
             await putJSON(env, 'sys/creds', { creds: next, updatedAt: Date.now() });
             // hosts keep a denormalised username for list rendering
             if (entry && entry.username !== username) {
-                for (const o of await list(env, 'hosts/')) {
-                    const host = await getJSON(env, o.key);
-                    if (host && host.credId === rec.id) {
-                        host.username = username;
-                        host.updatedAt = Date.now();
-                        await putJSON(env, o.key, host);
-                    }
+                for (const h of await listHosts(env)) {
+                    if (h.credId !== rec.id) continue;
+                    const host = await getJSON(env, HOST_PREFIX + h.id);
+                    if (!host) continue;
+                    host.username = username;
+                    host.updatedAt = Date.now();
+                    await putHostRecord(env, host);
                 }
             }
             return json({ cred: publicCredMeta(rec) });
@@ -475,9 +593,8 @@ async function handleApi(request, env, url) {
         const creds = await storedCreds(env);
         if (!creds.some((c) => c.id === id)) return json({ error: 'not_found', message: '常用账号不存在' }, 404);
         let used = 0;
-        for (const o of await list(env, 'hosts/')) {
-            const rec = await getJSON(env, o.key);
-            if (rec && rec.credId === id) used++;
+        for (const h of await listHosts(env)) {
+            if (h.credId === id) used++;
         }
         if (used) return json({ error: 'in_use', message: `该账号正被 ${used} 台主机使用，请先改用其他凭据` }, 409);
         await putJSON(env, 'sys/creds', { creds: creds.filter((c) => c.id !== id), updatedAt: Date.now() });
@@ -486,12 +603,7 @@ async function handleApi(request, env, url) {
 
     if (path === '/api/hosts') {
         if (method === 'GET') {
-            const objs = await list(env, 'hosts/');
-            const hosts = [];
-            for (const o of objs) {
-                const rec = await getJSON(env, o.key);
-                if (rec) hosts.push(publicHost(rec));
-            }
+            const hosts = await listHosts(env);
             hosts.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || (a.name || '').localeCompare(b.name || ''));
             return json({ hosts });
         }
@@ -543,8 +655,8 @@ async function handleApi(request, env, url) {
                     rec.keyId = existing.keyId;
                 }
             }
-            await putJSON(env, 'hosts/' + id, rec);
-            return json({ host: publicHost(rec) });
+            await putHostRecord(env, rec);
+            return json({ host: hostSummary(rec) });
         }
     }
 
@@ -608,6 +720,7 @@ async function handleApi(request, env, url) {
                     port: o.customMetadata?.port || '22',
                     user: o.customMetadata?.user || '',
                     started: o.customMetadata?.started || '',
+                    truncated: o.customMetadata?.truncated === '1',
                 }))
                 .sort((a, b) => String(b.uploaded).localeCompare(String(a.uploaded)));
             return json({ logs });
@@ -683,7 +796,7 @@ function socketError(message) {
     return new Response(null, { status: 101, webSocket: client });
 }
 
-async function handleWebSocket(request, env) {
+async function handleWebSocket(request, env, ctx) {
     const upgrade = request.headers.get('upgrade') || '';
     if (upgrade.toLowerCase() !== 'websocket') return json({ error: 'upgrade_required' }, 426);
     assertSameOrigin(request);
@@ -696,7 +809,8 @@ async function handleWebSocket(request, env) {
     const url = new URL(request.url);
     const hostId = url.searchParams.get('hostId') || '';
     const qHost = (url.searchParams.get('host') || '').trim();
-    const qPort = parseInt(url.searchParams.get('port'), 10) || 22;
+    const qPortRaw = url.searchParams.get('port');
+    const qPort = qPortRaw == null || qPortRaw === '' ? 22 : /^\d+$/.test(qPortRaw) ? Number(qPortRaw) : NaN;
 
     let target;
     if (hostId) {
@@ -707,7 +821,7 @@ async function handleWebSocket(request, env) {
     } else {
         const addr = normalizeHost(qHost);
         if (!addr) return json({ error: 'bad_host', message: '主机地址不合法' }, 400);
-        if (qPort < 1 || qPort > 65535) return json({ error: 'bad_port', message: '端口不合法' }, 400);
+        if (!Number.isInteger(qPort) || qPort < 1 || qPort > 65535) return json({ error: 'bad_port', message: '端口不合法' }, 400);
         const budget = await quickConnectBudget(env, session.token);
         if (!budget.ok) {
             return socketError(`临时连接过于频繁（${QUICK_WINDOW / 60000} 分钟内最多 ${QUICK_LIMIT} 个目标）。请先把常用主机保存下来再连接。`);
@@ -727,7 +841,7 @@ async function handleWebSocket(request, env) {
     const server = pair[1];
     server.accept();
 
-    const term = new Terminal(server, env, session.u, socket, target);
+    const term = new Terminal(server, env, session.u, socket, target, ctx);
     server.addEventListener('message', (ev) => {
         try {
             term.handleMessage(ev.data);
@@ -738,10 +852,12 @@ async function handleWebSocket(request, env) {
         }
     });
     server.addEventListener('close', () => {
-        term.cleanup('ws-close');
+        // cleanup() 还要把录制加密写进 R2；不挂 waitUntil 的话 socket 一关
+        // 这个请求就被判定结束，录像可能只写了一半甚至完全丢失。
+        ctx.waitUntil(term.cleanup('ws-close'));
     });
     server.addEventListener('error', () => {
-        term.cleanup('ws-error');
+        ctx.waitUntil(term.cleanup('ws-error'));
     });
 
     return new Response(null, { status: 101, webSocket: client });
@@ -762,7 +878,7 @@ export default {
                     request
                 );
             }
-            if (path === '/ws') return await handleWebSocket(request, env);
+            if (path === '/ws') return await handleWebSocket(request, env, ctx);
             if (path.startsWith('/api/')) return await handleApi(request, env, url);
             if (path === '/' || path === '/index.html') return html(renderShell(), request);
             if (env.ASSETS) {
