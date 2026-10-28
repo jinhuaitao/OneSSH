@@ -1,5 +1,5 @@
 // Account, session, throttle and at-rest secret encryption.
-import { getJSON, putJSON, del, list } from './store.js';
+import { getJSON, putJSON, putJSONIfAbsent, del, list } from './store.js';
 
 const ADMIN_KEY = 'sys/admin';
 const MASTER_KEY = 'sys/master';
@@ -53,18 +53,40 @@ export async function getAdmin(env) {
     return getJSON(env, ADMIN_KEY);
 }
 
-export async function createAdmin(env, username, password) {
+async function buildAdminRecord(username, password) {
     const salt = randomHex(16);
-    const record = {
+    return {
         username,
         salt,
         iterations: PBKDF2_ITER,
         hash: await hashPassword(password, salt, PBKDF2_ITER),
         createdAt: Date.now(),
     };
+}
+
+/** 覆盖写：仅用于改密（/api/password），初始化请用 createAdminIfAbsent */
+export async function createAdmin(env, username, password) {
+    const record = await buildAdminRecord(username, password);
     await putJSON(env, ADMIN_KEY, record);
     await ensureMasterKey(env);
     return record;
+}
+
+/**
+ * 首次初始化：并发请求里只有第一个能登基，其余返回 false。
+ * R2 没有 CAS，但 put 支持 If-None-Match: *（条件不满足返回 null），
+ * 所以这里用条件写而不是「先读后写」。写后再回读一次 initId 兜底：
+ * 即使运行时忽略了 onlyIf，后写者也能发现自己没抢到。
+ */
+export async function createAdminIfAbsent(env, username, password) {
+    const record = await buildAdminRecord(username, password);
+    const marker = randomHex(8);
+    record.initId = marker;
+    const wrote = await putJSONIfAbsent(env, ADMIN_KEY, record);
+    const stored = await getJSON(env, ADMIN_KEY);
+    if (!wrote && !stored) throw new Error('初始化失败：管理员记录没有写入存储，请重试');
+    await ensureMasterKey(env);
+    return Boolean(stored && stored.initId === marker);
 }
 
 export async function verifyLogin(env, username, password) {
@@ -246,7 +268,12 @@ export async function ensureMasterKey(env) {
     if (env.WEBSSH_MASTER_KEY) return;
     const existing = await getJSON(env, MASTER_KEY);
     if (existing && existing.key) return;
-    await putJSON(env, MASTER_KEY, { key: b64encode(crypto.getRandomValues(new Uint8Array(32))), createdAt: Date.now() });
+    // 与管理员记录同理：并发初始化只能有一份主密钥落盘。
+    // 败者绝不能覆盖 —— 否则赢家用 A 钥加密的凭据会被 B 钥毁掉。
+    const candidate = { key: b64encode(crypto.getRandomValues(new Uint8Array(32))), createdAt: Date.now() };
+    if (await putJSONIfAbsent(env, MASTER_KEY, candidate)) return;
+    const check = await getJSON(env, MASTER_KEY);
+    if (!check || !check.key) throw new Error('主密钥初始化失败，请重试');
 }
 
 export async function getMasterKey(env) {

@@ -281,7 +281,10 @@ async function handleApi(request, env, url) {
         }
         const pwError = checkPassword(password, username);
         if (pwError) return json({ error: 'weak_password', message: pwError }, 400);
-        await auth.createAdmin(env, username, password);
+        // 上面的 getAdmin() 只是快速路径：两个并发请求可能同时看到「未初始化」，
+        // 所以真正决定归属的是这里的条件写，输的一方拿不到会话。
+        const created = await auth.createAdminIfAbsent(env, username, password);
+        if (!created) return json({ error: 'already_setup', message: '系统已经完成初始化，请直接登录' }, 409);
         await auth.clearFailures(env, ip);
         const token = await auth.createSession(env, username, request);
         return json({ ok: true }, 200, { 'set-cookie': auth.sessionCookie(token, request) });

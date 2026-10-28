@@ -26,6 +26,19 @@ export async function putJSON(env, key, value, meta) {
     });
 }
 
+/**
+ * 只在 key 不存在时写入（R2 的 If-None-Match: *，条件不满足时 put 返回 null）。
+ * 返回 true 表示确实是本次写入的赢家。
+ */
+export async function putJSONIfAbsent(env, key, value, meta) {
+    const obj = await bucket(env).put(key, JSON.stringify(value), {
+        httpMetadata: { contentType: 'application/json' },
+        customMetadata: meta,
+        onlyIf: new Headers({ 'If-None-Match': '*' }),
+    });
+    return obj !== null;
+}
+
 export async function getBytes(env, key) {
     const obj = await bucket(env).get(key);
     if (!obj) return null;
