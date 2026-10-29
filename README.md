@@ -65,7 +65,7 @@
 npm install
 npx wrangler dev                # http://127.0.0.1:8787，本地 R2 在 .wrangler/ 下
 npx wrangler deploy             # CLI 部署，需先 wrangler login
-npm test                        # 86 个用例，不需要 wrangler / 网络 / sshd
+npm test                        # 93 个用例，不需要 wrangler / 网络 / sshd
 npm run test:watch              # 改代码自动重跑
 ```
 
@@ -77,7 +77,7 @@ npm run test:watch              # 改代码自动重跑
 | `tests/sftp.test.mjs` | SFTP 报文分帧、属性位解析、状态码翻译、`renameOverwrite` 的三级降级（posix-rename → 普通 rename → 备份再换名） |
 | `tests/session.test.mjs` | 会话层：`knownKey` 归一化、原子上传的两个操作码（临时文件 → 还原权限 → 覆盖改名）、失败时清理临时文件、句柄释放 |
 | `tests/api.test.mjs` | 直接调用 Worker 的 `fetch`：初始化 / 初始化口令 / 登录 / 限流 / 改密踢设备 / 登出、主机 · 分组 · 凭据库 CRUD、密文不落明文、跨站写请求与非法 Content-Type、安全响应头、路径穿越 |
-| `tests/hardening.test.mjs` | 会话绑设备（UA 缺省也拒绝、IP 取不到也拒绝、XFF 默认不采信）、初始化口令必填、密文 AAD 绑定与旧日志兼容、SHA-1 签名拒绝、`first_kex_packet_follows` 丢包、主动重协商触发条件 |
+| `tests/hardening.test.mjs` | 会话绑设备（UA 缺省也拒绝、IP 取不到也拒绝、XFF 默认不采信）、初始化口令必填、密文 AAD 绑定与旧日志兼容、SHA-1 签名拒绝、`first_kex_packet_follows` 丢包、主动重协商触发条件、密码 pepper 与哈希记录自动升级、`/api/state` 不泄露版本、主机数量上限、录制保留期 |
 
 为了在 Node 里加载 Worker 代码，`tests/loader.mjs` 把 `cloudflare:sockets` 解析成一个桩，`tests/helpers.mjs` 提供一个内存版 R2（含 `If-None-Match: *` 条件写与分页）。所以整套测试不需要 Cloudflare 账号、不需要本地 sshd，也不需要浏览器。删掉 `.wrangler/state` 会清空本地全部数据。
 
@@ -93,7 +93,7 @@ npm run test:watch              # 改代码自动重跑
 | 🔍 **搜索** | 顶部搜索框按名称 / 地址 / 用户名 / 分组 / 城市 / 备注过滤，与地区筛选叠加生效，<kbd>⌘K</kbd>（或 <kbd>/</kbd>）聚焦、<kbd>Esc</kbd> 清空，页脚同步显示 `命中 / 总数` |
 | 🌐 **IPv6** | 填 `2001:db8::1` 或 `[2001:db8::1]` 都行，列表统一显示为 `user@[addr]:port` |
 | 🔌 **连接** | 点主机行一键直连；没存凭据则弹窗临时输入，只在内存里用 |
-| ⚡ **快速连接** | 左侧闪电图标，临时连接不落库，可顺手保存到我的主机；为防止被当成端口扫描器，同一登录会话 10 分钟内最多连 10 个临时目标 |
+| ⚡ **快速连接** | 左侧闪电图标，临时连接不落库，可顺手保存到我的主机；为防止被当成端口扫描器，同一登录会话 10 分钟内最多连 10 个临时目标（连已保存的主机另按每分钟 20 条限速） |
 | 🔑 **主机密钥** | 首次连接弹 `SHA256:...` 指纹确认（与 `ssh-keygen -lf` 一致）；指纹变了直接拒绝，并在弹窗里一键「删除旧记录并重连」 |
 
 ### 🗂️ 组织与凭据
@@ -120,12 +120,12 @@ npm run test:watch              # 改代码自动重跑
 | 快捷键 | 作用 |
 | :--- | :--- |
 | <kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Shift</kbd> + <kbd>C</kbd> | 复制选中 |
-| <kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Shift</kbd> + <kbd>V</kbd> | 粘贴 |
+| <kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Shift</kbd> + <kbd>V</kbd> | 粘贴（**两行以上会先弹确认**） |
 | <kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Shift</kbd> + <kbd>F</kbd> | 全屏 |
 | <kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Shift</kbd> + <kbd>R</kbd> | 重连 |
 | <kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Shift</kbd> + <kbd>W</kbd> | 关闭当前标签 |
 | <kbd>Alt</kbd> + <kbd>1</kbd> … <kbd>9</kbd> | 切换标签 |
-| 右键 | 粘贴 |
+| 右键 | 粘贴（同样会先确认多行内容） |
 | <kbd>⌘</kbd> / <kbd>Ctrl</kbd> + <kbd>K</kbd> | 回到主机列表时聚焦搜索框 |
 
 ### 📲 安装到桌面（PWA）
@@ -144,7 +144,7 @@ npm run test:watch              # 改代码自动重跑
 
 ## 🔐 安全
 
-- 👤 **单管理员**：第一个完成初始化的账号就是唯一账号，没有注册入口。忘记密码只能删掉 R2 里的 `sys/admin` 和 `sess/*` 重新初始化（主密钥不变，已存凭据仍能解开）。
+- 👤 **单管理员**：第一个完成初始化的账号就是唯一账号，没有注册入口。忘记密码只能删掉 R2 里的 `sys/admin` 和 `sess/*` 重新初始化（主密钥不变，已存凭据仍能解开）。如果配了 `WEBSSH_PASSWORD_PEPPER`，重装时**必须用同一个 pepper**，否则已存的哈希永远对不上。
 - 🎟️ **初始化口令（必须设置）**：`WEBSSH_SETUP_TOKEN` 现在是硬性要求 —— 没配就**不允许初始化**，接口直接回 `503 setup_token_missing`。原因是未配置时的语义等于「谁先打开网址谁就是管理员」，而这个窗口往往正好在部署完、把链接丢进群里的那几分钟。口令与登录密码共用同一套失败计数（超过阈值锁 15 分钟）：
 
   ```bash
@@ -152,6 +152,13 @@ npm run test:watch              # 改代码自动重跑
   ```
 
 - 🔑 **口令与会话**：密码至少 10 位、拒绝常见弱口令；PBKDF2-SHA256（10 万次迭代）加盐存储，校验用恒定时间比较。会话是 HttpOnly + SameSite=Lax 的随机 256 位 token，30 天绝对过期、7 天空闲过期，**改密后其它设备立即掉线**。
+- 🧂 **密码 pepper（强烈建议）**：Workers 生产运行时把 PBKDF2 迭代次数**硬锁在 100000**（超了直接 `NotSupportedError`，本地 dev 不检查），所以「加迭代次数抗离线爆破」这条路是堵死的。能加的是 pepper —— 一段只存在环境变量、永远不写进 R2 的随机串，拼在密码前面一起过 PBKDF2。拿到桶转储的人没有 pepper，哈希对他就是一堆随机字节：
+
+  ```bash
+  npx wrangler secret put WEBSSH_PASSWORD_PEPPER   # 至少 16 字符，建议 openssl rand -base64 32
+  ```
+
+  加了 pepper 之后**旧密码仍然能登录**，登录成功那一刻记录自动升级（哈希记录带 `v: 2` / `peppered` 标记，升级时保留 `createdAt`）；pepper 短于 16 字符当作没配。反过来，**pepper 丢了 = 密码作废**，只能删 `sys/admin` 重新初始化。也正因为 pepper 和主密钥都在同一个环境变量里，这里没有把 `sys/admin` 整体加密 —— 加密不会多挡住任何人，却会让密钥配错时管理员彻底进不去。
 - 🧷 **会话绑设备（fail-closed）**：会话写入时的 User-Agent 会参与校验 —— UA 变了**或者这次压根没带 UA**，都直接作废并删除记录（空 UA 算不匹配，否则 `curl -A ""` 就是一条绕过路径）。IP 按网段比对：IPv4 比 /24、IPv6 比 /48，换网段同样作废；建会话时知道 IP、这次却取不到，也按不匹配处理。手机切 4G/5G 只换尾段，不受影响。确实需要放宽（比如经常跨网络漫游）可以设 `WEBSSH_SESSION_IP_BIND=off` 关掉 IP 这一层，UA 那一层没有开关。
 - 🕵️ **不采信客户端自报的 IP**：`cf-connecting-ip` 优先；`x-forwarded-for` / `x-real-ip` 是客户端可写的头，默认忽略 —— 否则换一个值就能把登录限流绕成无限次。确实在自己的反代后面（且反代会覆写这两个头）时，再设 `WEBSSH_TRUST_PROXY=on` 打开。
 - 🧱 **跨站防线**：所有写接口和 WebSocket 升级都校验 `Origin` 同源，挡 CSRF 和跨站 WebSocket 劫持；页面带 `CSP`（`connect-src 'self'`、`object-src 'none'`、`frame-ancestors 'none'`）、`COOP` / `CORP` / `Permissions-Policy`，HTTPS 下加 `HSTS`。
@@ -164,6 +171,8 @@ npm run test:watch              # 改代码自动重跑
 
   设置后不再使用 `sys/master`，但**换密钥后旧凭据都解不开**，需要重新录入。
 - 🚦 **登录限流**：同一 IP 10 分钟内失败 6 次，锁 15 分钟；写接口只收 `application/json` 且限制请求体大小；账号是否存在不体现在响应内容或耗时上。
+- 🧮 **连接预算**：登录态被拿走时，这个 Worker 就是一台免费代理。临时地址（`?host=`）每 10 分钟最多 10 个目标，**保存过的主机同样受限** —— 每会话每分钟最多新建 20 条连接，超了直接回一条 `error` 帧。Worker 是无状态的，跨 isolate 没有共享内存，所以限的是「新建速率」而不是「同时在线数」：会造成伤害的是短时间内打出去几百条 TCP。
+- 🗂️ **数量与保留期**：主机最多 200 台、分组最多 50 个（到顶返回 `409 too_many`，改已有条目不受影响）；会话录制默认保留 30 天，每次写完新录制顺手清一批过期的，`WEBSSH_LOG_RETENTION_DAYS=0` 可永久保留。
 - 🌍 **连不了内网**：Workers 只能连公网地址，Cloudflare 自家网段、localhost、内网地址都会被拒。
 
 <details>

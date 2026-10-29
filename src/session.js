@@ -2,7 +2,7 @@
 import { connect } from 'cloudflare:sockets';
 import { SSHClient } from './ssh/client.js';
 import { SFTPClient, OPEN, b64encode, b64decode, isDirMode, isLinkMode, modeString, tempName } from './ssh/sftp.js';
-import { getJSON, putJSON, putBytes } from './store.js';
+import { getJSON, putJSON, putBytes, list, del } from './store.js';
 import { decryptSecret, randomHex, encryptBytes } from './auth.js';
 import { normalizeHost } from './hostaddr.js';
 
@@ -802,6 +802,8 @@ export class Terminal {
                     // 读取端靠「先带上下文、失败再退回」兼容两者。
                     enc: 'v2',
                 });
+                // 写完新录制顺手清一批过期的（见 logRetentionDays）
+                await pruneOldLogs(this.env).catch(() => {});
             } catch (_) {}
         }
         this.recChunks = [];
@@ -812,6 +814,39 @@ function clampInt(v, min, max, dflt) {
     const n = parseInt(v, 10);
     if (!Number.isFinite(n)) return dflt;
     return Math.min(max, Math.max(min, n));
+}
+
+/* ------------------------------------------------------------ log retention */
+
+// 会话录制的保留期（天），0 = 永久保留。
+// R2 的生命周期规则要另开一套配置，而录制是这里唯一会无限增长的对象 ——
+// 不清理的话，一年后桶里全是没人再看的终端日志（还都是加密的，删了也不心疼）。
+function logRetentionDays(env) {
+    const raw = env && env.WEBSSH_LOG_RETENTION_DAYS;
+    if (raw == null || raw === '') return 30;
+    const n = parseInt(String(raw), 10);
+    return Number.isFinite(n) && n >= 0 ? n : 30;
+}
+
+// 一次最多删这么多：清理不能把一次会话结束的 CPU 预算吃光
+const PRUNE_BATCH = 50;
+
+/** 导出仅为可测：这段逻辑会真的删对象，值得一条用例守着。 */
+export async function pruneOldLogs(env) {
+    const days = logRetentionDays(env);
+    if (!days) return;
+    const cutoff = Date.now() - days * 24 * 3600 * 1000;
+    const objs = await list(env, 'logs/');
+    let removed = 0;
+    for (const o of objs) {
+        if (removed >= PRUNE_BATCH) break;
+        const t = o.uploaded instanceof Date ? o.uploaded.getTime() : Date.parse(o.uploaded);
+        if (!Number.isFinite(t) || t >= cutoff) continue;
+        try {
+            await del(env, o.key);
+            removed++;
+        } catch (_) {}
+    }
 }
 
 /** 把录制分片按顺序拼成一个字节流（解码留到读日志时整体进行） */

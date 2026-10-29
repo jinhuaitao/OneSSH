@@ -145,8 +145,37 @@ export function sameIpPrefix(a, b) {
 
 /* --------------------------------------------------------------- password */
 
-export async function hashPassword(password, saltHex, iterations = PBKDF2_ITER) {
-    const key = await crypto.subtle.importKey('raw', te.encode(password), 'PBKDF2', false, ['deriveBits']);
+// 记录格式版本。v1 是早期部署写的 { username, salt, iterations, hash }；
+// v2 多了 algo / v / peppered，用来判断这条记录该不该在登录后就地升级。
+const HASH_VER = 2;
+const HASH_ALGO = 'pbkdf2-sha256';
+// pepper 太短就没有意义了，短于这个长度当作没配
+const PEPPER_MIN = 16;
+
+/**
+ * 从 Worker secret 里取 pepper。
+ *
+ * 为什么需要它：Workers 生产运行时对 PBKDF2 迭代次数有 100000 的硬上限
+ * （超了直接 NotSupportedError），所以「提高迭代次数抗离线爆破」这条路是堵死的。
+ * 能加的是 pepper —— 一段只存在于环境变量、永远不写进 R2 的随机串，
+ * 拼在密码前面一起过 PBKDF2。拿到桶转储的人没有 pepper，
+ * 100000 次 PBKDF2 的哈希对他来说就是一堆随机字节。
+ *
+ * 这也是为什么不需要把 sys/admin 整体加密：加密密钥和 pepper 在同一个
+ * 环境变量里，加密不会多挡住任何人，却会让密钥配错时管理员彻底进不去。
+ */
+function passwordPepper(env) {
+    const raw = env && env.WEBSSH_PASSWORD_PEPPER;
+    if (!raw) return '';
+    const s = String(raw);
+    return s.length >= PEPPER_MIN ? s : '';
+}
+
+export async function hashPassword(password, saltHex, iterations = PBKDF2_ITER, pepper = '') {
+    // 用 \0 分隔：否则 pepper='ab' + password='cd' 和 pepper='a' + password='bcd'
+    // 会算出同一个哈希
+    const material = pepper ? pepper + '\u0000' + password : password;
+    const key = await crypto.subtle.importKey('raw', te.encode(material), 'PBKDF2', false, ['deriveBits']);
     const bits = await crypto.subtle.deriveBits(
         { name: 'PBKDF2', salt: fromHex(saltHex), iterations, hash: 'SHA-256' },
         key,
@@ -159,25 +188,60 @@ export async function getAdmin(env) {
     return getJSON(env, ADMIN_KEY);
 }
 
-async function buildAdminRecord(username, password) {
+async function buildAdminRecord(env, username, password) {
     const salt = randomHex(16);
+    const pepper = passwordPepper(env);
     return {
+        v: HASH_VER,
+        algo: HASH_ALGO,
         username,
         salt,
         iterations: PBKDF2_ITER,
-        hash: await hashPassword(password, salt, PBKDF2_ITER),
+        peppered: Boolean(pepper),
+        hash: await hashPassword(password, salt, PBKDF2_ITER, pepper),
         createdAt: Date.now(),
     };
 }
 
-/** 覆盖写：仅用于改密（/api/password），初始化请用 createAdminIfAbsent */
-export async function createAdmin(env, username, password) {
+/**
+ * 这条记录要不要用当前参数重算：
+ *  - 旧格式（没有 v，说明是 pepper 之前写的）
+ *  - 迭代次数不是当前值
+ *  - 配了 pepper，但记录里没带（最关键的升级路径：加上 pepper 后
+ *    旧记录仍然能登录，登录成功那一刻顺手升级，不用把人踢出去重设密码）
+ */
+export function needsRehash(env, admin) {
+    if (!admin) return false;
+    if (admin.v !== HASH_VER) return true;
+    if (Number(admin.iterations) !== PBKDF2_ITER) return true;
+    return Boolean(passwordPepper(env)) && !admin.peppered;
+}
+
+/**
+ * 覆盖写：仅用于改密（/api/password），初始化请用 createAdminIfAbsent。
+ * 传 prev 时保留它的 createdAt —— 改密码不代表账号是刚建的。
+ */
+export async function createAdmin(env, username, password, prev) {
     // 先确认主密钥可用，再动管理员记录：顺序反过来的话，密钥有问题时
     // 密码已经改了、凭据却全部解不开，属于最坏的一种「半成功」。
     await ensureMasterKey(env);
-    const record = await buildAdminRecord(username, password);
+    const record = await buildAdminRecord(env, username, password);
+    if (prev && prev.createdAt) record.createdAt = prev.createdAt;
     await putJSON(env, ADMIN_KEY, record);
     return record;
+}
+
+/**
+ * 登录成功后就地把记录升级到当前参数。
+ * 调用方已经验过密码，所以这里不需要再验一次；写失败不影响本次登录，
+ * 下次登录会再试一遍。
+ */
+export async function rehashAdmin(env, admin, password) {
+    const next = await buildAdminRecord(env, admin.username, password);
+    // createdAt 表示「这个账号是什么时候建的」，升级不该把它改成现在
+    if (admin.createdAt) next.createdAt = admin.createdAt;
+    await putJSON(env, ADMIN_KEY, next);
+    return next;
 }
 
 /**
@@ -191,7 +255,7 @@ export async function createAdminIfAbsent(env, username, password) {
     // 会出现「管理员已创建、但每次保存凭据都失败」的半初始化状态，
     // 而且 setup 已经不能重跑了（getAdmin 非空）。
     await ensureMasterKey(env);
-    const record = await buildAdminRecord(username, password);
+    const record = await buildAdminRecord(env, username, password);
     const marker = randomHex(8);
     record.initId = marker;
     const wrote = await putJSONIfAbsent(env, ADMIN_KEY, record);
@@ -204,7 +268,11 @@ export async function verifyLogin(env, username, password) {
     const admin = await getAdmin(env);
     const salt = admin && admin.salt ? admin.salt : DUMMY_SALT;
     const iterations = (admin && admin.iterations) || PBKDF2_ITER;
-    const hash = await hashPassword(String(password || ''), salt, iterations);
+    // 记录标了 peppered 就必须用 pepper 重算：pepper 丢了密码就永远对不上，
+    // 这是有意的（有 pepper 保护时，没有 pepper 的人本来就不该能登进来），
+    // 恢复手段见 README「忘记密码」——重新部署并清掉 sys/admin。
+    const pepper = admin && admin.peppered ? passwordPepper(env) : '';
+    const hash = await hashPassword(String(password || ''), salt, iterations, pepper);
     if (!admin) return null;
     if (!safeEqual(String(admin.username).toLowerCase(), String(username || '').toLowerCase())) return null;
     if (!safeEqual(hash, admin.hash)) return null;

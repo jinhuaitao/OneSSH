@@ -1,6 +1,6 @@
 /* Terminal view: tabs, panes, websocket sessions, live host metrics, key bar. */
 
-import { $, el, icon, toast, modal, fmtBytes, fmtRate, fmtUptime, copyText } from './ui.js';
+import { $, el, icon, toast, modal, confirmModal, fmtBytes, fmtRate, fmtUptime, copyText } from './ui.js';
 
 const THEME = {
     background: '#070910',
@@ -109,6 +109,32 @@ export function createTerminalView(cfg) {
             send(s, { t: 'input', data: data.slice(i, end) });
             i = end;
         }
+    }
+
+    /* ------------------------------------------------------------- paste */
+
+    // 粘两行以上要先确认。
+    //
+    // 从文档/聊天窗口复制命令时，剪贴板里常常顺带带上换行，粘进去就等于
+    // 直接回车执行 —— 粘错窗口（比如粘到 root 的会话里）就是一条 rm -rf。
+    // 单行粘贴（复制一个路径、一个 token）不打扰。
+    async function pasteInto(s, text) {
+        const raw = String(text || '');
+        if (!raw) return;
+        const lines = raw.replace(/\r\n?/g, '\n').split('\n');
+        // 末尾的空串只表示「最后一行以换行结尾」，不算多出来的一行
+        const count = lines[lines.length - 1] === '' ? lines.length - 1 : lines.length;
+        if (count >= 2) {
+            // 这里只放数字，不把剪贴板内容塞进弹窗（confirmModal 的 text 是 innerHTML）
+            const ok = await confirmModal(
+                '粘贴多行内容',
+                `剪贴板里有 <b>${count}</b> 行文本，粘进去会逐行执行。确认当前窗口和主机没错再继续。`,
+                '粘贴执行',
+                true
+            );
+            if (!ok) return;
+        }
+        sendInput(s, raw.replace(/\r?\n/g, '\r'));
     }
 
     /* ------------------------------------------------------------- sftp */
@@ -684,7 +710,7 @@ export function createTerminalView(cfg) {
             ev.preventDefault();
             try {
                 const text = await navigator.clipboard.readText();
-                if (text) sendInput(s, text.replace(/\r?\n/g, '\r'));
+                await pasteInto(s, text);
             } catch (_) {
                 toast('浏览器拒绝了剪贴板读取，请用 Ctrl+Shift+V', 'err');
             }
@@ -872,7 +898,7 @@ export function createTerminalView(cfg) {
                     .readText()
                     .then((text) => {
                         const s = active();
-                        if (s && text) sendInput(s, text.replace(/\r?\n/g, '\r'));
+                        if (s && text) return pasteInto(s, text);
                     })
                     .catch(() => toast('浏览器拒绝了剪贴板读取', 'err'));
                 ev.preventDefault();

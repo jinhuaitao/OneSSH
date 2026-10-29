@@ -8,6 +8,7 @@ import assert from 'node:assert/strict';
 
 import worker from '../src/worker.js';
 import * as auth from '../src/auth.js';
+import * as session from '../src/session.js';
 import * as C from '../src/ssh/crypto.js';
 import { SSHClient } from '../src/ssh/client.js';
 import { Writer } from '../src/ssh/buf.js';
@@ -320,5 +321,181 @@ test('主动重协商：只有会话就绪且流量到阈值才发起', async ()
     assert.equal(out.length, 1, '到阈值应当发一包 KEXINIT');
     assert.equal(out[0][5], 20);
     assert.equal(c.bytesSinceRekey, 0, '触发后计数归零');
+});
+
+/* ------------------------------------------------------------- 密码 pepper */
+
+// Workers 把 PBKDF2 迭代次数锁在 100000，抗离线爆破只能靠 pepper：
+// 一段只存在环境变量里、不进 R2 的随机串。
+const PEPPER = 'k'.repeat(32);
+
+test('密码 pepper：桶里的哈希离开 pepper 就验不过', async () => {
+    const env = makeEnv({ __worker: worker, WEBSSH_PASSWORD_PEPPER: PEPPER });
+    const res = await call(env, '/api/setup', {
+        method: 'POST',
+        body: { username: ADMIN.username, password: PW, token: SETUP_TOKEN },
+        headers: { 'user-agent': 'UA-A', 'cf-connecting-ip': '203.0.113.5' },
+    });
+    assert.equal(res.status, 200, res.text);
+
+    const rec = await auth.getAdmin(env);
+    assert.equal(rec.peppered, true, '配了 pepper 就必须标进记录');
+    assert.equal(rec.v, 2);
+
+    // 同样的密码、同样的盐，加不加 pepper 必须算出不同结果
+    const plain = await auth.hashPassword(PW, rec.salt, rec.iterations, '');
+    assert.notEqual(plain, rec.hash, 'pepper 必须真正参与运算');
+
+    // 拿桶转储的人没有 pepper：按无 pepper 直接算一遍必须对不上
+    assert.notEqual(plain, rec.hash, 'pepper 必须真正参与运算');
+
+    // 换一个 pepper 也不行
+    env.WEBSSH_PASSWORD_PEPPER = 'z'.repeat(32);
+    assert.equal(await auth.verifyLogin(env, ADMIN.username, PW), null, 'pepper 不同就不能登录');
+
+    // 完全去掉 pepper 更不行（这是有意的：pepper 丢了等于密码作废）
+    delete env.WEBSSH_PASSWORD_PEPPER;
+    assert.equal(await auth.verifyLogin(env, ADMIN.username, PW), null, '没有 pepper 不该能解开带 pepper 的哈希');
+
+    // 换回正确 pepper，登录恢复正常
+    env.WEBSSH_PASSWORD_PEPPER = PEPPER;
+    assert.ok(await auth.verifyLogin(env, ADMIN.username, PW));
+});
+
+test('密码 pepper：太短当作没配（不给人用 4 个字符的 pepper 自我安慰）', async () => {
+    const env = makeEnv({ __worker: worker, WEBSSH_PASSWORD_PEPPER: 'short' });
+    await call(env, '/api/setup', {
+        method: 'POST',
+        body: { username: ADMIN.username, password: PW, token: SETUP_TOKEN },
+        headers: { 'user-agent': 'UA-A', 'cf-connecting-ip': '203.0.113.5' },
+    });
+    const rec = await auth.getAdmin(env);
+    assert.equal(rec.peppered, false, '短于 16 字符的 pepper 应当被忽略');
+});
+
+test('密码记录升级：加了 pepper 之后旧记录仍能登录，并在登录后自动升级', async () => {
+    const env = makeEnv({ __worker: worker });
+    const setup = await call(env, '/api/setup', {
+        method: 'POST',
+        body: { username: ADMIN.username, password: PW, token: SETUP_TOKEN },
+        headers: { 'user-agent': 'UA-A', 'cf-connecting-ip': '203.0.113.5' },
+    });
+    assert.equal(setup.status, 200, setup.text);
+
+    let rec = await auth.getAdmin(env);
+    assert.equal(rec.peppered, false);
+    assert.equal(auth.needsRehash(env, rec), false, '没配 pepper 时不该无谓重写');
+
+    // 打开 pepper：旧记录必须仍然可验，否则就是「加个环境变量把人锁在门外」
+    env.WEBSSH_PASSWORD_PEPPER = PEPPER;
+    assert.equal(auth.needsRehash(env, rec), true, '旧记录要标记为待升级');
+    assert.ok(await auth.verifyLogin(env, ADMIN.username, PW), '旧记录仍然能登录');
+
+    // 走一次真实登录：成功之后记录应当就地升级
+    const login = await call(env, '/api/login', {
+        method: 'POST',
+        body: { username: ADMIN.username, password: PW },
+        headers: { 'user-agent': 'UA-A', 'cf-connecting-ip': '203.0.113.5' },
+    });
+    assert.equal(login.status, 200, login.text);
+
+    rec = await auth.getAdmin(env);
+    assert.equal(rec.peppered, true, '登录成功后应当自动升级');
+    assert.equal(auth.needsRehash(env, rec), false, '升级之后不该再触发重写');
+
+    // 升级完就真的离不开 pepper 了
+    delete env.WEBSSH_PASSWORD_PEPPER;
+    assert.equal(await auth.verifyLogin(env, ADMIN.username, PW), null);
+});
+
+test('密码记录升级：升级不会改动账号的创建时间', async () => {
+    const env = makeEnv({ __worker: worker, WEBSSH_PASSWORD_PEPPER: PEPPER });
+    const admin = await auth.createAdmin(env, ADMIN.username, PW);
+    const before = admin.createdAt;
+    await new Promise((r) => setTimeout(r, 5));
+    const next = await auth.rehashAdmin(env, admin, PW);
+    assert.equal(next.createdAt, before, 'createdAt 是「账号什么时候建的」，不该被升级覆盖');
+    assert.equal(next.username, ADMIN.username);
+});
+
+/* ------------------------------------------------------- /api/state 暴露面 */
+
+test('/api/state：已初始化但未登录时不暴露版本号与初始化配置', async () => {
+    const { env } = await boot();
+    const res = await call(env, '/api/state', { headers: { 'user-agent': 'UA-X', 'cf-connecting-ip': '198.51.100.1' } });
+    assert.equal(res.json.authed, false);
+    assert.equal(res.json.version, undefined, '陌生人不需要知道部署的是哪个版本');
+    assert.equal(res.json.setupTokenConfigured, undefined, '不该透露初始化口令配没配');
+
+    // 未初始化时前端要靠这些字段决定显示初始化表单，必须保留
+    const fresh = makeEnv({ __worker: worker });
+    const s2 = await call(fresh, '/api/state');
+    assert.equal(s2.json.setup, false);
+    assert.equal(typeof s2.json.version, 'string');
+    assert.equal(s2.json.setupTokenConfigured, true);
+
+    // 登录之后照常返回版本号（设置页要显示）
+    const { env: env2, cookie } = await boot();
+    const authed = await call(env2, '/api/state', { cookie, headers: { 'user-agent': 'UA-A', 'cf-connecting-ip': '203.0.113.5' } });
+    assert.equal(authed.json.authed, true);
+    assert.equal(typeof authed.json.version, 'string');
+});
+
+/* --------------------------------------------------------------- 数量上限 */
+
+test('主机数量上限：到顶之后新建返回 409，而不是无限膨胀', async () => {
+    const { env, cookie } = await boot();
+    const hdr = { 'user-agent': 'UA-A', 'cf-connecting-ip': '203.0.113.5' };
+    for (let i = 0; i < 200; i++) {
+        await env.BUCKET.put(
+            'hosts/s' + i,
+            JSON.stringify({ id: 's' + i, name: 'h' + i, host: '10.0.0.1', port: 22, group: '', authType: 'password', createdAt: i })
+        );
+    }
+    const res = await call(env, '/api/hosts', {
+        method: 'POST',
+        cookie,
+        headers: hdr,
+        body: { name: 'x', host: '10.0.0.2', port: 22, username: 'root', authType: 'password' },
+    });
+    assert.equal(res.status, 409);
+    assert.equal(res.json.error, 'too_many');
+
+    // 修改已有主机不受上限影响
+    const upd = await call(env, '/api/hosts', {
+        method: 'POST',
+        cookie,
+        headers: hdr,
+        body: { id: 's0', name: 'renamed', host: '10.0.0.1', port: 22, username: 'root', authType: 'password' },
+    });
+    assert.equal(upd.status, 200, upd.text);
+});
+
+/* ------------------------------------------------------------- 录制保留期 */
+
+async function seedLog(env, key, daysAgo) {
+    await env.BUCKET.put(key, new Uint8Array([1, 2, 3]), { customMetadata: { enc: 'v2' } });
+    env.BUCKET.map.get(key).uploaded = new Date(Date.now() - daysAgo * 24 * 3600 * 1000);
+}
+
+test('会话录制保留期：默认清掉 30 天前的，0 表示永久保留', async () => {
+    const env = makeEnv({});
+    await seedLog(env, 'logs/old.log', 40);
+    await seedLog(env, 'logs/new.log', 1);
+    await session.pruneOldLogs(env);
+    assert.deepEqual(env.BUCKET.keys('logs/'), ['logs/new.log'], '只该删过期的那条');
+
+    // 0 = 关掉保留期
+    const env2 = makeEnv({ WEBSSH_LOG_RETENTION_DAYS: '0' });
+    await seedLog(env2, 'logs/old.log', 400);
+    await session.pruneOldLogs(env2);
+    assert.equal(env2.BUCKET.keys('logs/').length, 1, '0 表示永久保留');
+
+    // 自定义天数
+    const env3 = makeEnv({ WEBSSH_LOG_RETENTION_DAYS: '7' });
+    await seedLog(env3, 'logs/a.log', 10);
+    await seedLog(env3, 'logs/b.log', 3);
+    await session.pruneOldLogs(env3);
+    assert.deepEqual(env3.BUCKET.keys('logs/'), ['logs/b.log']);
 });
 

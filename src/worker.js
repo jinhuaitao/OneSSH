@@ -24,6 +24,9 @@ const SECURITY_HEADERS = {
 };
 
 const MAX_BODY = 4 * 1024 * 1024;
+// 数量上限：R2 没有配额提醒，列表接口要逐条回读，堆到几千条就是「首页打不开」
+const MAX_HOSTS = 200;
+const MAX_GROUPS = 50;
 const MIN_PASSWORD = 10;
 const WEAK_PASSWORDS = new Set([
     '1234567890', '12345678', '123456789', 'password', 'password1', 'password123',
@@ -244,6 +247,10 @@ async function handleApi(request, env, url) {
     if (path === '/api/state' && method === 'GET') {
         const admin = await auth.getAdmin(env);
         const session = admin ? await auth.getSession(env, request) : null;
+        // 已经初始化之后，陌生人只需要知道「去登录」。
+        // 把 version / setupTokenConfigured 无条件返回，等于给扫描器免费做指纹识别：
+        // 「这台跑着 OneSSH 1.2.3，且没配初始化口令」是很有用的情报。
+        if (admin && !session) return json({ setup: true, authed: false, user: null });
         return json({
             setup: Boolean(admin),
             authed: Boolean(session),
@@ -318,6 +325,13 @@ async function handleApi(request, env, url) {
             return json({ error: 'bad_credentials', message: '用户名或密码不正确' }, 401);
         }
         await auth.clearFailures(env, ip);
+        // 旧格式记录（没带 pepper / 迭代次数变了）在登录成功这一刻顺手升级。
+        // 放在登录成功之后做，失败也不影响本次登录，下次再试。
+        if (auth.needsRehash(env, admin)) {
+            try {
+                await auth.rehashAdmin(env, admin, body.password);
+            } catch (_) {}
+        }
         try {
             await auth.pruneSessions(env);
         } catch (_) {}
@@ -355,7 +369,7 @@ async function handleApi(request, env, url) {
         const pwError = checkPassword(next, admin.username);
         if (pwError) return json({ error: 'weak_password', message: pwError }, 400);
         await auth.clearFailures(env, ip);
-        await auth.createAdmin(env, admin.username, next);
+        await auth.createAdmin(env, admin.username, next, admin);
         // 改密意味着旧凭据可能已泄露：踢掉所有设备，再给当前浏览器发一枚新 token
         await auth.destroyAllSessions(env);
         const token = await auth.createSession(env, admin.username, request);
@@ -374,6 +388,9 @@ async function handleApi(request, env, url) {
             if (op === 'add') {
                 const name = cleanGroupName(body.name);
                 if (groups.includes(name)) return json({ error: 'dup', message: '同名分组已存在' }, 409);
+                if (stored.length >= MAX_GROUPS) {
+                    return json({ error: 'too_many', message: `分组数量已达上限（${MAX_GROUPS} 个）` }, 409);
+                }
                 stored.push(name);
                 await saveGroups(env, stored);
                 return json({ groups: await listGroups(env), updated: 0 });
@@ -531,6 +548,14 @@ async function handleApi(request, env, url) {
             if (body.id != null && !/^[a-zA-Z0-9]{1,40}$/.test(String(body.id))) {
                 return json({ error: 'bad_id', message: '无效的主机 ID' }, 400);
             }
+            // 新建时卡上限：R2 没有配额提醒，主机列表每页都要回读一遍，
+            // 无限往里塞最后是「打开首页超时」，而不是一个能看懂的报错
+            if (!body.id && (await list(env, 'hosts/')).length >= MAX_HOSTS) {
+                return json(
+                    { error: 'too_many', message: `主机数量已达上限（${MAX_HOSTS} 台），请先删除不再使用的主机` },
+                    409
+                );
+            }
             const id = body.id || 'h' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
             const existing = body.id ? await getJSON(env, 'hosts/' + id) : null;
             if (body.id && !existing) return json({ error: 'not_found', message: '主机不存在' }, 404);
@@ -595,8 +620,9 @@ async function handleApi(request, env, url) {
         }
         if (method === 'POST') {
             const body = await readJSON(request);
-            const list = Array.isArray(body.snippets) ? body.snippets.slice(0, 100) : [];
-            const clean = list
+            // 别叫 list：会遮住从 store.js 引入的 list()
+            const incoming = Array.isArray(body.snippets) ? body.snippets.slice(0, 100) : [];
+            const clean = incoming
                 .filter((s) => s && typeof s.command === 'string' && s.command.trim())
                 .map((s) => ({
                     id: /^[a-zA-Z0-9]{1,24}$/.test(String(s.id || '')) ? String(s.id) : 's' + auth.randomHex(4),
@@ -696,19 +722,38 @@ async function handleApi(request, env, url) {
 const QUICK_LIMIT = 10;
 const QUICK_WINDOW = 10 * 60 * 1000;
 
-async function quickConnectBudget(env, token) {
-    const prefix = 'conn/' + String(token).slice(0, 24) + '/';
+// 连保存过的主机同样要限速：以前只有临时地址那条分支有预算，
+// 拿到会话的人可以循环 /ws?hostId=... 无限往外打 TCP。
+// Worker 是无状态的，没有跨 isolate 的内存计数器，所以这里限的是「新建速率」
+// 而不是「同时在线数」—— 会造成伤害的是短时间内打出去几百条连接。
+const CONNECT_LIMIT = 20;
+const CONNECT_WINDOW = 60 * 1000;
+
+/**
+ * 滑动窗口计数：prefix 下每个 key 的剩余部分以毫秒时间戳开头，
+ * 超出窗口的顺手删掉（R2 没有 TTL，不删会一直涨）。
+ * 返回 true 表示还有额度，并消耗一次。
+ */
+async function slidingBudget(env, prefix, limit, windowMs) {
     const now = Date.now();
     let used = 0;
     for (const o of await list(env, prefix)) {
         const ts = parseInt(o.key.slice(prefix.length), 10);
         if (!Number.isFinite(ts)) continue;
-        if (now - ts < QUICK_WINDOW) used++;
+        if (now - ts < windowMs) used++;
         else await del(env, o.key).catch(() => {});
     }
-    if (used >= QUICK_LIMIT) return { ok: false };
+    if (used >= limit) return false;
     await putJSON(env, prefix + now + '-' + auth.randomHex(3), 1);
-    return { ok: true };
+    return true;
+}
+
+async function quickConnectBudget(env, token) {
+    return slidingBudget(env, 'conn/' + String(token).slice(0, 24) + '/', QUICK_LIMIT, QUICK_WINDOW);
+}
+
+async function connectBudget(env, token) {
+    return slidingBudget(env, 'connall/' + String(token).slice(0, 24) + '/', CONNECT_LIMIT, CONNECT_WINDOW);
 }
 
 /** 用一条 WebSocket 把错误送达前端（升级失败的 HTTP 响应浏览器读不到 body） */
@@ -754,10 +799,15 @@ async function handleWebSocket(request, env) {
         if (!addr) return json({ error: 'bad_host', message: '主机地址不合法' }, 400);
         if (qPort < 1 || qPort > 65535) return json({ error: 'bad_port', message: '端口不合法' }, 400);
         const budget = await quickConnectBudget(env, session.token);
-        if (!budget.ok) {
+        if (!budget) {
             return socketError(`临时连接过于频繁（${QUICK_WINDOW / 60000} 分钟内最多 ${QUICK_LIMIT} 个目标）。请先把常用主机保存下来再连接。`);
         }
         target = { host: addr, port: qPort };
+    }
+
+    // 两条分支都要过：保存过的主机也不能被当成免费代理刷
+    if (!(await connectBudget(env, session.token))) {
+        return socketError(`连接建立过于频繁（每分钟最多 ${CONNECT_LIMIT} 次），请稍后再试。`);
     }
 
     let socket;
