@@ -87,8 +87,16 @@ export class MemoryBucket {
 
 export const ORIGIN = 'https://webssh.test';
 
+export const SETUP_TOKEN = 'test-setup-token';
+
+/**
+ * 默认带上 WEBSSH_SETUP_TOKEN：初始化口令现在是无条件必需的，
+ * 想测「没配口令」的分支就显式传 WEBSSH_SETUP_TOKEN: undefined。
+ */
 export function makeEnv(extra) {
-    return Object.assign({ BUCKET: new MemoryBucket() }, extra || {});
+    const env = Object.assign({ BUCKET: new MemoryBucket(), WEBSSH_SETUP_TOKEN: SETUP_TOKEN }, extra || {});
+    for (const k of Object.keys(env)) if (env[k] === undefined) delete env[k];
+    return env;
 }
 
 /** 调一次 Worker；返回 { status, headers, text, json } 方便断言。 */

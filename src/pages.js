@@ -80,7 +80,8 @@ export function renderShell() {
       <h2>初始化管理员</h2>
       <p class="hint">设置访问本工具的账号与密码，凭据只保存在你自己的 R2 存储里。</p>
       <label>用户名<input name="username" type="text" placeholder="admin" autocomplete="username" required minlength="3" maxlength="32"></label>
-      <label id="setup-token-field" hidden>初始化口令<input name="token" type="password" placeholder="部署时设置的口令" autocomplete="off"></label>
+      <label id="setup-token-field">初始化口令<input name="token" type="password" placeholder="部署时设置的 WEBSSH_SETUP_TOKEN" autocomplete="off" required></label>
+      <p class="form-hint" id="setup-token-hint" hidden>还没配置 <code>WEBSSH_SETUP_TOKEN</code>：先到 Worker 的变量里设置它，否则无法初始化（未设置时任何人都能抢先成为管理员）。</p>
       <label>密码<input name="password" type="password" placeholder="至少 10 位" autocomplete="new-password" required minlength="10" maxlength="200"></label>
       <label>确认密码<input name="password2" type="password" placeholder="再次输入" autocomplete="new-password" required minlength="10" maxlength="200"></label>
       <button type="submit" class="btn primary block">创建并进入</button>

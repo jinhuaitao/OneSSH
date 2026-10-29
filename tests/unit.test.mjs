@@ -113,8 +113,9 @@ test('deriveKey：长度正确、可复现、不同字母不同结果', async ()
     assert.notEqual(bytesToHex(c), bytesToHex(d));
 });
 
-test('HMAC：长度符合算法定义', async () => {
-    for (const [alg, len] of [['hmac-sha2-256', 32], ['hmac-sha2-512', 64], ['hmac-sha1', 20]]) {
+test('HMAC：长度符合算法定义，且 SHA-1 系已被移除', async () => {
+    assert.throws(() => new C.Mac('hmac-sha1', new Uint8Array(20)), /unsupported mac/);
+    for (const [alg, len] of [['hmac-sha2-256', 32], ['hmac-sha2-512', 64]]) {
         const mac = await new C.Mac(alg, new Uint8Array(len).fill(1)).ready();
         assert.equal(mac.len, len);
         const sig = await mac.sign(1, new Uint8Array([1, 2, 3]));

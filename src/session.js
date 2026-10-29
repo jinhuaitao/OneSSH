@@ -207,17 +207,17 @@ export class Terminal {
                     const vault = await getJSON(this.env, 'sys/keys');
                     const key = vault && Array.isArray(vault.keys) ? vault.keys.find((k) => k.id === saved.keyId) : null;
                     if (!key || !key.keyEnc) throw new Error('密钥库里找不到该主机使用的密钥，请在主机设置中重新选择');
-                    privateKey = await decryptSecret(this.env, key.keyEnc);
+                    privateKey = await decryptSecret(this.env, key.keyEnc, 'key:' + key.id);
                 } else if (saved.authType === 'key' && saved.keyEnc) {
-                    privateKey = await decryptSecret(this.env, saved.keyEnc);
+                    privateKey = await decryptSecret(this.env, saved.keyEnc, 'host:' + (saved.id || cfg.hostId));
                 } else if (saved.authType === 'password' && saved.credId) {
                     const vault = await getJSON(this.env, 'sys/creds');
                     const cred = vault && Array.isArray(vault.creds) ? vault.creds.find((c) => c.id === saved.credId) : null;
                     if (!cred || !cred.passEnc) throw new Error('凭据库里找不到该主机使用的账号，请在主机设置中重新选择');
-                    password = await decryptSecret(this.env, cred.passEnc);
+                    password = await decryptSecret(this.env, cred.passEnc, 'cred:' + cred.id);
                     if (cred.username) username = cred.username;
                 } else if (saved.secretEnc) {
-                    password = await decryptSecret(this.env, saved.secretEnc);
+                    password = await decryptSecret(this.env, saved.secretEnc, 'host:' + (saved.id || cfg.hostId));
                 }
             }
         }
@@ -791,7 +791,7 @@ export class Terminal {
                 const startedAt = this.startedAt || Date.now();
                 const id = new Date(startedAt).toISOString().replace(/[:.]/g, '-') + '-' + randomHex(4);
                 const bytes = joinBytes(this.recChunks, this.recBytes);
-                await putBytes(this.env, 'logs/' + id + '.log', await encryptBytes(this.env, bytes), {
+                await putBytes(this.env, 'logs/' + id + '.log', await encryptBytes(this.env, bytes, 'log:logs/' + id + '.log'), {
                     host: this.meta.host,
                     port: String(this.meta.port),
                     user: this.meta.user,

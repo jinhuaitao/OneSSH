@@ -144,16 +144,17 @@ npm run test:watch              # 改代码自动重跑
 ## 🔐 安全
 
 - 👤 **单管理员**：第一个完成初始化的账号就是唯一账号，没有注册入口。忘记密码只能删掉 R2 里的 `sys/admin` 和 `sess/*` 重新初始化（主密钥不变，已存凭据仍能解开）。
-- 🎟️ **初始化口令（建议公开部署时设置）**：设了 `WEBSSH_SETUP_TOKEN`，第一次初始化必须带上它，陌生人抢不走管理员：
+- 🎟️ **初始化口令（必须设置）**：`WEBSSH_SETUP_TOKEN` 现在是硬性要求 —— 没配就**不允许初始化**，接口直接回 `503 setup_token_missing`。原因是未配置时的语义等于「谁先打开网址谁就是管理员」，而这个窗口往往正好在部署完、把链接丢进群里的那几分钟。口令与登录密码共用同一套失败计数（超过阈值锁 15 分钟）：
 
   ```bash
   npx wrangler secret put WEBSSH_SETUP_TOKEN   # 或在控制台 Workers → 设置 → 变量 里加
   ```
 
 - 🔑 **口令与会话**：密码至少 10 位、拒绝常见弱口令；PBKDF2-SHA256（10 万次迭代）加盐存储，校验用恒定时间比较。会话是 HttpOnly + SameSite=Lax 的随机 256 位 token，30 天绝对过期、7 天空闲过期，**改密后其它设备立即掉线**。
+- 🧷 **会话绑设备**：会话写入时的 User-Agent 会参与校验 —— UA 变了（典型场景：Cookie 被导出到另一台机器）直接作废并删除记录；IP 按网段比对（IPv4 比前三段、IPv6 比前四组），换网段同样作废。手机切 4G/5G 只换尾段，不受影响；确实需要放宽（比如经常跨网络漫游）可以设 `WEBSSH_SESSION_IP_BIND=off` 关掉 IP 这一层，UA 那一层没有开关。
 - 🧱 **跨站防线**：所有写接口和 WebSocket 升级都校验 `Origin` 同源，挡 CSRF 和跨站 WebSocket 劫持；页面带 `CSP`（`connect-src 'self'`、`object-src 'none'`、`frame-ancestors 'none'`）、`COOP` / `CORP` / `Permissions-Policy`，HTTPS 下加 `HSTS`。
 - 🛡️ **主机密钥强校验**：握手时先验证服务器签名，拿不出这把主机私钥就直接断开（中间人无法用「点继续」绕过）；首次连接记录指纹，之后指纹变化自动拒绝。
-- 🔒 **加密边界**：主机密码、私钥、常用账号、**会话录制**都用 AES-GCM 加密。主密钥默认放在同一个桶的 `sys/master` —— 防「桶被人翻到」，防不了「Cloudflare 账号被攻破」。可以自带密钥：
+- 🔒 **加密边界**：主机密码、私钥、常用账号、**会话录制**都用 AES-GCM 加密；密文格式升到 `v2`，把「这段密文属于哪个字段」绑进 AAD（`host:<id>` / `cred:<id>` / `key:<id>` / `log:<name>`）—— 只拿到 R2 写权限也搬不动别人的密文，换个字段解就是认证失败。旧数据是 `v1`（无 AAD），仍可正常读取。主密钥默认放在同一个桶的 `sys/master` —— 防「桶被人翻到」，防不了「Cloudflare 账号被攻破」。可以自带密钥：
 
   ```bash
   npx wrangler secret put WEBSSH_MASTER_KEY   # 32 字节 base64 或 64 位 hex
@@ -187,7 +188,9 @@ npm run test:watch              # 改代码自动重跑
                                      └── R2：账号 / 会话 / 主机 / 分组 / 凭据库 / 已知主机密钥 / 录制 / 片段
 ```
 
-SSH 协议栈是自己实现的（`src/ssh/`），只依赖 WebCrypto：`curve25519-sha256` 密钥交换、`aes{128,192,256}-ctr` 加密、`hmac-sha2-{256,512}` / `hmac-sha1` 校验、`ssh-ed25519` / `ecdsa-sha2-nistp256` / `rsa-sha2-{256,512}` / `ssh-rsa` 主机密钥，支持密码、公钥（OpenSSH / PKCS#1 / PKCS#8）和 keyboard-interactive 认证。
+SSH 协议栈是自己实现的（`src/ssh/`），只依赖 WebCrypto：`curve25519-sha256` 密钥交换、`aes{128,192,256}-ctr` 加密、`hmac-sha2-{256,512}` 校验、`ssh-ed25519` / `ecdsa-sha2-nistp256` / `rsa-sha2-{256,512}` 主机密钥，支持密码、公钥（OpenSSH / PKCS#1 / PKCS#8）和 keyboard-interactive 认证。
+
+**SHA-1 系已从协商列表里移除**：`hmac-sha1` 与 `ssh-rsa`（用 SHA-1 签主机密钥）不再提供。RSA 主机密钥仍然支持，只是强制走 `rsa-sha2-256/512`。同时握手阶段会核对「协商到的算法」与「服务器实际报出来的签名算法」是否一致 —— 否则攻击者可以把 `rsa-sha2-512` 悄悄压回 `ssh-rsa`，而界面看不出任何异常。
 
 | 文件 | 作用 |
 | :--- | :--- |

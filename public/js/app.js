@@ -1730,6 +1730,9 @@ async function boot() {
     state.version = info.version || '';
     const tokenField = $('#setup-token-field');
     if (tokenField) tokenField.hidden = !info.needsSetupToken;
+    // 口令现在是必需项：没配置时直接提示，别让用户点了「创建」才看到 503
+    const tokenHint = $('#setup-token-hint');
+    if (tokenHint) tokenHint.hidden = info.setupTokenConfigured !== false;
     if (!state.setup) showAuth('setup');
     else if (!state.authed) showAuth('login');
     else enterApp();

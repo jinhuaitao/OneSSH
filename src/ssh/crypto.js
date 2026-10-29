@@ -22,7 +22,6 @@ export async function sha1(data) {
 const HMAC_HASH = {
     'hmac-sha2-256': { hash: 'SHA-256', len: 32 },
     'hmac-sha2-512': { hash: 'SHA-512', len: 64 },
-    'hmac-sha1': { hash: 'SHA-1', len: 20 },
 };
 
 export class Mac {
@@ -173,13 +172,9 @@ function ecP256Spki(point) {
 
 /* ----------------------------------------------------------- host key api */
 
-export const HOST_KEY_ALGS = [
-    'ssh-ed25519',
-    'ecdsa-sha2-nistp256',
-    'rsa-sha2-512',
-    'rsa-sha2-256',
-    'ssh-rsa',
-];
+// 不包含 'ssh-rsa'：那意味着用 SHA-1 验证主机签名，2026 年没有任何理由接受。
+// （RSA 主机密钥仍然支持，只是强制走 rsa-sha2-256/512）
+export const HOST_KEY_ALGS = ['ssh-ed25519', 'ecdsa-sha2-nistp256', 'rsa-sha2-512', 'rsa-sha2-256'];
 
 /** SHA256 fingerprint in the same shape `ssh-keygen -lf` prints. */
 export async function fingerprint(keyBlob) {
@@ -233,19 +228,28 @@ export async function verifyHostKeySignature(keyBlob, sigBlob, exchangeHash) {
     const sr = new Reader(sigBlob);
     const sigAlg = sr.text();
     const sig = sr.str();
+    const fail = (reason) => ({ type, sigAlg, verified: false, reason });
+
+    // SHA-1 签名一律拒绝：这是最容易被降级命中的一环（rsa-sha2-* 协商成功却被回退到 ssh-rsa）
+    if (sigAlg === 'ssh-rsa') return fail('拒绝 SHA-1 主机签名（ssh-rsa），请让服务器改用 rsa-sha2-256/512');
+
     let imported;
     try {
         imported = await importHostKey(keyBlob);
     } catch (e) {
-        return { type, verified: false, reason: e.message };
+        return fail(e.message);
     }
     try {
         if (imported.type === 'ssh-ed25519') {
+            if (sigAlg !== 'ssh-ed25519') return fail('签名算法（' + sigAlg + '）与主机密钥类型（' + type + '）不符');
             const ok = await subtle().verify({ name: 'Ed25519' }, imported.key, sig, exchangeHash);
-            return { type, verified: ok, reason: ok ? null : 'signature mismatch' };
+            return ok ? { type, sigAlg, verified: true, reason: null } : fail('signature mismatch');
         }
         if (imported.rsa) {
-            const hash = sigAlg === 'rsa-sha2-512' ? 'SHA-512' : sigAlg === 'ssh-rsa' ? 'SHA-1' : 'SHA-256';
+            if (sigAlg !== 'rsa-sha2-256' && sigAlg !== 'rsa-sha2-512') {
+                return fail('不支持的 RSA 签名算法：' + sigAlg);
+            }
+            const hash = sigAlg === 'rsa-sha2-512' ? 'SHA-512' : 'SHA-256';
             const key = await subtle().importKey(
                 'spki',
                 rsaSpkiFromBlob(keyBlob),
@@ -254,21 +258,22 @@ export async function verifyHostKeySignature(keyBlob, sigBlob, exchangeHash) {
                 ['verify']
             );
             const ok = await subtle().verify({ name: 'RSASSA-PKCS1-v1_5' }, key, sig, exchangeHash);
-            return { type, verified: ok, reason: ok ? null : 'signature mismatch' };
+            return ok ? { type, sigAlg, verified: true, reason: null } : fail('signature mismatch');
         }
         if (imported.ecdsa) {
+            if (sigAlg !== 'ecdsa-sha2-nistp256') return fail('签名算法（' + sigAlg + '）与主机密钥类型（' + type + '）不符');
             // SSH packs ECDSA signatures as (mpint r, mpint s); WebCrypto wants r||s
             const ir = new Reader(sig);
             const rr = ir.mpint();
             const ss = ir.mpint();
             const raw = concat(leftPad(rr, 32), leftPad(ss, 32));
             const ok = await subtle().verify({ name: 'ECDSA', hash: 'SHA-256' }, imported.key, raw, exchangeHash);
-            return { type, verified: ok, reason: ok ? null : 'signature mismatch' };
+            return ok ? { type, sigAlg, verified: true, reason: null } : fail('signature mismatch');
         }
     } catch (e) {
-        return { type, verified: false, reason: String(e && e.message ? e.message : e) };
+        return fail(String(e && e.message ? e.message : e));
     }
-    return { type, verified: false, reason: 'unsupported signature algorithm: ' + sigAlg };
+    return fail('unsupported signature algorithm: ' + sigAlg);
 }
 
 function rsaSpkiFromBlob(keyBlob) {

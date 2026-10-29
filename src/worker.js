@@ -248,7 +248,10 @@ async function handleApi(request, env, url) {
             setup: Boolean(admin),
             authed: Boolean(session),
             user: session ? session.u : null,
-            needsSetupToken: Boolean(env.WEBSSH_SETUP_TOKEN),
+            // 初始化口令现在是无条件必需的：任何拿到网址的人都能抢先注册成管理员，
+            // 所以界面永远显示口令输入框，未配置时 setup 直接拒绝
+            needsSetupToken: true,
+            setupTokenConfigured: Boolean(env.WEBSSH_SETUP_TOKEN),
             version: VERSION,
         });
     }
@@ -256,21 +259,29 @@ async function handleApi(request, env, url) {
     if (path === '/api/setup' && method === 'POST') {
         const admin = await auth.getAdmin(env);
         if (admin) return json({ error: 'already_setup', message: '系统已经完成初始化' }, 409);
-        const ip = request.headers.get('cf-connecting-ip') || 'local';
+        const ip = auth.clientIpOf(request);
+        // 未配置初始化口令时直接拒绝，而不是退化成「先到先得」：
+        // 这就是「陌生人拿到网址就能注册管理员」的唯一入口，fail-closed 比方便重要
+        if (!env.WEBSSH_SETUP_TOKEN) {
+            return json(
+                {
+                    error: 'setup_token_missing',
+                    message: '必须先配置 WEBSSH_SETUP_TOKEN 才能初始化：未配置时任何知道网址的人都能抢先成为管理员。',
+                },
+                503
+            );
+        }
         // 初始化口令和登录密码走同一套失败计数：否则它就是唯一一个可以无限次猜测的口令
-        if (env.WEBSSH_SETUP_TOKEN) {
-            const throttle = await auth.checkThrottle(env, ip);
-            if (throttle.locked) {
-                return json(
-                    { error: 'locked', message: `尝试次数过多，请 ${Math.ceil(throttle.retryAfter / 60)} 分钟后再试` },
-                    429,
-                    { 'retry-after': String(throttle.retryAfter) }
-                );
-            }
+        const throttle = await auth.checkThrottle(env, ip);
+        if (throttle.locked) {
+            return json(
+                { error: 'locked', message: `尝试次数过多，请 ${Math.ceil(throttle.retryAfter / 60)} 分钟后再试` },
+                429,
+                { 'retry-after': String(throttle.retryAfter) }
+            );
         }
         const body = await readJSON(request);
-        // 公开部署时防止陌生人抢先初始化：设置了 WEBSSH_SETUP_TOKEN 就必须带上它
-        if (env.WEBSSH_SETUP_TOKEN && !auth.safeEqual(String(body.token || ''), String(env.WEBSSH_SETUP_TOKEN))) {
+        if (!auth.safeEqual(String(body.token || ''), String(env.WEBSSH_SETUP_TOKEN))) {
             await auth.recordFailure(env, ip);
             return json({ error: 'bad_token', message: '初始化口令不正确' }, 403);
         }
@@ -291,7 +302,7 @@ async function handleApi(request, env, url) {
     }
 
     if (path === '/api/login' && method === 'POST') {
-        const ip = request.headers.get('cf-connecting-ip') || 'local';
+        const ip = auth.clientIpOf(request);
         const throttle = await auth.checkThrottle(env, ip);
         if (throttle.locked) {
             return json(
@@ -325,7 +336,7 @@ async function handleApi(request, env, url) {
     }
 
     if (path === '/api/password' && method === 'POST') {
-        const ip = request.headers.get('cf-connecting-ip') || 'local';
+        const ip = auth.clientIpOf(request);
         const throttle = await auth.checkThrottle(env, ip);
         if (throttle.locked) {
             return json(
@@ -414,12 +425,13 @@ async function handleApi(request, env, url) {
             } else if (!entry) {
                 return json({ error: 'bad_key', message: '请粘贴私钥内容' }, 400);
             }
+            const recId = entry ? entry.id : 'k' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
             const rec = {
-                id: entry ? entry.id : 'k' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+                id: recId,
                 name,
                 algo: meta ? meta.algo : entry.algo,
                 fingerprint: meta ? meta.fingerprint : entry.fingerprint,
-                keyEnc: keyText ? await auth.encryptSecret(env, keyText) : entry.keyEnc,
+                keyEnc: keyText ? await auth.encryptSecret(env, keyText, 'key:' + recId) : entry.keyEnc,
                 createdAt: entry ? entry.createdAt : Date.now(),
                 updatedAt: Date.now(),
             };
@@ -461,11 +473,12 @@ async function handleApi(request, env, url) {
                 return json({ error: 'dup', message: '同名常用账号已存在' }, 409);
             }
             if (!entry && !password) return json({ error: 'bad_cred', message: '请填写密码' }, 400);
+            const recId = entry ? entry.id : 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
             const rec = {
-                id: entry ? entry.id : 'c' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8),
+                id: recId,
                 name,
                 username,
-                passEnc: password ? await auth.encryptSecret(env, password) : entry.passEnc,
+                passEnc: password ? await auth.encryptSecret(env, password, 'cred:' + recId) : entry.passEnc,
                 createdAt: entry ? entry.createdAt : Date.now(),
                 updatedAt: Date.now(),
             };
@@ -533,7 +546,7 @@ async function handleApi(request, env, url) {
                     }
                     rec.credId = credId;
                 } else if (body.password) {
-                    rec.secretEnc = saveSecret ? await auth.encryptSecret(env, String(body.password)) : null;
+                    rec.secretEnc = saveSecret ? await auth.encryptSecret(env, String(body.password), 'host:' + id) : null;
                 } else if (existing && existing.secretEnc && saveSecret) {
                     rec.secretEnc = existing.secretEnc;
                 } else if (existing && existing.credId && saveSecret) {
@@ -553,7 +566,7 @@ async function handleApi(request, env, url) {
                     if (!/BEGIN [A-Z ]*PRIVATE KEY/.test(keyText)) {
                         return json({ error: 'bad_key', message: '私钥格式无法识别（需 PEM 格式）' }, 400);
                     }
-                    rec.keyEnc = saveSecret ? await auth.encryptSecret(env, keyText) : null;
+                    rec.keyEnc = saveSecret ? await auth.encryptSecret(env, keyText, 'host:' + id) : null;
                 } else if (existing && existing.keyEnc && saveSecret) {
                     rec.keyEnc = existing.keyEnc;
                 } else if (existing && existing.keyId && saveSecret) {
@@ -655,7 +668,9 @@ async function handleApi(request, env, url) {
         const obj = await getBytes(env, key);
         if (!obj) return json({ error: 'not_found', message: '记录不存在' }, 404);
         // 新记录以主密钥加密落盘；旧记录仍是明文，直接原样返回
-        const text = obj.meta.enc ? new TextDecoder().decode(await auth.decryptBytes(env, obj.bytes)) : new TextDecoder().decode(obj.bytes);
+        const text = obj.meta.enc
+            ? new TextDecoder().decode(await auth.decryptBytes(env, obj.bytes, 'log:' + key))
+            : new TextDecoder().decode(obj.bytes);
         return new Response(text, {
             // 会话日志里可能粘着密码，走和页面同一套安全头（含 HTTPS 下的 HSTS）
             headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', ...securityHeaders(request) },

@@ -2,14 +2,17 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import worker from '../src/worker.js';
-import { MemoryBucket, makeEnv, call, cookieFrom, tokenFrom, stored, ADMIN, ORIGIN } from './helpers.mjs';
+import { MemoryBucket, makeEnv, call, cookieFrom, tokenFrom, stored, ADMIN, ORIGIN, SETUP_TOKEN } from './helpers.mjs';
 
 const PW = ADMIN.password;
 
 /** 新建一套干净环境并完成初始化，返回 { env, cookie } */
 async function setupApp(extra) {
     const env = makeEnv(Object.assign({ __worker: worker }, extra || {}));
-    const res = await call(env, '/api/setup', { method: 'POST', body: { username: ADMIN.username, password: PW } });
+    const res = await call(env, '/api/setup', {
+        method: 'POST',
+        body: { username: ADMIN.username, password: PW, token: SETUP_TOKEN },
+    });
     assert.equal(res.status, 200, '初始化应当成功: ' + res.text);
     return { env, cookie: cookieFrom(res) };
 }
@@ -23,27 +26,29 @@ async function ed25519Pem() {
 
 /* ------------------------------------------------------------------ 初始化 */
 
-test('初始状态：未初始化、未登录、没有初始化口令', async () => {
+test('初始状态：未初始化、未登录、初始化口令必填', async () => {
     const env = makeEnv({ __worker: worker });
     const res = await call(env, '/api/state');
     assert.equal(res.status, 200);
     assert.equal(res.json.setup, false);
     assert.equal(res.json.authed, false);
-    assert.equal(res.json.needsSetupToken, false);
+    // 口令输入框永远显示：没配口令时 setup 会被拒绝（fail-closed）
+    assert.equal(res.json.needsSetupToken, true);
+    assert.equal(res.json.setupTokenConfigured, true);
     assert.match(res.json.version, /^\d+\.\d+\.\d+$/);
 });
 
 test('初始化：弱口令被拒，合法口令拿到会话 Cookie', async () => {
     const env = makeEnv({ __worker: worker });
 
-    let res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: 'short' } });
+    let res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: 'short', token: SETUP_TOKEN } });
     assert.equal(res.status, 400);
     assert.equal(res.json.error, 'weak_password');
 
-    res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: 'password123' } });
+    res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: 'password123', token: SETUP_TOKEN } });
     assert.equal(res.status, 400, '常见弱口令必须被拒');
 
-    res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: PW } });
+    res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: PW, token: SETUP_TOKEN } });
     assert.equal(res.status, 200);
     const cookie = cookieFrom(res);
     assert.match(cookie, /^wssh_session=[a-f0-9]{64}$/);
@@ -56,7 +61,10 @@ test('初始化：弱口令被拒，合法口令拿到会话 Cookie', async () =
 
 test('初始化：只能成功一次', async () => {
     const { env } = await setupApp();
-    const res = await call(env, '/api/setup', { method: 'POST', body: { username: 'other', password: 'another-long-password' } });
+    const res = await call(env, '/api/setup', {
+        method: 'POST',
+        body: { username: 'other', password: 'another-long-password', token: SETUP_TOKEN },
+    });
     assert.equal(res.status, 409);
     assert.equal(res.json.error, 'already_setup');
 });
@@ -403,19 +411,19 @@ test('未知接口返回 404 JSON', async () => {
 
 test('主密钥：WEBSSH_MASTER_KEY 优先于 R2 里的 sys/master', async () => {
     const env = makeEnv({ __worker: worker, WEBSSH_MASTER_KEY: 'a'.repeat(64) });
-    const res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: PW } });
+    const res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: PW, token: SETUP_TOKEN } });
     assert.equal(res.status, 200);
     assert.equal(env.BUCKET.map.has('sys/master'), false, '自带密钥时不应再写 sys/master');
 
     const host = await call(env, '/api/hosts', { method: 'POST', cookie: cookieFrom(res), body: { host: '192.0.2.10', username: 'root', password: 'x' } });
     assert.equal(host.status, 200);
     const saved = stored(env, 'hosts/' + host.json.host.id);
-    assert.match(saved.secretEnc, /^v1:/);
+    assert.match(saved.secretEnc, /^v2:/, '有上下文的密文应当是 v2（绑定归属）');
 });
 
 test('主密钥：非法长度直接报错，且不留下「半初始化」状态', async () => {
     const env = makeEnv({ __worker: worker, WEBSSH_MASTER_KEY: 'tooshort' });
-    const res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: PW } });
+    const res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: PW, token: SETUP_TOKEN } });
     assert.equal(res.status, 500);
 
     // 关键：管理员记录不能被写进去，否则 setup 再也跑不了，用户只能去 R2 里手删
@@ -425,7 +433,7 @@ test('主密钥：非法长度直接报错，且不留下「半初始化」状�
 
     // 换成合法密钥后重试应当成功
     env.WEBSSH_MASTER_KEY = 'ab'.repeat(32);
-    const retry = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: PW } });
+    const retry = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: PW, token: SETUP_TOKEN } });
     assert.equal(retry.status, 200);
 });
 

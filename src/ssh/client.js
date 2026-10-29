@@ -41,9 +41,10 @@ const KEX_ALGS = ['curve25519-sha256', 'curve25519-sha256@libssh.org'];
 // 只用来「通告」，不参与 pick()：这两个不是真正的密钥交换算法
 const KEX_EXTRA = ['ext-info-c', 'kex-strict-c-v00@openssh.com'];
 const CIPHERS = ['aes128-ctr', 'aes192-ctr', 'aes256-ctr'];
-const MACS = ['hmac-sha2-256', 'hmac-sha2-512', 'hmac-sha1'];
+// 只保留 SHA-2 系 MAC：会 SHA-1 的 HMAC 已经不该出现在 2026 年的协商列表里
+const MACS = ['hmac-sha2-256', 'hmac-sha2-512'];
 const CIPHER_KEYLEN = { 'aes128-ctr': 16, 'aes192-ctr': 24, 'aes256-ctr': 32 };
-const MAC_LEN = { 'hmac-sha2-256': 32, 'hmac-sha2-512': 64, 'hmac-sha1': 20 };
+const MAC_LEN = { 'hmac-sha2-256': 32, 'hmac-sha2-512': 64 };
 
 const WINDOW = 2 * 1024 * 1024;
 const MAX_PACKET = 32 * 1024;
@@ -526,6 +527,17 @@ export class SSHClient {
         if (!sigResult.verified) {
             throw new Error(
                 '主机密钥签名校验失败：' + (sigResult.reason || '无有效签名') + '，已中止连接（可能是中间人攻击）'
+            );
+        }
+        // 协商了什么就必须用什么：签名算法若由服务器单方面决定，
+        // 攻击者可以把 rsa-sha2-512 压回 ssh-rsa（SHA-1）而界面毫无异常
+        if (sigResult.sigAlg && sigResult.sigAlg !== this.neg.hostKeyAlg) {
+            throw new Error(
+                '主机密钥签名算法与协商结果不一致（协商 ' +
+                    this.neg.hostKeyAlg +
+                    '，实际 ' +
+                    sigResult.sigAlg +
+                    '），已中止连接'
             );
         }
         const fp = await C.fingerprint(hostKeyBlob);

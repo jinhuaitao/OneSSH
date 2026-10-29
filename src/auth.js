@@ -37,6 +37,34 @@ export function safeEqual(a, b) {
     return d === 0;
 }
 
+/* -------------------------------------------------------------- client ip */
+
+/** 客户端 IP：优先 Cloudflare 注入的头，其次反代常见头，最后兜底 */
+export function clientIpOf(request) {
+    const h = request.headers;
+    const direct = (h.get('cf-connecting-ip') || '').trim();
+    if (direct) return direct;
+    const forwarded = (h.get('x-forwarded-for') || h.get('x-real-ip') || '').split(',')[0].trim();
+    return forwarded || 'local';
+}
+
+/**
+ * 会话绑定的 IP 比对：IPv4 比前三段、IPv6 比前四组。
+ * 要求完全相等太容易误伤（手机切 4G 就换 IP），但「跨城市/跨运营商还在同一段」
+ * 基本不可能 —— 折中在这里。
+ */
+export function sameIpPrefix(a, b) {
+    const clean = (v) => String(v || '').toLowerCase().replace(/^::ffff:/, '').trim();
+    const x = clean(a);
+    const y = clean(b);
+    if (!x || !y) return true;
+    if (x === y) return true;
+    if (x.includes(':') || y.includes(':')) {
+        return x.split(':').slice(0, 4).join(':') === y.split(':').slice(0, 4).join(':');
+    }
+    return x.split('.').slice(0, 3).join('.') === y.split('.').slice(0, 3).join('.');
+}
+
 /* --------------------------------------------------------------- password */
 
 export async function hashPassword(password, saltHex, iterations = PBKDF2_ITER) {
@@ -183,6 +211,21 @@ export async function getSession(env, request) {
         rec.seen = now;
         await putJSON(env, SESSION_PREFIX + token, rec);
     }
+    // 会话绑设备：Cookie 一旦泄露（共享电脑、扩展、截图），有效期还有 30 天，
+    // 而进来就等于拿到整库 SSH 凭据。UA 变了直接作废 —— 同一个浏览器几乎不会换 UA。
+    const ua = (request.headers.get('user-agent') || '').slice(0, 160);
+    if (rec.ua && ua && ua !== rec.ua) {
+        await del(env, SESSION_PREFIX + token);
+        return null;
+    }
+    // IP 按网段比对（可用 WEBSSH_SESSION_IP_BIND=off 关掉，方便移动网络用户）
+    if (rec.ip && (!env || env.WEBSSH_SESSION_IP_BIND !== 'off')) {
+        const ip = clientIpOf(request);
+        if (rec.ip !== 'local' && ip !== 'local' && !sameIpPrefix(rec.ip, ip)) {
+            await del(env, SESSION_PREFIX + token);
+            return null;
+        }
+    }
     return { token, ...rec };
 }
 
@@ -200,7 +243,6 @@ export async function destroyAllSessions(env, exceptToken) {
 
 export async function pruneSessions(env) {
     const objs = await list(env, SESSION_PREFIX);
-    if (objs.length < 12) return;
     for (const o of objs) {
         const rec = await getJSON(env, o.key);
         if (!rec || !rec.exp || rec.exp < Date.now()) await del(env, o.key);
@@ -315,42 +357,56 @@ export async function getMasterKey(env) {
     return cachedMaster;
 }
 
-export async function encryptSecret(env, plaintext) {
+/** 把「这段密文属于哪个字段」绑进 AAD：搬走别人的密文就解不开 */
+function aadFor(context) {
+    return te.encode('onessh|' + String(context || ''));
+}
+
+export async function encryptSecret(env, plaintext, context) {
     if (plaintext == null || plaintext === '') return null;
     const key = await getMasterKey(env);
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ct = new Uint8Array(
-        await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, te.encode(String(plaintext)))
-    );
-    return 'v1:' + b64encode(iv) + ':' + b64encode(ct);
+    const params = { name: 'AES-GCM', iv };
+    if (context) params.additionalData = aadFor(context);
+    const ct = new Uint8Array(await crypto.subtle.encrypt(params, key, te.encode(String(plaintext))));
+    // 有上下文用 v2（AAD 绑定），没有上下文仍写 v1（兼容旧数据格式）
+    return (context ? 'v2:' : 'v1:') + b64encode(iv) + ':' + b64encode(ct);
 }
 
-export async function decryptSecret(env, blob) {
+export async function decryptSecret(env, blob, context) {
     if (!blob) return null;
     const parts = String(blob).split(':');
-    if (parts.length !== 3 || parts[0] !== 'v1') throw new Error('密文格式不正确');
+    if (parts.length !== 3 || (parts[0] !== 'v1' && parts[0] !== 'v2')) throw new Error('密文格式不正确');
     const key = await getMasterKey(env);
-    const iv = b64decode(parts[1]);
-    const ct = b64decode(parts[2]);
-    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct);
+    const params = { name: 'AES-GCM', iv: b64decode(parts[1]) };
+    if (parts[0] === 'v2') {
+        // v2 必须带上下文：拿不到就无法校验归属，宁可报错也不放行
+        if (!context) throw new Error('这段密文绑定了上下文，缺少归属信息无法解密');
+        params.additionalData = aadFor(context);
+    }
+    const pt = await crypto.subtle.decrypt(params, key, b64decode(parts[2]));
     return new TextDecoder().decode(pt);
 }
 
 /* 会话日志里可能粘着密码/令牌，落盘同样走主密钥加密：iv(12) || ciphertext */
-export async function encryptBytes(env, bytes) {
+export async function encryptBytes(env, bytes, context) {
     const key = await getMasterKey(env);
     const iv = crypto.getRandomValues(new Uint8Array(12));
-    const ct = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, bytes));
+    const params = { name: 'AES-GCM', iv };
+    if (context) params.additionalData = aadFor(context);
+    const ct = new Uint8Array(await crypto.subtle.encrypt(params, key, bytes));
     const out = new Uint8Array(12 + ct.length);
     out.set(iv, 0);
     out.set(ct, 12);
     return out;
 }
 
-export async function decryptBytes(env, buf) {
+export async function decryptBytes(env, buf, context) {
     const u8 = new Uint8Array(buf);
     if (u8.length < 13) throw new Error('密文格式不正确');
     const key = await getMasterKey(env);
-    const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: u8.subarray(0, 12) }, key, u8.subarray(12));
+    const params = { name: 'AES-GCM', iv: u8.subarray(0, 12) };
+    if (context) params.additionalData = aadFor(context);
+    const pt = await crypto.subtle.decrypt(params, key, u8.subarray(12));
     return new Uint8Array(pt);
 }
