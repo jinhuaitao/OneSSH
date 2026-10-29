@@ -65,11 +65,11 @@
 npm install
 npx wrangler dev                # http://127.0.0.1:8787，本地 R2 在 .wrangler/ 下
 npx wrangler deploy             # CLI 部署，需先 wrangler login
-npm test                        # 70 个用例，不需要 wrangler / 网络 / sshd
+npm test                        # 86 个用例，不需要 wrangler / 网络 / sshd
 npm run test:watch              # 改代码自动重跑
 ```
 
-`npm test` 用 Node 自带的 `node:test` 跑，分三组：
+`npm test` 用 Node 自带的 `node:test` 跑，分五组：
 
 | 文件 | 覆盖内容 |
 | :--- | :--- |
@@ -77,6 +77,7 @@ npm run test:watch              # 改代码自动重跑
 | `tests/sftp.test.mjs` | SFTP 报文分帧、属性位解析、状态码翻译、`renameOverwrite` 的三级降级（posix-rename → 普通 rename → 备份再换名） |
 | `tests/session.test.mjs` | 会话层：`knownKey` 归一化、原子上传的两个操作码（临时文件 → 还原权限 → 覆盖改名）、失败时清理临时文件、句柄释放 |
 | `tests/api.test.mjs` | 直接调用 Worker 的 `fetch`：初始化 / 初始化口令 / 登录 / 限流 / 改密踢设备 / 登出、主机 · 分组 · 凭据库 CRUD、密文不落明文、跨站写请求与非法 Content-Type、安全响应头、路径穿越 |
+| `tests/hardening.test.mjs` | 会话绑设备（UA 缺省也拒绝、IP 取不到也拒绝、XFF 默认不采信）、初始化口令必填、密文 AAD 绑定与旧日志兼容、SHA-1 签名拒绝、`first_kex_packet_follows` 丢包、主动重协商触发条件 |
 
 为了在 Node 里加载 Worker 代码，`tests/loader.mjs` 把 `cloudflare:sockets` 解析成一个桩，`tests/helpers.mjs` 提供一个内存版 R2（含 `If-None-Match: *` 条件写与分页）。所以整套测试不需要 Cloudflare 账号、不需要本地 sshd，也不需要浏览器。删掉 `.wrangler/state` 会清空本地全部数据。
 
@@ -151,10 +152,11 @@ npm run test:watch              # 改代码自动重跑
   ```
 
 - 🔑 **口令与会话**：密码至少 10 位、拒绝常见弱口令；PBKDF2-SHA256（10 万次迭代）加盐存储，校验用恒定时间比较。会话是 HttpOnly + SameSite=Lax 的随机 256 位 token，30 天绝对过期、7 天空闲过期，**改密后其它设备立即掉线**。
-- 🧷 **会话绑设备**：会话写入时的 User-Agent 会参与校验 —— UA 变了（典型场景：Cookie 被导出到另一台机器）直接作废并删除记录；IP 按网段比对（IPv4 比前三段、IPv6 比前四组），换网段同样作废。手机切 4G/5G 只换尾段，不受影响；确实需要放宽（比如经常跨网络漫游）可以设 `WEBSSH_SESSION_IP_BIND=off` 关掉 IP 这一层，UA 那一层没有开关。
+- 🧷 **会话绑设备（fail-closed）**：会话写入时的 User-Agent 会参与校验 —— UA 变了**或者这次压根没带 UA**，都直接作废并删除记录（空 UA 算不匹配，否则 `curl -A ""` 就是一条绕过路径）。IP 按网段比对：IPv4 比 /24、IPv6 比 /48，换网段同样作废；建会话时知道 IP、这次却取不到，也按不匹配处理。手机切 4G/5G 只换尾段，不受影响。确实需要放宽（比如经常跨网络漫游）可以设 `WEBSSH_SESSION_IP_BIND=off` 关掉 IP 这一层，UA 那一层没有开关。
+- 🕵️ **不采信客户端自报的 IP**：`cf-connecting-ip` 优先；`x-forwarded-for` / `x-real-ip` 是客户端可写的头，默认忽略 —— 否则换一个值就能把登录限流绕成无限次。确实在自己的反代后面（且反代会覆写这两个头）时，再设 `WEBSSH_TRUST_PROXY=on` 打开。
 - 🧱 **跨站防线**：所有写接口和 WebSocket 升级都校验 `Origin` 同源，挡 CSRF 和跨站 WebSocket 劫持；页面带 `CSP`（`connect-src 'self'`、`object-src 'none'`、`frame-ancestors 'none'`）、`COOP` / `CORP` / `Permissions-Policy`，HTTPS 下加 `HSTS`。
 - 🛡️ **主机密钥强校验**：握手时先验证服务器签名，拿不出这把主机私钥就直接断开（中间人无法用「点继续」绕过）；首次连接记录指纹，之后指纹变化自动拒绝。
-- 🔒 **加密边界**：主机密码、私钥、常用账号、**会话录制**都用 AES-GCM 加密；密文格式升到 `v2`，把「这段密文属于哪个字段」绑进 AAD（`host:<id>` / `cred:<id>` / `key:<id>` / `log:<name>`）—— 只拿到 R2 写权限也搬不动别人的密文，换个字段解就是认证失败。旧数据是 `v1`（无 AAD），仍可正常读取。主密钥默认放在同一个桶的 `sys/master` —— 防「桶被人翻到」，防不了「Cloudflare 账号被攻破」。可以自带密钥：
+- 🔒 **加密边界**：主机密码、私钥、常用账号、**会话录制**都用 AES-GCM 加密；密文格式升到 `v2`，把「这段密文属于哪个字段」绑进 AAD（`host:<id>` / `cred:<id>` / `key:<id>` / `log:<name>`）—— 只拿到 R2 写权限也搬不动别人的密文，换个字段解就是认证失败。旧数据是 `v1`（无 AAD），仍可正常读取：凭据靠 `v1:`/`v2:` 前缀分支，会话日志没有前缀可判，所以读取时先带上下文、失败再退回无上下文解密。主密钥默认放在同一个桶的 `sys/master` —— 防「桶被人翻到」，防不了「Cloudflare 账号被攻破」。可以自带密钥：
 
   ```bash
   npx wrangler secret put WEBSSH_MASTER_KEY   # 32 字节 base64 或 64 位 hex
@@ -191,6 +193,8 @@ npm run test:watch              # 改代码自动重跑
 SSH 协议栈是自己实现的（`src/ssh/`），只依赖 WebCrypto：`curve25519-sha256` 密钥交换、`aes{128,192,256}-ctr` 加密、`hmac-sha2-{256,512}` 校验、`ssh-ed25519` / `ecdsa-sha2-nistp256` / `rsa-sha2-{256,512}` 主机密钥，支持密码、公钥（OpenSSH / PKCS#1 / PKCS#8）和 keyboard-interactive 认证。
 
 **SHA-1 系已从协商列表里移除**：`hmac-sha1` 与 `ssh-rsa`（用 SHA-1 签主机密钥）不再提供。RSA 主机密钥仍然支持，只是强制走 `rsa-sha2-256/512`。同时握手阶段会核对「协商到的算法」与「服务器实际报出来的签名算法」是否一致 —— 否则攻击者可以把 `rsa-sha2-512` 悄悄压回 `ssh-rsa`，而界面看不出任何异常。
+
+**重协商与 KEX 细节**：累计收发到 1 GB（或服务端主动发起）会重算会话密钥，重协商时主机密钥仍然重新验签；服务器声明 `first_kex_packet_follows` 且猜错算法时，它那一个包按 RFC 4253 §7.1 丢弃。
 
 | 文件 | 作用 |
 | :--- | :--- |

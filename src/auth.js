@@ -39,30 +39,108 @@ export function safeEqual(a, b) {
 
 /* -------------------------------------------------------------- client ip */
 
-/** 客户端 IP：优先 Cloudflare 注入的头，其次反代常见头，最后兜底 */
-export function clientIpOf(request) {
-    const h = request.headers;
-    const direct = (h.get('cf-connecting-ip') || '').trim();
-    if (direct) return direct;
-    const forwarded = (h.get('x-forwarded-for') || h.get('x-real-ip') || '').split(',')[0].trim();
-    return forwarded || 'local';
+/** 只有显式声明「前面挂了自己的反代」才采信 XFF —— 那个头客户端可以随便写 */
+function trustProxy(env) {
+    const v = String((env && env.WEBSSH_TRUST_PROXY) || '').trim().toLowerCase();
+    return v === 'on' || v === '1' || v === 'true';
 }
 
 /**
- * 会话绑定的 IP 比对：IPv4 比前三段、IPv6 比前四组。
- * 要求完全相等太容易误伤（手机切 4G 就换 IP），但「跨城市/跨运营商还在同一段」
- * 基本不可能 —— 折中在这里。
+ * 客户端 IP：优先 Cloudflare 注入的头。
+ *
+ * `x-forwarded-for` / `x-real-ip` 是**客户端可写**的，默认不采信：
+ * 否则攻击者每次请求换一个值就能把登录限流绕成无限次，发个空值还能让
+ * 会话的 IP 绑定整层失效。只有在反代自己会覆写这两个头的部署里，才把
+ * WEBSSH_TRUST_PROXY 打开。
+ */
+export function clientIpOf(request, env) {
+    const h = request.headers;
+    const direct = (h.get('cf-connecting-ip') || '').trim();
+    if (direct) return direct;
+    if (trustProxy(env)) {
+        const forwarded = (h.get('x-forwarded-for') || h.get('x-real-ip') || '').split(',')[0].trim();
+        if (forwarded) return forwarded;
+    }
+    return 'local';
+}
+
+/** 展开成 8 组 16 位整数；解析不了返回 null。用于把 `::`、IPv4 内嵌、大小写都归一。 */
+function expandIpv6(input) {
+    let s = String(input || '').trim().toLowerCase();
+    const pct = s.indexOf('%'); // 去掉 zone id（fe80::1%eth0）
+    if (pct >= 0) s = s.slice(0, pct);
+    if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1);
+    if (!s || !s.includes(':')) return null;
+    if (s.includes('.')) {
+        // IPv4 内嵌（::ffff:1.2.3.4 / ::1.2.3.4）：尾部换成两组 16 位
+        const i = s.lastIndexOf(':');
+        if (i < 0) return null;
+        const v4 = s.slice(i + 1).split('.');
+        if (v4.length !== 4) return null;
+        const n = v4.map((x) => (/^\d{1,3}$/.test(x) ? Number(x) : NaN));
+        if (n.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return null;
+        s = s.slice(0, i + 1) + ((n[0] << 8) | n[1]).toString(16) + ':' + ((n[2] << 8) | n[3]).toString(16);
+    }
+    const halves = s.split('::');
+    if (halves.length > 2) return null;
+    const head = halves[0] ? halves[0].split(':') : [];
+    const tail = halves.length === 2 ? (halves[1] ? halves[1].split(':') : []) : null;
+    let groups;
+    if (tail === null) {
+        groups = head;
+    } else {
+        const fill = 8 - head.length - tail.length;
+        if (fill < 1) return null;
+        groups = head.concat(new Array(fill).fill('0'), tail);
+    }
+    if (groups.length !== 8) return null;
+    const out = [];
+    for (const g of groups) {
+        if (!/^[0-9a-f]{1,4}$/.test(g)) return null;
+        out.push(parseInt(g, 16));
+    }
+    return out;
+}
+
+/** 把各种写法的 IP 归一成 { v: 4|6, parts: number[] }；解析不了返回 null */
+export function parseIp(raw) {
+    const s = String(raw == null ? '' : raw).trim().toLowerCase();
+    if (!s) return null;
+    if (s.includes(':')) {
+        const g = expandIpv6(s);
+        if (!g) return null;
+        // IPv4-mapped（::ffff:a.b.c.d）当 IPv4 处理，和裸 IPv4 才能比到一起去
+        if (g.slice(0, 5).every((x) => x === 0) && g[5] === 0xffff) {
+            return { v: 4, parts: [g[6] >> 8, g[6] & 0xff, g[7] >> 8, g[7] & 0xff] };
+        }
+        return { v: 6, parts: g };
+    }
+    const p = s.split('.');
+    if (p.length !== 4) return null;
+    const n = p.map((x) => (/^\d{1,3}$/.test(x) ? Number(x) : NaN));
+    if (n.some((x) => !Number.isInteger(x) || x < 0 || x > 255)) return null;
+    return { v: 4, parts: n };
+}
+
+// IPv4 比 /24，IPv6 比 /48。
+// IPv6 原来比前四组（= /64），而一个 IPv6 用户通常手握整个 /64（2^64 个地址），
+// 那层绑定等于不存在 —— 攻击者在自己 /64 里随便换地址就能过。放宽到 /48 才对应
+// 「同一个站点/同一个运营商前缀」。前缀会随拨号变化的话，用 WEBSSH_SESSION_IP_BIND=off。
+const IPV4_GROUPS = 3;
+const IPV6_GROUPS = 3;
+
+/**
+ * 会话绑定的 IP 比对。要求完全相等太容易误伤（手机切 4G 就换 IP），
+ * 所以按网段比：跨城市/跨运营商基本不可能还在同一段。
  */
 export function sameIpPrefix(a, b) {
-    const clean = (v) => String(v || '').toLowerCase().replace(/^::ffff:/, '').trim();
-    const x = clean(a);
-    const y = clean(b);
-    if (!x || !y) return true;
-    if (x === y) return true;
-    if (x.includes(':') || y.includes(':')) {
-        return x.split(':').slice(0, 4).join(':') === y.split(':').slice(0, 4).join(':');
-    }
-    return x.split('.').slice(0, 3).join('.') === y.split('.').slice(0, 3).join('.');
+    const x = parseIp(a);
+    const y = parseIp(b);
+    if (!x || !y) return true; // 解析不了就不在这里判断（调用方另有 fail-closed 处理）
+    if (x.v !== y.v) return false;
+    const n = x.v === 4 ? IPV4_GROUPS : IPV6_GROUPS;
+    for (let i = 0; i < n; i++) if (x.parts[i] !== y.parts[i]) return false;
+    return true;
 }
 
 /* --------------------------------------------------------------- password */
@@ -179,7 +257,9 @@ export function clearCookie(request) {
 
 export async function createSession(env, username, request) {
     const token = randomHex(32);
-    const ip = request.headers.get('cf-connecting-ip') || '';
+    // 必须和 getSession 用同一个取值函数，否则反代部署下这里存空串、
+    // 那边再比对，IP 这一层就静默失效了。
+    const ip = clientIpOf(request, env);
     await putJSON(env, SESSION_PREFIX + token, {
         u: username,
         exp: Date.now() + SESSION_TTL,
@@ -213,15 +293,21 @@ export async function getSession(env, request) {
     }
     // 会话绑设备：Cookie 一旦泄露（共享电脑、扩展、截图），有效期还有 30 天，
     // 而进来就等于拿到整库 SSH 凭据。UA 变了直接作废 —— 同一个浏览器几乎不会换 UA。
+    // 空 UA 必须算「不匹配」：写成 `rec.ua && ua && ua !== rec.ua` 的话，
+    // 攻击者只要发一个不带 User-Agent 的请求就能把整层绕过去。
     const ua = (request.headers.get('user-agent') || '').slice(0, 160);
-    if (rec.ua && ua && ua !== rec.ua) {
+    if (rec.ua && ua !== rec.ua) {
         await del(env, SESSION_PREFIX + token);
         return null;
     }
-    // IP 按网段比对（可用 WEBSSH_SESSION_IP_BIND=off 关掉，方便移动网络用户）
-    if (rec.ip && (!env || env.WEBSSH_SESSION_IP_BIND !== 'off')) {
-        const ip = clientIpOf(request);
-        if (rec.ip !== 'local' && ip !== 'local' && !sameIpPrefix(rec.ip, ip)) {
+    // IP 按网段比对（可用 WEBSSH_SESSION_IP_BIND=off 关掉，方便移动网络用户）。
+    // 反向的 fail-closed：建立会话时知道 IP，这次却取不到（'local'），同样作废 ——
+    // 否则「让请求不带任何 IP 头」本身就是一条绕过路径。
+    if (rec.ip && rec.ip !== 'local' && (!env || env.WEBSSH_SESSION_IP_BIND !== 'off')) {
+        const ip = clientIpOf(request, env);
+        // 解析不出来（'local' 或畸形值）一律按不匹配处理：开了 WEBSSH_TRUST_PROXY 时
+        // XFF 是可控的，随手塞个 "garbage" 不能变成免检通行证。
+        if (ip === 'local' || !parseIp(ip) || !sameIpPrefix(rec.ip, ip)) {
             await del(env, SESSION_PREFIX + token);
             return null;
         }

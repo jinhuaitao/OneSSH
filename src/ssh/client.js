@@ -48,6 +48,15 @@ const MAC_LEN = { 'hmac-sha2-256': 32, 'hmac-sha2-512': 64 };
 
 const WINDOW = 2 * 1024 * 1024;
 const MAX_PACKET = 32 * 1024;
+/**
+ * 传输层单包上限。RFC 4253 §6.1 只要求能处理 35000 字节以内的包，这里放到 256KB
+ * 是因为 SFTP 读请求一次要 128KB（READ_CHUNK），服务端完全可能把它塞进一个
+ * DATA 包里回过来 —— 卡在 35000 会让大文件下载直接断。仍然是有界的，不是无限。
+ */
+const MAX_PACKET_SIZE = 256 * 1024;
+
+/** 主动重协商阈值：OpenSSH 默认也是 1GB（或 1 小时） */
+const REKEY_BYTES = 1024 * 1024 * 1024;
 
 /** 给任意 promise 加超时：SSH 里"对方不说话"是最常见的失败方式，不能无限等 */
 function withTimeout(promise, ms, message) {
@@ -124,6 +133,10 @@ export class SSHClient {
         this.strictKex = false;
         this.kexActive = false;
         this._watchdog = null;
+        // 服务端声明「猜测随包」且猜错时，它的下一个包必须被丢弃（RFC 4253 §7.1）
+        this._dropNextKexPacket = false;
+        // 累计收发字节，到阈值主动重协商
+        this.bytesSinceRekey = 0;
     }
 
     /** resolves once the interactive shell is up */
@@ -174,8 +187,24 @@ export class SSHClient {
         for (;;) {
             const payload = await this._readPacket();
             if (!payload) return;
+            // 服务器猜错算法时那一个包是「按它猜的算法」构造的，必须整包丢掉
+            if (this._dropNextKexPacket) {
+                this._dropNextKexPacket = false;
+                continue;
+            }
             await this._dispatch(payload);
         }
+    }
+
+    /**
+     * 累计流量到阈值就主动重协商（RFC 4253 §9：1GB 或 1 小时后应重算会话密钥）。
+     * 只从收包路径触发：发包路径里再发 KEXINIT 会自己插进 sendChain，容易绕成环。
+     */
+    _maybeRekey() {
+        if (!this.ready || this.closed || this.kexActive) return;
+        if (this.bytesSinceRekey < REKEY_BYTES) return;
+        this.bytesSinceRekey = 0;
+        this._sendKexInit().catch((e) => this._fail(e));
     }
 
     async _readPacket() {
@@ -189,7 +218,7 @@ export class SSHClient {
         } else {
             packetLen = new DataView(head.buffer, head.byteOffset, 4).getUint32(0);
         }
-        if (packetLen < 5 || packetLen > 256 * 1024) throw new Error('bad packet length ' + packetLen);
+        if (packetLen < 5 || packetLen > MAX_PACKET_SIZE) throw new Error('bad packet length ' + packetLen);
         const total = 4 + packetLen;
         if (avail < total + this.macInLen) return null;
         let pkt = this.buf.subarray(this.off, this.off + total);
@@ -206,6 +235,8 @@ export class SSHClient {
             this.off = 0;
         }
         this.lastInbound = Date.now();
+        this.bytesSinceRekey += total + this.macInLen;
+        this._maybeRekey();
         const padLen = pkt[4];
         // RFC 4253 §6：padding 至少 4 字节，且必须给 payload 留出至少 1 字节（报文类型）
         if (padLen < 4 || padLen > packetLen - 1) throw new Error('bad padding length ' + padLen);
@@ -463,7 +494,7 @@ export class SSHClient {
         r.nameList();
         r.nameList();
         r.nameList();
-        r.bool();
+        const firstKexFollows = r.bool();
         r.u32();
 
         this.iS = p;
@@ -479,6 +510,11 @@ export class SSHClient {
         if (!hostKeyAlg) throw new Error('没有共同支持的主机密钥算法');
 
         this.neg = { kex, encC2S: enc1, encS2C: enc2, macC2S: mac1, macS2C: mac2, hostKeyAlg };
+        // RFC 4253 §7.1：服务器可以「猜测随包」（先发 KEX_ECDH_INIT，赌我们也会选它猜的算法）。
+        // 猜对了那个包照常处理，猜错了它必须被丢弃 —— 否则会把按别的算法构造的包当成本次 KEX 的输入。
+        // 比较基准要跳过 ext-info-s / strict-kex 这类伪算法，它们不参与 pick()。
+        const firstReal = kexAlgs.find((a) => a !== 'ext-info-s' && a !== 'kex-strict-s-v00@openssh.com') || '';
+        this._dropNextKexPacket = firstKexFollows && !(firstReal === kex && hostKeyAlgs[0] === hostKeyAlg);
         // Terrapin（CVE-2023-48795）：双方都通告 strict-kex 时，KEX 期间禁止注入
         // IGNORE/DEBUG/UNIMPLEMENTED，且 NEWKEYS 之后序号归零。只在首次 KEX 决定一次。
         if (this.strictDecided === undefined) {
@@ -497,6 +533,9 @@ export class SSHClient {
     }
 
     async _onKexReply(p) {
+        // 会话已经建立（sessionId 非空）说明这是重协商，不是首次握手：
+        // 界面不该再弹一次「正在认证」，但主机密钥仍然要重新验一遍。
+        const rekey = Boolean(this.sessionId);
         const r = new Reader(p, 1);
         const hostKeyBlob = r.str();
         const serverPub = r.str();
@@ -573,7 +612,7 @@ export class SSHClient {
         this.blockOut = 16;
         this.macOutLen = macOut.len;
         this._pendingIn = { encIn, macIn };
-        this.onEvent({ type: 'kex-done', hostKeyType: sigResult.type, fingerprint: fp });
+        if (!rekey) this.onEvent({ type: 'kex-done', hostKeyType: sigResult.type, fingerprint: fp });
     }
 
     _onNewKeys() {
@@ -585,6 +624,7 @@ export class SSHClient {
         this._pendingIn = null;
         if (this.strictKex) this.seqIn = 0; // NEWKEYS 自身已用旧序号校验，之后归零
         this.kexActive = false;
+        this.bytesSinceRekey = 0;
         if (this.kexDone) this.kexDone.resolve();
         this.kexInitSent = false;
     }

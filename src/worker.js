@@ -259,7 +259,7 @@ async function handleApi(request, env, url) {
     if (path === '/api/setup' && method === 'POST') {
         const admin = await auth.getAdmin(env);
         if (admin) return json({ error: 'already_setup', message: '系统已经完成初始化' }, 409);
-        const ip = auth.clientIpOf(request);
+        const ip = auth.clientIpOf(request, env);
         // 未配置初始化口令时直接拒绝，而不是退化成「先到先得」：
         // 这就是「陌生人拿到网址就能注册管理员」的唯一入口，fail-closed 比方便重要
         if (!env.WEBSSH_SETUP_TOKEN) {
@@ -302,7 +302,7 @@ async function handleApi(request, env, url) {
     }
 
     if (path === '/api/login' && method === 'POST') {
-        const ip = auth.clientIpOf(request);
+        const ip = auth.clientIpOf(request, env);
         const throttle = await auth.checkThrottle(env, ip);
         if (throttle.locked) {
             return json(
@@ -336,7 +336,7 @@ async function handleApi(request, env, url) {
     }
 
     if (path === '/api/password' && method === 'POST') {
-        const ip = auth.clientIpOf(request);
+        const ip = auth.clientIpOf(request, env);
         const throttle = await auth.checkThrottle(env, ip);
         if (throttle.locked) {
             return json(
@@ -667,10 +667,19 @@ async function handleApi(request, env, url) {
         }
         const obj = await getBytes(env, key);
         if (!obj) return json({ error: 'not_found', message: '记录不存在' }, 404);
-        // 新记录以主密钥加密落盘；旧记录仍是明文，直接原样返回
-        const text = obj.meta.enc
-            ? new TextDecoder().decode(await auth.decryptBytes(env, obj.bytes, 'log:' + key))
-            : new TextDecoder().decode(obj.bytes);
+        // 新记录以主密钥加密落盘（v2，绑定了文件名）；补丁前的记录没有 AAD，
+        // 只能退回无上下文解密 —— 元数据里新旧都写着 enc:'v1'，靠不住，
+        // 所以这里用「先带上下文、失败再退回」而不是按版本号分支。
+        let text;
+        if (!obj.meta.enc) {
+            text = new TextDecoder().decode(obj.bytes);
+        } else {
+            try {
+                text = new TextDecoder().decode(await auth.decryptBytes(env, obj.bytes, 'log:' + key));
+            } catch (_) {
+                text = new TextDecoder().decode(await auth.decryptBytes(env, obj.bytes));
+            }
+        }
         return new Response(text, {
             // 会话日志里可能粘着密码，走和页面同一套安全头（含 HTTPS 下的 HSTS）
             headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', ...securityHeaders(request) },

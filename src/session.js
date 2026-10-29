@@ -798,7 +798,9 @@ export class Terminal {
                     started: new Date(startedAt).toISOString(),
                     bytes: String(this.recBytes),
                     reason: String(reason || ''),
-                    enc: 'v1',
+                    // v2 = 密文绑定了 'log:<key>' 作为 AAD；旧记录是 v1（无 AAD）。
+                    // 读取端靠「先带上下文、失败再退回」兼容两者。
+                    enc: 'v2',
                 });
             } catch (_) {}
         }

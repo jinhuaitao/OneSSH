@@ -13,10 +13,6 @@ export async function sha512(data) {
     return new Uint8Array(await subtle().digest('SHA-512', data));
 }
 
-export async function sha1(data) {
-    return new Uint8Array(await subtle().digest('SHA-1', data));
-}
-
 /* -------------------------------------------------------------------- hmac */
 
 const HMAC_HASH = {
