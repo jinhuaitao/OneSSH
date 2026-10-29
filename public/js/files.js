@@ -171,20 +171,28 @@ export function openFiles(cfg) {
     }
 
     async function uploadOne(full, file) {
-        let handle = null;
+        // 原子上传：服务端先在同目录写临时文件，全部写完才 rename 覆盖目标。
+        // 中途失败（网络断、磁盘满、用户关掉页面）时原文件完好无损。
+        const opened = await request({ op: 'open-upload', path: full }, 60000);
+        const handle = opened.handle;
+        const tmp = opened.tmp;
+        let committed = false;
         try {
-            const opened = await request({ op: 'open-write', path: full }, 60000);
-            handle = opened.handle;
+            const total = file.size || 1;
             for (let offset = 0; offset < file.size; offset += WRITE_CHUNK) {
                 const buf = await file.slice(offset, offset + WRITE_CHUNK).arrayBuffer();
                 await request({ op: 'write', handle, offset, data: b64(new Uint8Array(buf)) }, 120000);
-                setStatus('上传 ' + file.name + ' · ' + fmtBytes(Math.min(file.size, offset + WRITE_CHUNK)) + ' / ' + fmtBytes(file.size));
+                const done = Math.min(file.size, offset + WRITE_CHUNK);
+                setStatus(
+                    '上传 ' + file.name + ' · ' + fmtBytes(done) + ' / ' + fmtBytes(file.size) + ' · ' + Math.round((done / total) * 100) + '%'
+                );
             }
+            await request({ op: 'commit-upload', handle, tmp, path: full }, 120000);
+            committed = true;
         } finally {
-            if (handle) {
-                try {
-                    await request({ op: 'close', handle });
-                } catch (_) {}
+            if (!committed) {
+                await request({ op: 'close', handle }).catch(() => {});
+                await request({ op: 'remove', path: tmp }).catch(() => {});
             }
         }
     }

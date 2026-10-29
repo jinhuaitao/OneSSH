@@ -474,6 +474,41 @@ export class Terminal {
                 reply({ handle: await this._trackHandle(handle) });
                 return;
             }
+            /**
+             * 原子上传：先在同目录建临时文件，写完再 rename 覆盖目标。
+             * 直接 open(TRUNC) 目标文件的话，传到一半断线/报错，原文件就没了 ——
+             * 上传一个同名配置文件时这一点尤其致命。
+             */
+            case 'open-upload': {
+                const target = cleanPath(msg.path);
+                const tmp = tempName(target, 'webssh-upload');
+                const handle = await sftp.open(tmp, OPEN.WRITE | OPEN.CREAT | OPEN.TRUNC | OPEN.EXCL);
+                reply({ handle: await this._trackHandle(handle), tmp });
+                return;
+            }
+            case 'commit-upload': {
+                const token = String(msg.handle);
+                const h = this.handles.get(token);
+                if (!h) throw new Error('文件句柄无效，请重新打开');
+                const target = cleanPath(msg.path);
+                const tmp = cleanPath(msg.tmp);
+                // rename 换的是 inode：不还原权限位的话，0600 的密钥上传一次就变 0644
+                const prev = await sftp.stat(target).catch(() => null);
+                if (prev && prev.perms != null) {
+                    try {
+                        await sftp.fchmod(h, prev.perms & 0o7777);
+                    } catch (_) {}
+                }
+                await this._closeHandle(token);
+                try {
+                    await sftp.renameOverwrite(tmp, target);
+                } catch (e) {
+                    await sftp.remove(tmp).catch(() => {});
+                    throw new Error('保存 ' + target + ' 失败：' + ((e && e.message) || e) + '（原文件未受影响）');
+                }
+                reply({ path: target });
+                return;
+            }
             case 'write': {
                 const h = this.handles.get(String(msg.handle));
                 if (!h) throw new Error('文件句柄无效，请重新打开');

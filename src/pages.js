@@ -19,6 +19,7 @@ const ICONS = {
     log: '<path d="M6 3.5h7l5 5v12H6z"/><path d="M13 3.5v5h5M9 13h6M9 16.5h4"/>',
     folder: '<path d="M3.5 6.5h6l1.8 2h9.2v10.5a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1z"/>',
     lock: '<rect x="4" y="10" width="16" height="10" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+    search: '<circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 4.5 4.5"/>',
 };
 
 function icon(name, size) {
@@ -121,7 +122,13 @@ export function renderShell() {
         <h1>我的主机</h1>
         <p class="sub">安全保存，随时连接。</p>
       </div>
-      <button class="btn primary" id="btn-add-host">${icon('plus', 15)} 添加主机</button>
+      <div class="dash-tools">
+        <label class="search">
+          ${icon('search', 15)}
+          <input id="host-search" type="search" placeholder="搜索名称 / 地址 / 备注" title="可按名称、地址、用户名、分组、城市、备注搜索" autocomplete="off" spellcheck="false" aria-label="搜索主机">
+        </label>
+        <button class="btn primary" id="btn-add-host">${icon('plus', 15)} 添加主机</button>
+      </div>
     </header>
 
     <div class="filters" id="filters"></div>

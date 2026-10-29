@@ -406,6 +406,54 @@ textarea {
     font-weight: 800;
     margin: 0 0 9px;
 }
+.dash-tools {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 0 0 auto;
+}
+.search {
+    display: flex;
+    flex-direction: row; /* 全局 label 是纵向表单标签，这里必须显式覆盖 */
+    align-items: center;
+    gap: 7px;
+    height: 38px;
+    padding: 0 13px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--card);
+    color: var(--muted);
+    transition: border-color 0.16s ease, box-shadow 0.16s ease, color 0.16s ease;
+}
+.search:hover {
+    border-color: var(--muted-2);
+}
+.search:focus-within {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+    color: var(--accent);
+}
+.search input {
+    width: 188px;
+    border: 0;
+    outline: 0;
+    padding: 0;
+    background: none;
+    /* 全局 input:focus 会加内阴影，胶囊本身已经有 focus-within 外环，这里必须清掉 */
+    box-shadow: none;
+    font: inherit;
+    font-size: 13px;
+    color: var(--ink);
+}
+.search input:focus {
+    box-shadow: none;
+}
+.search input::placeholder {
+    color: var(--muted-2);
+}
+.search input::-webkit-search-cancel-button {
+    cursor: pointer;
+}
 .sub {
     margin: 0;
     font-size: 12.5px;
@@ -1222,6 +1270,20 @@ textarea {
     .dash-head h1 {
         font-size: 26px;
     }
+    .dash-head {
+        flex-direction: column;
+        align-items: stretch;
+        gap: 14px;
+    }
+    .dash-tools {
+        justify-content: space-between;
+    }
+    .search {
+        flex: 1 1 auto;
+    }
+    .search input {
+        width: 100%;
+    }
     .host-loc {
         display: none;
     }
@@ -1239,5 +1301,35 @@ textarea {
     }
     .fm-list {
         height: min(44vh, 340px);
+    }
+}
+
+/* 触屏设备没有 hover，操作按钮不该常驻半透明 */
+@media (hover: none) {
+    .host-acts,
+    .fm-acts {
+        opacity: 1;
+    }
+}
+
+@media (max-width: 560px) {
+    /* 窄屏：主机名占满一行，操作按钮挪到第二行右对齐，避免名字被截成两三个字 */
+    .host-row {
+        display: grid;
+        grid-template-columns: auto minmax(0, 1fr);
+        grid-template-areas:
+            'tile main'
+            'acts acts';
+        row-gap: 10px;
+    }
+    .host-row .tile {
+        grid-area: tile;
+    }
+    .host-row .host-main {
+        grid-area: main;
+    }
+    .host-row .host-acts {
+        grid-area: acts;
+        justify-content: flex-end;
     }
 }

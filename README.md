@@ -65,11 +65,22 @@
 npm install
 npx wrangler dev                # http://127.0.0.1:8787，本地 R2 在 .wrangler/ 下
 npx wrangler deploy             # CLI 部署，需先 wrangler login
-npm test                        # 端到端：本地 sshd + wrangler dev + 真 Chrome
-node tests/e2e.mjs --headful    # 想看着它点
+npm test                        # 70 个用例，不需要 wrangler / 网络 / sshd
+npm run test:watch              # 改代码自动重跑
 ```
 
-`npm test` 覆盖初始化（含初始化口令）、分组、凭据库、主机密钥确认、终端交互、监控、代码片段、文件管理、刷新保持登录、退出登录，以及安全项：响应头、跨站写请求 / WebSocket 被拒、改密踢掉其它设备、加密日志读回。依赖 `ssh2` 与 `playwright-core`（用本机 Chrome）。删掉 `.wrangler/state` 会清空本地全部数据。
+`npm test` 用 Node 自带的 `node:test` 跑，分三组：
+
+| 文件 | 覆盖内容 |
+| :--- | :--- |
+| `tests/unit.test.mjs` | 主机地址归一化、SSH 二进制缓冲、AES-CTR 密钥流连续性、密钥派生、ed25519 / ECDSA / RSA 三种主机密钥的签名校验、私钥解析（PKCS#8）、PBKDF2、凭据加解密、Cookie 属性 |
+| `tests/sftp.test.mjs` | SFTP 报文分帧、属性位解析、状态码翻译、`renameOverwrite` 的三级降级（posix-rename → 普通 rename → 备份再换名） |
+| `tests/session.test.mjs` | 会话层：`knownKey` 归一化、原子上传的两个操作码（临时文件 → 还原权限 → 覆盖改名）、失败时清理临时文件、句柄释放 |
+| `tests/api.test.mjs` | 直接调用 Worker 的 `fetch`：初始化 / 初始化口令 / 登录 / 限流 / 改密踢设备 / 登出、主机 · 分组 · 凭据库 CRUD、密文不落明文、跨站写请求与非法 Content-Type、安全响应头、路径穿越 |
+
+为了在 Node 里加载 Worker 代码，`tests/loader.mjs` 把 `cloudflare:sockets` 解析成一个桩，`tests/helpers.mjs` 提供一个内存版 R2（含 `If-None-Match: *` 条件写与分页）。所以整套测试不需要 Cloudflare 账号、不需要本地 sshd，也不需要浏览器。删掉 `.wrangler/state` 会清空本地全部数据。
+
+需要「真 SSH 握手 + 真浏览器」的端到端验证时，仍然可以用 `ssh2` + `playwright-core` 自己搭：前者起一个本地 sshd，后者驱动 `wrangler dev` 的页面。这两个依赖已列在 `devDependencies` 里，只是 `npm test` 不再依赖它们，CI 里跑得快也更稳。
 
 ## 🧭 使用
 
@@ -78,6 +89,7 @@ node tests/e2e.mjs --headful    # 想看着它点
 | 操作 | 说明 |
 | :--- | :--- |
 | ➕ **添加主机** | 名称、分组、地址、端口、用户名，选密码或私钥，再选地区和城市；同一分组内按添加先后排列 |
+| 🔍 **搜索** | 顶部搜索框按名称 / 地址 / 用户名 / 分组 / 城市 / 备注过滤，与地区筛选叠加生效，<kbd>⌘K</kbd>（或 <kbd>/</kbd>）聚焦、<kbd>Esc</kbd> 清空，页脚同步显示 `命中 / 总数` |
 | 🌐 **IPv6** | 填 `2001:db8::1` 或 `[2001:db8::1]` 都行，列表统一显示为 `user@[addr]:port` |
 | 🔌 **连接** | 点主机行一键直连；没存凭据则弹窗临时输入，只在内存里用 |
 | ⚡ **快速连接** | 左侧闪电图标，临时连接不落库，可顺手保存到我的主机；为防止被当成端口扫描器，同一登录会话 10 分钟内最多连 10 个临时目标 |
@@ -96,7 +108,7 @@ node tests/e2e.mjs --headful    # 想看着它点
 
 | 操作 | 说明 |
 | :--- | :--- |
-| 📄 **文件管理** | 终端顶部「文件」走 SFTP；单文件上限 64 MB，在线编辑限 512 KB 以内的文本 |
+| 📄 **文件管理** | 终端顶部「文件」走 SFTP；单文件上限 64 MB，在线编辑限 512 KB 以内的文本；上传先写临时文件再覆盖改名，中断不会毁掉原文件 |
 | 🧩 **代码片段** | 左侧「代码片段」维护常用命令，终端页右上角也能打开，点一下发送到当前会话 |
 | 📊 **监控** | Linux 主机每 3 秒采样一次 `/proc`（独立 exec 通道，不打断 shell）；其他系统显示「不可用」 |
 | 🎛️ **特殊按键** | Ctrl / Alt、Tab / Esc、方向键、Ctrl+C / Ctrl+D、PgUp / PgDn / Home / End / Del |
@@ -113,6 +125,7 @@ node tests/e2e.mjs --headful    # 想看着它点
 | <kbd>Ctrl</kbd> / <kbd>⌘</kbd> + <kbd>Shift</kbd> + <kbd>W</kbd> | 关闭当前标签 |
 | <kbd>Alt</kbd> + <kbd>1</kbd> … <kbd>9</kbd> | 切换标签 |
 | 右键 | 粘贴 |
+| <kbd>⌘</kbd> / <kbd>Ctrl</kbd> + <kbd>K</kbd> | 回到主机列表时聚焦搜索框 |
 
 ### 📲 安装到桌面（PWA）
 
@@ -194,6 +207,7 @@ SSH 协议栈是自己实现的（`src/ssh/`），只依赖 WebCrypto：`curve25
 | `public/js/land.js` | 2°×2° 陆地掩码（构建期光栅化生成，运行时零依赖） |
 | `public/js/term.js` | 终端页：多标签、WebSocket 会话、监控面板、按键条 |
 | `public/vendor/` | xterm.js（随仓库内置，不依赖 CDN） |
+| `tests/` | `node:test` 用例 + 内存 R2 + `cloudflare:sockets` 桩，见上文「本地开发与测试」 |
 
 R2 数据布局：
 

@@ -66,9 +66,11 @@ async function buildAdminRecord(username, password) {
 
 /** 覆盖写：仅用于改密（/api/password），初始化请用 createAdminIfAbsent */
 export async function createAdmin(env, username, password) {
+    // 先确认主密钥可用，再动管理员记录：顺序反过来的话，密钥有问题时
+    // 密码已经改了、凭据却全部解不开，属于最坏的一种「半成功」。
+    await ensureMasterKey(env);
     const record = await buildAdminRecord(username, password);
     await putJSON(env, ADMIN_KEY, record);
-    await ensureMasterKey(env);
     return record;
 }
 
@@ -79,13 +81,16 @@ export async function createAdmin(env, username, password) {
  * 即使运行时忽略了 onlyIf，后写者也能发现自己没抢到。
  */
 export async function createAdminIfAbsent(env, username, password) {
+    // 先校验/生成主密钥，再抢管理员记录。反过来写的话，WEBSSH_MASTER_KEY 配错时
+    // 会出现「管理员已创建、但每次保存凭据都失败」的半初始化状态，
+    // 而且 setup 已经不能重跑了（getAdmin 非空）。
+    await ensureMasterKey(env);
     const record = await buildAdminRecord(username, password);
     const marker = randomHex(8);
     record.initId = marker;
     const wrote = await putJSONIfAbsent(env, ADMIN_KEY, record);
     const stored = await getJSON(env, ADMIN_KEY);
     if (!wrote && !stored) throw new Error('初始化失败：管理员记录没有写入存储，请重试');
-    await ensureMasterKey(env);
     return Boolean(stored && stored.initId === marker);
 }
 
@@ -264,8 +269,25 @@ async function importMaster(raw) {
     return crypto.subtle.importKey('raw', raw, { name: 'AES-GCM' }, false, ['encrypt', 'decrypt']);
 }
 
+/** 把 WEBSSH_MASTER_KEY 归一成 32 字节，长度不对就明确报错（不静默降级） */
+function masterKeyBytes(tag) {
+    let raw;
+    try {
+        raw = /^[a-f0-9]{64}$/i.test(tag) ? fromHex(tag) : b64decode(tag);
+    } catch (_) {
+        throw new Error('WEBSSH_MASTER_KEY 既不是 64 位 hex，也不是合法的 base64');
+    }
+    if (raw.length !== 32) throw new Error('WEBSSH_MASTER_KEY 必须是 32 字节的 base64 或 64 位 hex');
+    return raw;
+}
+
 export async function ensureMasterKey(env) {
-    if (env.WEBSSH_MASTER_KEY) return;
+    if (env.WEBSSH_MASTER_KEY) {
+        // 提前校验：格式不对的密钥如果拖到「第一次保存凭据」才炸，
+        // 初始化看起来是成功的，之后每个写操作都失败，排查成本很高。
+        masterKeyBytes(String(env.WEBSSH_MASTER_KEY).trim());
+        return;
+    }
     const existing = await getJSON(env, MASTER_KEY);
     if (existing && existing.key) return;
     // 与管理员记录同理：并发初始化只能有一份主密钥落盘。
@@ -282,8 +304,7 @@ export async function getMasterKey(env) {
     if (cachedMaster && cachedMasterTag === tag) return cachedMaster;
     let raw = null;
     if (tag) {
-        raw = /^[a-f0-9]{64}$/i.test(tag) ? fromHex(tag) : b64decode(tag);
-        if (raw.length !== 32) throw new Error('WEBSSH_MASTER_KEY 必须是 32 字节的 base64 或 64 位 hex');
+        raw = masterKeyBytes(tag);
     } else {
         const rec = await getJSON(env, MASTER_KEY);
         if (!rec || !rec.key) throw new Error('主密钥不存在，请重新完成初始化');

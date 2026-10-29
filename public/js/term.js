@@ -28,6 +28,9 @@ const THEME = {
 
 const FONT_STACK = 'ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace';
 
+// 单条输入上限：服务端 handleMessage 只收 1MB 以内的 data，超过就整条丢弃
+const INPUT_CHUNK = 64 * 1024;
+
 const KEYS = [
     { label: 'Ctrl', mod: 'ctrl' },
     { label: 'Alt', mod: 'alt' },
@@ -66,6 +69,8 @@ export function createTerminalView(cfg) {
         alt: false,
     };
     let bound = false;
+    // 当前挂在 #hb-stats 里的是哪个会话的监控 DOM
+    let statsMountedFor = null;
 
     const panesEl = $('#panes');
     const tabsEl = $('#tabs');
@@ -88,7 +93,22 @@ export function createTerminalView(cfg) {
 
     function sendInput(s, data) {
         if (!data) return;
-        send(s, { t: 'input', data });
+        if (data.length <= INPUT_CHUNK) {
+            send(s, { t: 'input', data });
+            return;
+        }
+        // 一次粘贴好几 MB 时，服务端按单条 1MB 上限整条丢弃（表现是「什么都没发生」）。
+        // 这里分片发送：顺序不变，也不丢内容；边界避开代理对，免得 emoji 变成 U+FFFD。
+        let i = 0;
+        while (i < data.length) {
+            let end = Math.min(data.length, i + INPUT_CHUNK);
+            if (end < data.length) {
+                const code = data.charCodeAt(end - 1);
+                if (code >= 0xd800 && code <= 0xdbff) end--;
+            }
+            send(s, { t: 'input', data: data.slice(i, end) });
+            i = end;
+        }
     }
 
     /* ------------------------------------------------------------- sftp */
@@ -183,6 +203,7 @@ export function createTerminalView(cfg) {
             if (title) title.textContent = '—';
             if (osEl) osEl.textContent = '';
             if (statsEl) statsEl.textContent = '';
+            statsMountedFor = null;
             return;
         }
         if (dot) dot.className = 'hb-dot' + (s.status === 'ready' ? '' : s.status === 'err' ? ' err' : ' wait');
@@ -207,11 +228,14 @@ export function createTerminalView(cfg) {
     function buildStats(s) {
         const box = $('#hb-stats');
         if (!box) return;
-        if (s._statsFor === s.id && box.firstChild) {
+        // 判断「这块 DOM 现在挂的是哪个会话」，而不是「这个会话以前建过 DOM」。
+        // 后者在切换标签时会踩坑：A 的 _statsFor 仍是 A，但盒子里已经是 B 的节点，
+        // 于是 updateStats(A) 往一堆已经脱离文档的节点里写，界面上永远是 B 的旧数字。
+        if (statsMountedFor === s.id && box.firstChild) {
             updateStats(s);
             return;
         }
-        s._statsFor = s.id;
+        statsMountedFor = s.id;
         box.textContent = '';
         const mk = (label, optional) => {
             const wrap = el('div', { class: 'stat' + (optional ? ' optional' : '') }, [el('span', { class: 'k', text: label })]);
@@ -353,7 +377,10 @@ export function createTerminalView(cfg) {
             if (s.pingTimer) clearInterval(s.pingTimer);
             s.pingTimer = null;
             failSftp(s, '会话已断开');
-            if (s.status !== 'err') s.status = s.status === 'ready' ? 'closed' : 'err';
+            // 只有「还没连上就断了」才算异常。已经 ready 或正常退出的会话保持原状态，
+            // 否则用户敲完 exit 之后标签会莫名其妙变红。
+            if (s.status === 'ready') s.status = 'closed';
+            else if (s.status === 'wait') s.status = 'err';
             updateTab(s);
             if (s.id === state.activeId) renderHostbar();
         };
@@ -376,7 +403,11 @@ export function createTerminalView(cfg) {
             case 'ready':
                 s.status = 'ready';
                 updateTab(s);
-                if (s.id === state.activeId) renderHostbar();
+                if (s.id === state.activeId) {
+                    renderHostbar();
+                    // 用户点「连接」之后就该能直接打字，不该再点一次终端
+                    if (!$('#view-term').hidden) s.term.focus();
+                }
                 break;
 
             case 'banner':

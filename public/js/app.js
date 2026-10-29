@@ -1,6 +1,6 @@
 /* WebSSH front-end: auth, host manager, dotted globe, multi-tab terminal. */
 
-import { $, $$, el, esc, icon, toast, api, modal, confirmModal, fmtBytes, fmtDate, timeAgo, initials, PALETTE, copyText } from './ui.js';
+import { $, $$, el, esc, icon, toast, api, modal, confirmModal, fmtBytes, fmtDate, timeAgo, initials, PALETTE, copyText, debounce } from './ui.js';
 import { COUNTRIES, CITIES, countryOf, flagOf, regionLabel, locate } from './geo.js';
 import { createGlobe } from './globe.js';
 import { createTerminalView } from './term.js';
@@ -12,12 +12,14 @@ const state = {
     setup: false,
     authed: false,
     user: null,
+    version: '',
     hosts: [],
     groups: [],
     keys: [],
     creds: [],
     snippets: [],
     filter: 'all',
+    query: '',
     settings: { fontSize: 13, record: false },
     term: null,
     globe: null,
@@ -187,9 +189,20 @@ function renderDash() {
     updateGlobePoints();
 }
 
+// 列表内容变了（搜索 / 筛选）之后，列表和页脚统计要一起刷新
+function renderList() {
+    renderHosts();
+    renderDashFoot();
+}
+
 function visibleHosts() {
-    if (state.filter === 'all') return state.hosts;
-    return state.hosts.filter((h) => (h.country || '') === state.filter);
+    const q = state.query.trim().toLowerCase();
+    return state.hosts.filter((h) => {
+        if (state.filter !== 'all' && (h.country || '') !== state.filter) return false;
+        if (!q) return true;
+        const hay = [h.name, h.host, h.username, h.group, h.city, h.note, h.port].filter(Boolean).join(' ').toLowerCase();
+        return hay.includes(q);
+    });
 }
 
 function renderFilters() {
@@ -207,7 +220,7 @@ function renderFilters() {
         btn.addEventListener('click', () => {
             state.filter = key;
             renderFilters();
-            renderHosts();
+            renderList();
         });
         box.appendChild(btn);
     };
@@ -263,6 +276,22 @@ function renderHosts() {
                 '<p>把常用的服务器存进来，之后一键就能连上。<br>凭据会用 AES-GCM 加密后保存在你自己的 R2 存储中。</p>';
             empty.appendChild(
                 el('button', { class: 'btn primary', type: 'button', html: icon('plus', 15) + ' 添加第一台主机', onclick: () => openHostEditor(null) })
+            );
+        } else if (state.query.trim()) {
+            empty.innerHTML =
+                '<h3>没有匹配的主机</h3><p>没有名称、地址、用户名或备注包含「' + esc(state.query.trim()) + '」的主机。</p>';
+            empty.appendChild(
+                el('button', {
+                    class: 'btn',
+                    type: 'button',
+                    text: '清空搜索',
+                    onclick: () => {
+                        state.query = '';
+                        const input = $('#host-search');
+                        if (input) input.value = '';
+                        renderList();
+                    },
+                })
             );
         } else {
             empty.innerHTML = '<h3>这个地区还没有主机</h3><p>换个筛选条件试试。</p>';
@@ -363,9 +392,14 @@ function hostRow(host, index) {
 function renderDashFoot() {
     const regions = new Set();
     for (const h of state.hosts) if (h.country) regions.add(h.country);
-    $('#dash-count').textContent = state.hosts.length
-        ? state.hosts.length + ' 台主机 · ' + regions.size + ' 个地区'
-        : '还没有主机';
+    const total = state.hosts.length;
+    const shown = visibleHosts().length;
+    const filtering = state.filter !== 'all' || !!state.query.trim();
+    let text;
+    if (!total) text = '还没有主机';
+    else if (filtering && shown !== total) text = shown + ' / ' + total + ' 台主机 · ' + regions.size + ' 个地区';
+    else text = total + ' 台主机 · ' + regions.size + ' 个地区';
+    $('#dash-count').textContent = text;
     const gc = $('#globe-count');
     if (gc) {
         const n = state.hosts.length;
@@ -1340,10 +1374,10 @@ function openKnown() {
 function openLogs(host) {
     const box = el('div', { class: 'list' });
     const body = el('div', { style: 'display:flex;flex-direction:column;gap:10px' }, [
-        el('p', { class: 'note-box', style: 'margin:0', text: '开启「会话录制」后，每次连接的终端输出都会存到 R2。' }),
+        el('p', { class: 'note-box', style: 'margin:0', text: '开启「会话录制」后，每次连接的终端输出都会加密存到 R2，可随时回看、复制或删除。' }),
         box,
     ]);
-    const m = modal({ title: host ? '连接记录 · ' + (host.name || host.host) : '会话日志', body, width: '640px' });
+    modal({ title: host ? '连接记录 · ' + (host.name || host.host) : '会话日志', body, width: '640px' });
 
     const show = async (entry) => {
         const text = await safe(async () => {
@@ -1367,23 +1401,45 @@ function openLogs(host) {
                         toast('已复制');
                     },
                 }),
-                el('button', { class: 'btn', type: 'button', text: '返回列表', onclick: () => m.close() }),
+                el('button', { class: 'btn', type: 'button', text: '返回列表', onclick: () => load() }),
             ])
         );
         body.appendChild(pre);
     };
 
-    (async () => {
+    const remove = async (entry) => {
+        const ok = await confirmModal(
+            '删除会话记录',
+            '确定删除 <b>' + esc((entry.user || '') + '@' + entry.host + ':' + entry.port) + '</b> 于 ' +
+                esc(fmtDate(entry.started || entry.uploaded)) + ' 的记录吗？此操作不可撤销。',
+            '删除',
+            true
+        );
+        if (!ok) return;
+        const res = await safe(() => api('/api/logs?key=' + encodeURIComponent(entry.key), { method: 'DELETE' }));
+        if (!res) return;
+        toast('记录已删除');
+        load();
+    };
+
+    async function load() {
         const res = await safe(() => api('/api/logs'));
         if (!res) return;
         let items = res.logs || [];
         if (host) items = items.filter((l) => l.host === host.host && String(l.port || 22) === String(host.port || 22));
+        body.textContent = '';
+        body.appendChild(box);
         box.textContent = '';
         if (!items.length) {
-            box.appendChild(el('div', { class: 'empty-hint', text: '还没有会话记录。' }));
+            box.appendChild(el('div', { class: 'empty-hint', text: host ? '这台主机还没有会话记录。' : '还没有会话记录。' }));
             return;
         }
         for (const it of items) {
+            const del = el('button', { class: 'act icon-only', type: 'button', title: '删除记录', html: icon('trash', 14) });
+            del.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                remove(it);
+            });
             const row = el('div', { class: 'list-row', style: 'cursor:pointer' }, [
                 el('span', { class: 'flag', text: '📄' }),
                 el('div', { class: 'grow' }, [
@@ -1391,11 +1447,14 @@ function openLogs(host) {
                     el('div', { class: 'mono', text: fmtDate(it.started || it.uploaded) + ' · ' + fmtBytes(it.size) }),
                 ]),
                 el('span', { class: 'muted-sm', text: timeAgo(it.uploaded) }),
+                del,
             ]);
             row.addEventListener('click', () => show(it));
             box.appendChild(row);
         }
-    })();
+    }
+
+    load();
 }
 
 /* --------------------------------------------------------------- settings */
@@ -1424,7 +1483,7 @@ function openSettings() {
         field('当前密码', curIn),
         field('新密码', nextIn),
         pwMsg,
-        el('div', { class: 'muted-sm', text: '账号：' + (state.user || 'admin') + ' · WebSSH v1.0.0 · 数据保存在你自己的 R2' }),
+        el('div', { class: 'muted-sm', text: '账号：' + (state.user || 'admin') + ' · WebSSH v' + (state.version || '1.0.0') + ' · 数据保存在你自己的 R2' }),
     ]);
 
     const foot = el('div', { style: 'display:flex;gap:8px;width:100%;justify-content:space-between' }, [
@@ -1597,6 +1656,39 @@ function bindStatic() {
     const refresh = $('#btn-refresh');
     if (refresh) refresh.addEventListener('click', () => loadHosts());
 
+    const searchIn = $('#host-search');
+    if (searchIn) {
+        const apply = debounce(() => {
+            state.query = searchIn.value;
+            renderList();
+        }, 140);
+        searchIn.addEventListener('input', apply);
+        searchIn.addEventListener('keydown', (ev) => {
+            if (ev.key === 'Escape' && searchIn.value) {
+                ev.stopPropagation();
+                searchIn.value = '';
+                state.query = '';
+                renderList();
+            }
+        });
+    }
+
+    // ⌘K / Ctrl+K（或直接按 /）聚焦搜索框
+    document.addEventListener('keydown', (ev) => {
+        if (!$('#view-term').hidden) return;
+        if (document.querySelector('#modal-root .modal')) return;
+        const tag = (ev.target && ev.target.tagName) || '';
+        const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(tag);
+        const mod = ev.ctrlKey || ev.metaKey;
+        const hit = (mod && ev.key.toLowerCase() === 'k') || (!mod && ev.key === '/' && !typing);
+        if (!hit) return;
+        const box = $('#host-search');
+        if (!box) return;
+        ev.preventDefault();
+        box.focus();
+        box.select();
+    });
+
     $$('.rail-item[data-nav]').forEach((btn) => {
         btn.addEventListener('click', () => {
             const nav = btn.dataset.nav;
@@ -1635,6 +1727,7 @@ async function boot() {
     state.setup = !!info.setup;
     state.authed = !!info.authed;
     state.user = info.user || '';
+    state.version = info.version || '';
     const tokenField = $('#setup-token-field');
     if (tokenField) tokenField.hidden = !info.needsSetupToken;
     if (!state.setup) showAuth('setup');

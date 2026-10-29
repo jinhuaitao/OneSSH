@@ -568,6 +568,9 @@ async function handleApi(request, env, url) {
     if (path.startsWith('/api/hosts/') && method === 'DELETE') {
         const id = path.slice('/api/hosts/'.length);
         if (!/^[a-zA-Z0-9]+$/.test(id)) return json({ error: 'bad_id', message: '无效的主机 ID' }, 400);
+        // 先确认存在再删：原来无论有没有这条记录都回 200，前端会把「删了个不存在的东西」当成功
+        const existing = await getJSON(env, 'hosts/' + id);
+        if (!existing) return json({ error: 'not_found', message: '主机不存在，可能已被删除' }, 404);
         await del(env, 'hosts/' + id);
         return json({ ok: true });
     }
@@ -654,7 +657,8 @@ async function handleApi(request, env, url) {
         // 新记录以主密钥加密落盘；旧记录仍是明文，直接原样返回
         const text = obj.meta.enc ? new TextDecoder().decode(await auth.decryptBytes(env, obj.bytes)) : new TextDecoder().decode(obj.bytes);
         return new Response(text, {
-            headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', ...SECURITY_HEADERS },
+            // 会话日志里可能粘着密码，走和页面同一套安全头（含 HTTPS 下的 HSTS）
+            headers: { 'content-type': 'text/plain; charset=utf-8', 'cache-control': 'no-store', ...securityHeaders(request) },
         });
     }
 

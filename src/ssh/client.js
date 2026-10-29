@@ -108,6 +108,7 @@ export class SSHClient {
         this.macInLen = 0;
         this.sendChain = Promise.resolve();
         this.drainChain = Promise.resolve();
+        this.flowChain = Promise.resolve();
         this.closed = false;
         this.kexInitSent = false;
         this.sessionId = null;
@@ -881,7 +882,22 @@ export class SSHClient {
 
     write(data) {
         if (!this.ready || this.closed) return;
-        this.writeChannel(this.shell, data);
+        const u8 = typeof data === 'string' ? new TextEncoder().encode(data) : data;
+        if (!u8.length) return;
+        // 小块（按键、短命令）走「发了就不管」的快路径，不额外等一次微任务。
+        if (u8.length <= 16384) {
+            this.writeChannel(this.shell, u8);
+            return;
+        }
+        // 大块（粘贴、cat 大文件）必须等对端窗口：writeChannel 会把整段数据一次性
+        // 塞进管道并同步扣减 ch.window，超过剩余窗口时 OpenSSH 直接判
+        // "channel window exceeded" 断开整条连接 —— 表现就是「一粘贴就掉线」。
+        // 同时用一条链串行化，避免两个并发大写入各自看到足够的窗口、一起把额度透支。
+        const run = () => this.writeChannelFlow(this.shell, u8);
+        this.flowChain = this.flowChain.then(run, run).catch((e) => {
+            // 通道已经正常关闭时不必再判连接失败，否则用户按 Ctrl+D 退出后会被报错
+            if (!this.closed && this.shell && !this.shell.closed) this._fail(e);
+        });
     }
 
     resize(cols, rows) {
