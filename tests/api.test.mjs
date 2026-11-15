@@ -213,6 +213,18 @@ test('安全响应头齐备', async () => {
     assert.equal(api.headers.get('cache-control'), 'no-store');
 });
 
+test('首页骨架带「返回终端」入口，且无会话时默认隐藏', async () => {
+    const env = makeEnv({ __worker: worker });
+    const page = await call(env, '/');
+    assert.equal(page.status, 200);
+    const html = page.text;
+    assert.ok(html.includes('id="nav-terminal"'), '缺少返回终端按钮');
+    assert.ok(html.includes('data-nav="terminal"'), '按钮未接入 rail 导航');
+    // 初次进入仪表盘还没有会话，按钮必须默认藏着，显隐交给 showDash() 管
+    assert.ok(/id="nav-terminal"\s+hidden/.test(html), '无会话时按钮应默认隐藏');
+    assert.ok(html.includes('返回终端'));
+});
+
 /* ------------------------------------------------------------------- 主机 */
 
 test('主机 CRUD：密文不外泄、更新时保留旧凭据', async () => {

@@ -67,6 +67,10 @@ function showDash() {
     setNav('overview');
     renderDash();
     ensureGlobe();
+    // 有存活会话时给一个「回到终端」的出口：showTerm() 只切视图，不动任何连接。
+    // 关掉最后一个会话会走 onEmpty → showDash()，这里自然把按钮藏回去。
+    const backBtn = $('#nav-terminal');
+    if (backBtn) backBtn.hidden = !(state.term && state.term.sessions().length);
 }
 
 function showTerm() {
@@ -1680,6 +1684,14 @@ function bindStatic() {
         const tag = (ev.target && ev.target.tagName) || '';
         const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(tag);
         const mod = ev.ctrlKey || ev.metaKey;
+        // Alt+T：有存活会话时直接回到终端页。⌘K 已被搜索占用，Ctrl+Shift+T 会被浏览器
+        // 抢去「恢复关闭的标签页」；macOS 的 Option+T 产生的是 †，所以用 code 认物理按键。
+        const isT = ev.code === 'KeyT' || (ev.key || '').toLowerCase() === 't';
+        if (!mod && ev.altKey && isT && !typing && state.term && state.term.sessions().length) {
+            ev.preventDefault();
+            showTerm();
+            return;
+        }
         const hit = (mod && ev.key.toLowerCase() === 'k') || (!mod && ev.key === '/' && !typing);
         if (!hit) return;
         const box = $('#host-search');
@@ -1695,6 +1707,10 @@ function bindStatic() {
             if (nav === 'overview') {
                 setNav('overview');
                 showDash();
+            } else if (nav === 'terminal') {
+                // 直接切回已有的终端页，不新建会话（区别于点主机行）
+                if (state.term && state.term.sessions().length) showTerm();
+                else toast('当前没有打开的会话', 'err');
             } else if (nav === 'groups') openGroups();
             else if (nav === 'snippets') openSnippets(state.term && !$('#view-term').hidden ? (cmd) => state.term.sendToActive(cmd) : null);
             else if (nav === 'quick') openQuickConnect();

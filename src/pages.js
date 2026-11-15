@@ -106,6 +106,7 @@ export function renderShell() {
     <div class="rail-brand">${icon('terminal', 20)}</div>
     <nav class="rail-nav">
       <button class="rail-item on" data-nav="overview">${icon('home')}<span>总览</span></button>
+      <button class="rail-item" data-nav="terminal" id="nav-terminal" hidden title="回到已打开的终端会话（Alt+T）">${icon('terminal')}<span>返回终端</span></button>
       <button class="rail-item" data-nav="groups">${icon('folder')}<span>分组</span></button>
       <button class="rail-item" data-nav="snippets">${icon('code')}<span>代码片段</span></button>
       <button class="rail-item" data-nav="quick">${icon('bolt')}<span>快速连接</span></button>
