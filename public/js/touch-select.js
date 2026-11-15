@@ -21,10 +21,7 @@ export function shouldBlockPullToRefresh(dy, scrollTop) {
  *    不必等长按阈值（这正是触屏上最自然的选字动作）；
  *  - 位移都在容差内 → 静止够久就开始长按选择，否则继续等。
  */
-export function gestureIntent(dx, dy, elapsedMs, tolerance, force) {
-    // force = 用户主动打开了「选择」模式：按下即选，完全不等长按、也不跟
-    // 浏览器的系统长按手势竞争，所以按在「字上」和空白处效果一致。
-    if (force) return 'select';
+export function gestureIntent(dx, dy, elapsedMs, tolerance) {
     const tol = Number(tolerance) || MOVE_TOLERANCE;
     const ax = Math.abs(dx);
     const ay = Math.abs(dy);

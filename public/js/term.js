@@ -59,7 +59,6 @@ const SHORTCUTS = [
     ['Alt + 数字', '切换到第 N 个标签'],
     ['Ctrl + Shift + W', '关闭当前会话'],
     ['触屏长按 + 拖动', '选择文本并复制'],
-    ['点「选择」后拖动', '触屏选字，不用长按'],
 ];
 
 export function createTerminalView(cfg) {
@@ -351,7 +350,6 @@ export function createTerminalView(cfg) {
     let suppressMouseUntil = 0;// 抑制浏览器合成的鼠标事件，免得 xterm 重开鼠标选择清掉选区
     let lastTouchAt = 0;       // 兜底：系统 contextmenu 可能早于长按阈值派发
     let selBar = null;         // 「复制 / 全选 / 取消」浮动条，挂在 .term-body 上
-    let selectMode = false;    // 显式「选择」模式：按下即选，不等长按、不跟系统手势竞争
 
     function ensureSelBar() {
         if (selBar) return selBar;
@@ -373,7 +371,7 @@ export function createTerminalView(cfg) {
                 s.term.selectAll();
                 toast('已全选当前缓冲区，点「复制」即可');
             }),
-            mk('取消', '', () => setSelectMode(false)),
+            mk('取消', '', clearTouchSelection),
         ]);
         body.appendChild(selBar);
         return selBar;
@@ -408,7 +406,7 @@ export function createTerminalView(cfg) {
         try {
             await copyText(text);
             toast('已复制 ' + text.length + ' 个字符');
-            setSelectMode(false); // 复制完回到正常输入状态，避免之后每次触摸都在选字
+            clearTouchSelection();
         } catch (e) {
             toast('复制失败：' + String((e && e.message) || e), 'err');
         }
@@ -426,14 +424,6 @@ export function createTerminalView(cfg) {
         if (suppressUntil > Date.now() + 1000) suppressUntil = Date.now() + 500;
         if (suppressMouseUntil > Date.now() + 1000) suppressMouseUntil = Date.now() + 500;
         hideSelBar();
-    }
-
-    function setSelectMode(on) {
-        selectMode = !!on;
-        const btn = $('#btn-select');
-        if (btn) btn.classList.toggle('on', selectMode);
-        if (!selectMode) clearTouchSelection();
-        return selectMode;
     }
 
     function screenRect(s) {
@@ -566,21 +556,11 @@ export function createTerminalView(cfg) {
                 };
                 touchSel = sel;
                 suppressMouseUntil = 0;
-                if (selectMode) {
-                    // 显式模式：在 touchstart 就接管，浏览器来不及弹系统长按菜单，
-                    // xterm 也收不到手势（不会 focus / 滚动 / 重开鼠标选择）。
-                    // 按在「字上」和按在空白处走的是完全同一条路径。
-                    ev.preventDefault();
-                    ev.stopPropagation();
+                sel.timer = setTimeout(() => {
+                    if (touchSel !== sel || sel.active) return;
                     beginTouchSelection(sel);
                     suppressMouseUntil = Date.now() + 10000;
-                } else {
-                    sel.timer = setTimeout(() => {
-                        if (touchSel !== sel || sel.active) return;
-                        beginTouchSelection(sel);
-                        suppressMouseUntil = Date.now() + 10000;
-                    }, LONG_PRESS_MS);
-                }
+                }, LONG_PRESS_MS);
             },
             opts
         );
@@ -602,7 +582,7 @@ export function createTerminalView(cfg) {
                 }
                 const dx = t.clientX - sel.x0;
                 const dy = t.clientY - sel.y0;
-                const intent = gestureIntent(dx, dy, Date.now() - sel.t0, MOVE_TOLERANCE, selectMode);
+                const intent = gestureIntent(dx, dy, Date.now() - sel.t0, MOVE_TOLERANCE);
                 if (intent === 'scroll') {
                     // 垂直滚动是 xterm 的活儿，别抢手势
                     if (sel.timer) clearTimeout(sel.timer);
@@ -1195,17 +1175,6 @@ export function createTerminalView(cfg) {
         bindTouchSelection();
         // 防止上下翻历史时带出浏览器的下拉刷新
         bindOverscrollGuard();
-
-        // 「选择」开关：触屏上按在字里也能可靠选中的显式入口，不依赖长按手势
-        const selBtn = $('#btn-select');
-        if (selBtn) {
-            const canTouch = 'ontouchstart' in window || navigator.maxTouchPoints > 0;
-            selBtn.hidden = !canTouch; // 桌面端 xterm 自带鼠标选择，不用这个开关
-            selBtn.addEventListener('click', () => {
-                const enabled = setSelectMode(!selectMode);
-                toast(enabled ? '选择模式：在文字上按下并拖动，松开后点「复制」' : '已退出选择模式');
-            });
-        }
 
         const on = (sel, ev, fn) => {
             const node = $(sel);

@@ -73,12 +73,6 @@ test('gestureIntent：静止够久才长按，轻微抖动继续等', () => {
     assert.equal(gestureIntent(0, 0, LONG_PRESS_MS, MOVE_TOLERANCE), 'select');
 });
 
-test('gestureIntent：显式「选择」模式按下即进入，不受手势/位置影响', () => {
-    assert.equal(gestureIntent(0, 0, 0, MOVE_TOLERANCE, true), 'select');
-    assert.equal(gestureIntent(2, 40, 100, MOVE_TOLERANCE, true), 'select');
-    assert.equal(gestureIntent(0, 0, 0, MOVE_TOLERANCE, false), 'wait');
-});
-
 test('长按阈值与移动容差在可用区间', () => {
     assert.ok(LONG_PRESS_MS >= 300 && LONG_PRESS_MS <= 800);
     assert.ok(MOVE_TOLERANCE > 0 && MOVE_TOLERANCE <= 20);
