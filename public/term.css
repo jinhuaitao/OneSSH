@@ -314,6 +314,13 @@
     -webkit-user-select: none;
     user-select: none;
 }
+/* -webkit-touch-callout 不是继承属性：canvas 与 xterm 的 helper textarea
+   必须单独压住，否则按在「字上」时系统会接管手势并 cancel 掉整段触摸序列。 */
+.pane * {
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
+}
 .pane.on {
     display: block;
 }

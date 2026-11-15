@@ -1,7 +1,7 @@
 /* Terminal view: tabs, panes, websocket sessions, live host metrics, key bar. */
 
 import { $, el, icon, toast, modal, confirmModal, fmtBytes, fmtRate, fmtUptime, copyText } from './ui.js';
-import { LONG_PRESS_MS, MOVE_TOLERANCE, cellAt, selectionRange } from './touch-select.js';
+import { LONG_PRESS_MS, MOVE_TOLERANCE, gestureIntent, cellAt, selectionRange } from './touch-select.js';
 
 const THEME = {
     background: '#070910',
@@ -347,6 +347,7 @@ export function createTerminalView(cfg) {
     // 这里只用它公开的 select(col,row,length) / getSelection()，不碰内部私有字段。
     let touchSel = null;       // 当前触摸 { s, id, x0, y0, x, y, start, end, active, timer }
     let suppressUntil = 0;     // 长按期间抑制 contextmenu（移动端长按会派发它）
+    let suppressMouseUntil = 0;// 抑制浏览器合成的鼠标事件，免得 xterm 重开鼠标选择清掉选区
     let lastTouchAt = 0;       // 兜底：系统 contextmenu 可能早于长按阈值派发
     let selBar = null;         // 「复制 / 全选 / 取消」浮动条，挂在 .term-body 上
 
@@ -419,8 +420,9 @@ export function createTerminalView(cfg) {
             } catch (_) {}
         }
         touchSel = null;
-        // 长按中途取消时别让抑制窗口残留太久
+        // 长按中途取消时别让两个抑制窗口残留太久
         if (suppressUntil > Date.now() + 1000) suppressUntil = Date.now() + 500;
+        if (suppressMouseUntil > Date.now() + 1000) suppressMouseUntil = Date.now() + 500;
         hideSelBar();
     }
 
@@ -461,7 +463,7 @@ export function createTerminalView(cfg) {
         applyTouchSelection(sel);
     }
 
-    function endTouchSelection(sel, cancelled) {
+    function endTouchSelection(sel) {
         if (sel.timer) clearTimeout(sel.timer);
         sel.timer = null;
         if (!sel.active) {
@@ -470,10 +472,6 @@ export function createTerminalView(cfg) {
         }
         sel.active = false;
         suppressUntil = Date.now() + 900;
-        if (cancelled) {
-            clearTouchSelection();
-            return;
-        }
         try {
             if (sel.s.term.hasSelection()) showSelBar(sel.x, sel.y);
             else clearTouchSelection();
@@ -482,13 +480,31 @@ export function createTerminalView(cfg) {
         }
     }
 
-    function bindTouchSelection(s, pane) {
-        // 移动端长按会派发 contextmenu：在捕获阶段拦掉，否则会触发「右键粘贴」
+    function bindTouchSelection() {
+        // 挂到整个终端页的捕获阶段：xterm 把触摸监听装在 canvas / helper textarea 上，
+        // 还会 cancel(e) 掐断传播；只有在最外层捕获，按在「字上」和按在空白处才一视同仁。
+        const view = $('#view-term');
+        if (!view) return;
+
+        const hitSession = (ev) => {
+            // 浮动条自己的点击不参与选择手势
+            if (selBar && ev.target && selBar.contains(ev.target)) return null;
+            const s = active();
+            if (!s || !s.pane || view.hidden) return null;
+            const t = ev.touches && ev.touches[0];
+            const x = t ? t.clientX : ev.clientX;
+            const y = t ? t.clientY : ev.clientY;
+            const r = s.pane.getBoundingClientRect();
+            if (x < r.left || x > r.right || y < r.top || y > r.bottom) return null;
+            return s;
+        };
+
+        // 移动端长按会派发 contextmenu：捕获阶段拦掉，否则会触发「右键粘贴」
         // 与多行确认弹窗，xterm 自己的 rightClickHandler 也会插一脚。
-        pane.addEventListener(
+        view.addEventListener(
             'contextmenu',
             (ev) => {
-                if (Date.now() < suppressUntil) {
+                if (Date.now() < suppressUntil && hitSession(ev)) {
                     ev.preventDefault();
                     ev.stopPropagation();
                 }
@@ -496,13 +512,28 @@ export function createTerminalView(cfg) {
             true
         );
 
-        // xterm 在 .xterm-screen 上用 passive:false 的 touchmove 做滚动，还会
-        // cancel(e) 掐断冒泡 —— 所以必须挂捕获阶段才收得到触摸事件。
+        // 选择模式期间浏览器还会合成 mousedown / mouseup / click；xterm 的 mousedown
+        // 会 focus() 并让 SelectionService 重开一次鼠标选择，把刚画好的选区清掉。
+        const blockMouse = (ev) => {
+            if (Date.now() >= suppressMouseUntil) return;
+            if (selBar && ev.target && selBar.contains(ev.target)) return; // 复制条照常可点
+            if (!hitSession(ev)) return;
+            ev.preventDefault();
+            ev.stopPropagation();
+        };
+        // 只兜底 mousedown / mouseup（xterm 在这两个上重开鼠标选择）；
+        // 不拦 click，避免影响按钮与正常点击聚焦。
+        for (const type of ['mousedown', 'mouseup']) view.addEventListener(type, blockMouse, true);
+
+        // xterm 的 touchmove 会 stopPropagation，且它用 JS 直接改 scrollTop 滚动，
+        // 所以选择模式一旦激活，后续触摸必须在这里（捕获阶段）全部拦下。
         const opts = { passive: false, capture: true };
 
-        pane.addEventListener(
+        view.addEventListener(
             'touchstart',
             (ev) => {
+                const s = hitSession(ev);
+                if (!s) return;
                 if (ev.touches.length !== 1) {
                     clearTouchSelection();
                     return;
@@ -517,52 +548,77 @@ export function createTerminalView(cfg) {
                     y0: t.clientY,
                     x: t.clientX,
                     y: t.clientY,
+                    t0: Date.now(),
                     start: null,
                     end: null,
                     active: false,
                     timer: null,
                 };
                 touchSel = sel;
-                sel.timer = setTimeout(() => beginTouchSelection(sel), LONG_PRESS_MS);
+                suppressMouseUntil = 0;
+                sel.timer = setTimeout(() => {
+                    if (touchSel !== sel || sel.active) return;
+                    beginTouchSelection(sel);
+                    suppressMouseUntil = Date.now() + 10000;
+                }, LONG_PRESS_MS);
             },
             opts
         );
 
-        pane.addEventListener(
+        view.addEventListener(
             'touchmove',
             (ev) => {
                 const sel = touchSel;
-                if (!sel || sel.s !== s) return;
+                if (!sel) return;
                 const t = Array.from(ev.touches).find((p) => p.identifier === sel.id);
                 if (!t) return;
                 sel.x = t.clientX;
                 sel.y = t.clientY;
-                if (!sel.active) {
-                    // 手指先动了：这是滚动，不是长按，撤掉定时器，其余交给 xterm
-                    if (Math.abs(t.clientX - sel.x0) > MOVE_TOLERANCE || Math.abs(t.clientY - sel.y0) > MOVE_TOLERANCE) {
-                        if (sel.timer) clearTimeout(sel.timer);
-                        touchSel = null;
-                    }
+                if (sel.active) {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    updateTouchSelection(sel, t.clientX, t.clientY);
                     return;
                 }
-                ev.preventDefault();
-                ev.stopPropagation();
-                updateTouchSelection(sel, t.clientX, t.clientY);
+                const dx = t.clientX - sel.x0;
+                const dy = t.clientY - sel.y0;
+                const intent = gestureIntent(dx, dy, Date.now() - sel.t0, MOVE_TOLERANCE);
+                if (intent === 'scroll') {
+                    // 垂直滚动是 xterm 的活儿，别抢手势
+                    if (sel.timer) clearTimeout(sel.timer);
+                    touchSel = null;
+                    return;
+                }
+                if (intent === 'select') {
+                    // 「按在字 A 上 → 横向拖到字 B」：不用等长按，立刻进选择模式。
+                    // 起点就是按下的那个字，终点是当前手指下的字。
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    if (sel.timer) clearTimeout(sel.timer);
+                    sel.timer = null;
+                    beginTouchSelection(sel);
+                    suppressMouseUntil = Date.now() + 10000;
+                    updateTouchSelection(sel, t.clientX, t.clientY);
+                }
             },
             opts
         );
 
-        const finish = (ev, cancelled) => {
+        const finish = (ev) => {
             const sel = touchSel;
-            if (!sel || sel.s !== s) return;
+            if (!sel) return;
             if (sel.active) {
                 ev.preventDefault();
                 ev.stopPropagation();
+                // 只有真正进入过选择模式才开抑制窗口，普通点击/滚动不受影响
+                suppressMouseUntil = Date.now() + 300;
             }
-            endTouchSelection(sel, cancelled);
+            // 系统手势（放大镜 / callout）可能派发 touchcancel：选区已经画出来了，
+            // 别把它丢掉，照样给复制条。
+            endTouchSelection(sel);
         };
-        pane.addEventListener('touchend', (ev) => finish(ev, false), opts);
-        pane.addEventListener('touchcancel', (ev) => finish(ev, true), opts);
+        view.addEventListener('touchend', finish, opts);
+        view.addEventListener('touchcancel', finish, opts);
     }
 
     /* ------------------------------------------------------------ session */
@@ -931,9 +987,6 @@ export function createTerminalView(cfg) {
         term.onData((data) => sendInput(s, data));
         term.onResize(({ cols, rows }) => send(s, { t: 'resize', cols, rows }));
 
-        // 触屏长按选择（含移动端 contextmenu 抑制），桌面右键行为不受影响
-        bindTouchSelection(s, pane);
-
         // right click pastes (keeps the muscle memory of desktop terminals)
         pane.addEventListener('contextmenu', async (ev) => {
             ev.preventDefault();
@@ -1076,6 +1129,8 @@ export function createTerminalView(cfg) {
         buildKeys();
         renderTabs();
         renderHostbar();
+        // 只绑一次，挂在 #view-term 捕获阶段，覆盖所有会话的 pane
+        bindTouchSelection();
 
         const on = (sel, ev, fn) => {
             const node = $(sel);

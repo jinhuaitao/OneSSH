@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LONG_PRESS_MS, MOVE_TOLERANCE, cellAt, selectionRange } from '../public/js/touch-select.js';
+import { LONG_PRESS_MS, MOVE_TOLERANCE, gestureIntent, cellAt, selectionRange } from '../public/js/touch-select.js';
 
 const rect = { left: 12, top: 8, width: 800, height: 400 };
 
@@ -39,6 +39,30 @@ test('selectionRange：滚动过 scrollback 时叠加 viewportY', () => {
     // 视口第 3 行 = 缓冲区第 123 行（viewportY=120）
     assert.deepEqual(selectionRange(80, { col: 2, row: 3 }, { col: 7, row: 3 }, 120), { col: 2, row: 123, length: 6 });
     assert.deepEqual(selectionRange(80, { col: 70, row: 2 }, { col: 5, row: 3 }, 120), { col: 70, row: 122, length: 16 });
+});
+
+test('gestureIntent：按在一个字上横向拖到另一个字，立即进入选择', () => {
+    // 不必等 420ms 的长按阈值，起点是按下那个字、终点是手指下的字
+    assert.equal(gestureIntent(30, 0, 120, MOVE_TOLERANCE), 'select');
+    assert.equal(gestureIntent(-40, 2, 90, MOVE_TOLERANCE), 'select');
+    assert.equal(gestureIntent(120, 6, 80, MOVE_TOLERANCE), 'select');
+});
+
+test('gestureIntent：垂直滑动让给 xterm 滚 scrollback', () => {
+    assert.equal(gestureIntent(2, 40, 100, MOVE_TOLERANCE), 'scroll');
+    assert.equal(gestureIntent(0, 25, 100, MOVE_TOLERANCE), 'scroll');
+    assert.equal(gestureIntent(100, 100, 100, MOVE_TOLERANCE), 'scroll');
+});
+
+test('gestureIntent：斜向跨行拖动仍算选字，不算滚动', () => {
+    assert.equal(gestureIntent(30, 30, 100, MOVE_TOLERANCE), 'select');
+    assert.equal(gestureIntent(60, 30, 100, MOVE_TOLERANCE), 'select');
+});
+
+test('gestureIntent：静止够久才长按，轻微抖动继续等', () => {
+    assert.equal(gestureIntent(0, 0, 100, MOVE_TOLERANCE), 'wait');
+    assert.equal(gestureIntent(4, 3, 100, MOVE_TOLERANCE), 'wait');
+    assert.equal(gestureIntent(0, 0, LONG_PRESS_MS, MOVE_TOLERANCE), 'select');
 });
 
 test('长按阈值与移动容差在可用区间', () => {

@@ -1,7 +1,28 @@
 /* Touch long-press selection: pure geometry helpers (no DOM, unit-testable in Node). */
 
-export const LONG_PRESS_MS = 480;
-export const MOVE_TOLERANCE = 10;
+export const LONG_PRESS_MS = 420;
+export const MOVE_TOLERANCE = 16;
+
+/**
+ * 判定一次触摸是「滚动」还是「选字」。纯函数，方便单测。
+ *
+ * 终端只有垂直滚动（xterm 的 handleTouchMove 只看 pageY 差值），所以：
+ *  - 垂直位移为主且超容差 → 滚 scrollback，别抢手势；
+ *  - 水平位移为主且已有明显位移 → 用户正从一个字拖到另一个字，立刻进选择模式，
+ *    不必等长按阈值（这正是触屏上最自然的选字动作）；
+ *  - 位移都在容差内 → 静止够久就开始长按选择，否则继续等。
+ */
+export function gestureIntent(dx, dy, elapsedMs, tolerance) {
+    const tol = Number(tolerance) || MOVE_TOLERANCE;
+    const ax = Math.abs(dx);
+    const ay = Math.abs(dy);
+    // 垂直明显占主导 → 滚 scrollback
+    if (ay > tol && ay > ax * 1.2) return 'scroll';
+    // 水平占主导（含跨行的斜向拖动，最多约三行）→ 从字 A 选到字 B
+    if (ax > 8 && ax >= ay * 0.8 && ay <= tol * 3) return 'select';
+    if (ax > tol || ay > tol) return 'scroll';
+    return elapsedMs >= LONG_PRESS_MS ? 'select' : 'wait';
+}
 
 /** 把触点换算成终端字符坐标。rect 取 .xterm-screen 的 getBoundingClientRect()。 */
 export function cellAt(rect, cols, rows, clientX, clientY) {
