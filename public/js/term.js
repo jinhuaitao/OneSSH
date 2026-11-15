@@ -1,6 +1,7 @@
 /* Terminal view: tabs, panes, websocket sessions, live host metrics, key bar. */
 
 import { $, el, icon, toast, modal, confirmModal, fmtBytes, fmtRate, fmtUptime, copyText } from './ui.js';
+import { LONG_PRESS_MS, MOVE_TOLERANCE, cellAt, selectionRange } from './touch-select.js';
 
 const THEME = {
     background: '#070910',
@@ -57,6 +58,7 @@ const SHORTCUTS = [
     ['Ctrl + Shift + R', '重新连接当前会话'],
     ['Alt + 数字', '切换到第 N 个标签'],
     ['Ctrl + Shift + W', '关闭当前会话'],
+    ['触屏长按 + 拖动', '选择文本并复制'],
 ];
 
 export function createTerminalView(cfg) {
@@ -337,6 +339,230 @@ export function createTerminalView(cfg) {
             }
         }
         ui.rtt.innerHTML = s.rtt == null ? '<span class="dim">—</span>' : s.rtt + ' ms';
+    }
+
+    /* ------------------------------------------------- touch selection */
+
+    // 触屏长按选择：xterm 是 canvas 渲染，禁用了原生文本选择，也没有触摸拖动选区。
+    // 这里只用它公开的 select(col,row,length) / getSelection()，不碰内部私有字段。
+    let touchSel = null;       // 当前触摸 { s, id, x0, y0, x, y, start, end, active, timer }
+    let suppressUntil = 0;     // 长按期间抑制 contextmenu（移动端长按会派发它）
+    let lastTouchAt = 0;       // 兜底：系统 contextmenu 可能早于长按阈值派发
+    let selBar = null;         // 「复制 / 全选 / 取消」浮动条，挂在 .term-body 上
+
+    function ensureSelBar() {
+        if (selBar) return selBar;
+        const body = $('.term-body');
+        if (!body) return null;
+        const mk = (label, cls, fn) => {
+            const b = el('button', { type: 'button', class: cls || '', text: label });
+            b.addEventListener('click', (ev) => {
+                ev.stopPropagation();
+                fn();
+            });
+            return b;
+        };
+        selBar = el('div', { class: 'sel-bar' }, [
+            mk('复制', 'primary', copySelection),
+            mk('全选', '', () => {
+                const s = touchSel && touchSel.s;
+                if (!s) return;
+                s.term.selectAll();
+                toast('已全选当前缓冲区，点「复制」即可');
+            }),
+            mk('取消', '', clearTouchSelection),
+        ]);
+        body.appendChild(selBar);
+        return selBar;
+    }
+
+    function showSelBar(clientX, clientY) {
+        const bar = ensureSelBar();
+        const body = $('.term-body');
+        if (!bar || !body) return;
+        const box = body.getBoundingClientRect();
+        bar.classList.add('on');
+        const w = bar.offsetWidth || 210;
+        const h = bar.offsetHeight || 40;
+        const left = Math.max(8, Math.min(box.width - w - 8, clientX - box.left - w / 2));
+        const top = Math.max(8, Math.min(box.height - h - 8, clientY - box.top - h - 14));
+        bar.style.left = left + 'px';
+        bar.style.top = top + 'px';
+    }
+
+    function hideSelBar() {
+        if (selBar) selBar.classList.remove('on');
+    }
+
+    async function copySelection() {
+        const s = touchSel && touchSel.s;
+        if (!s) return;
+        const text = s.term.getSelection();
+        if (!text) {
+            toast('没有选中内容', 'err');
+            return;
+        }
+        try {
+            await copyText(text);
+            toast('已复制 ' + text.length + ' 个字符');
+            clearTouchSelection();
+        } catch (e) {
+            toast('复制失败：' + String((e && e.message) || e), 'err');
+        }
+    }
+
+    function clearTouchSelection() {
+        if (touchSel && touchSel.s) {
+            if (touchSel.timer) clearTimeout(touchSel.timer);
+            try {
+                touchSel.s.term.clearSelection();
+            } catch (_) {}
+        }
+        touchSel = null;
+        // 长按中途取消时别让抑制窗口残留太久
+        if (suppressUntil > Date.now() + 1000) suppressUntil = Date.now() + 500;
+        hideSelBar();
+    }
+
+    function screenRect(s) {
+        const node = s.term.element && s.term.element.querySelector('.xterm-screen');
+        return (node || s.pane).getBoundingClientRect();
+    }
+
+    function applyTouchSelection(sel) {
+        const s = sel.s;
+        if (!sel.start || !sel.end) return;
+        const buf = s.term.buffer && s.term.buffer.active;
+        const offset = buf && Number.isFinite(buf.viewportY) ? buf.viewportY : 0;
+        const r = selectionRange(s.term.cols, sel.start, sel.end, offset);
+        try {
+            s.term.select(r.col, r.row, r.length);
+        } catch (_) {}
+    }
+
+    function beginTouchSelection(sel) {
+        const s = sel.s;
+        if (!s || !s.term || touchSel !== sel) return;
+        sel.active = true;
+        // 覆盖整个选择过程；松开后由 endTouchSelection 收窄到 900ms
+        suppressUntil = Date.now() + 10000;
+        try {
+            s.term.blur(); // 收起软键盘，别挡住选区
+        } catch (_) {}
+        const rect = screenRect(s);
+        sel.start = cellAt(rect, s.term.cols, s.term.rows, sel.x0, sel.y0);
+        sel.end = sel.start;
+        applyTouchSelection(sel);
+    }
+
+    function updateTouchSelection(sel, x, y) {
+        const rect = screenRect(sel.s);
+        sel.end = cellAt(rect, sel.s.term.cols, sel.s.term.rows, x, y);
+        applyTouchSelection(sel);
+    }
+
+    function endTouchSelection(sel, cancelled) {
+        if (sel.timer) clearTimeout(sel.timer);
+        sel.timer = null;
+        if (!sel.active) {
+            touchSel = null;
+            return;
+        }
+        sel.active = false;
+        suppressUntil = Date.now() + 900;
+        if (cancelled) {
+            clearTouchSelection();
+            return;
+        }
+        try {
+            if (sel.s.term.hasSelection()) showSelBar(sel.x, sel.y);
+            else clearTouchSelection();
+        } catch (_) {
+            clearTouchSelection();
+        }
+    }
+
+    function bindTouchSelection(s, pane) {
+        // 移动端长按会派发 contextmenu：在捕获阶段拦掉，否则会触发「右键粘贴」
+        // 与多行确认弹窗，xterm 自己的 rightClickHandler 也会插一脚。
+        pane.addEventListener(
+            'contextmenu',
+            (ev) => {
+                if (Date.now() < suppressUntil) {
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                }
+            },
+            true
+        );
+
+        // xterm 在 .xterm-screen 上用 passive:false 的 touchmove 做滚动，还会
+        // cancel(e) 掐断冒泡 —— 所以必须挂捕获阶段才收得到触摸事件。
+        const opts = { passive: false, capture: true };
+
+        pane.addEventListener(
+            'touchstart',
+            (ev) => {
+                if (ev.touches.length !== 1) {
+                    clearTouchSelection();
+                    return;
+                }
+                const t = ev.touches[0];
+                lastTouchAt = Date.now();
+                clearTouchSelection(); // 任何新触摸先清掉上一次选区
+                const sel = {
+                    s,
+                    id: t.identifier,
+                    x0: t.clientX,
+                    y0: t.clientY,
+                    x: t.clientX,
+                    y: t.clientY,
+                    start: null,
+                    end: null,
+                    active: false,
+                    timer: null,
+                };
+                touchSel = sel;
+                sel.timer = setTimeout(() => beginTouchSelection(sel), LONG_PRESS_MS);
+            },
+            opts
+        );
+
+        pane.addEventListener(
+            'touchmove',
+            (ev) => {
+                const sel = touchSel;
+                if (!sel || sel.s !== s) return;
+                const t = Array.from(ev.touches).find((p) => p.identifier === sel.id);
+                if (!t) return;
+                sel.x = t.clientX;
+                sel.y = t.clientY;
+                if (!sel.active) {
+                    // 手指先动了：这是滚动，不是长按，撤掉定时器，其余交给 xterm
+                    if (Math.abs(t.clientX - sel.x0) > MOVE_TOLERANCE || Math.abs(t.clientY - sel.y0) > MOVE_TOLERANCE) {
+                        if (sel.timer) clearTimeout(sel.timer);
+                        touchSel = null;
+                    }
+                    return;
+                }
+                ev.preventDefault();
+                ev.stopPropagation();
+                updateTouchSelection(sel, t.clientX, t.clientY);
+            },
+            opts
+        );
+
+        const finish = (ev, cancelled) => {
+            const sel = touchSel;
+            if (!sel || sel.s !== s) return;
+            if (sel.active) {
+                ev.preventDefault();
+                ev.stopPropagation();
+            }
+            endTouchSelection(sel, cancelled);
+        };
+        pane.addEventListener('touchend', (ev) => finish(ev, false), opts);
+        pane.addEventListener('touchcancel', (ev) => finish(ev, true), opts);
     }
 
     /* ------------------------------------------------------------ session */
@@ -705,9 +931,15 @@ export function createTerminalView(cfg) {
         term.onData((data) => sendInput(s, data));
         term.onResize(({ cols, rows }) => send(s, { t: 'resize', cols, rows }));
 
+        // 触屏长按选择（含移动端 contextmenu 抑制），桌面右键行为不受影响
+        bindTouchSelection(s, pane);
+
         // right click pastes (keeps the muscle memory of desktop terminals)
         pane.addEventListener('contextmenu', async (ev) => {
             ev.preventDefault();
+            // 触屏长按派发的 contextmenu 是「选择」手势，不是桌面右键粘贴；
+            // 捕获阶段的抑制没盖住时，这里再兜一次底。
+            if (Date.now() - lastTouchAt < 1500 || Date.now() < suppressUntil) return;
             try {
                 const text = await navigator.clipboard.readText();
                 await pasteInto(s, text);
@@ -724,6 +956,8 @@ export function createTerminalView(cfg) {
     function setActive(id, silent) {
         const s = state.sessions.find((x) => x.id === id);
         if (!s) return;
+        // 切到别的标签时收起上一个会话的选区与浮动条
+        if (touchSel && touchSel.s && touchSel.s.id !== id) clearTouchSelection();
         state.activeId = id;
         for (const other of state.sessions) {
             other.pane.classList.toggle('on', other.id === id);
@@ -746,6 +980,7 @@ export function createTerminalView(cfg) {
         const idx = state.sessions.findIndex((s) => s.id === id);
         if (idx < 0) return;
         const s = state.sessions[idx];
+        if (touchSel && touchSel.s === s) clearTouchSelection();
         failSftp(s, '会话已关闭');
         try {
             if (s.ws && s.ws.readyState === 1) s.ws.send(JSON.stringify({ t: 'close' }));

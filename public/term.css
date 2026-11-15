@@ -309,6 +309,10 @@
     inset: 0;
     display: none;
     padding: 8px 4px 0 12px;
+    /* 长按交给自定义选区，别让 iOS 弹出系统「选择 / 拷贝」菜单 */
+    -webkit-touch-callout: none;
+    -webkit-user-select: none;
+    user-select: none;
 }
 .pane.on {
     display: block;
@@ -328,6 +332,40 @@
 }
 .pane .xterm-viewport::-webkit-scrollbar-thumb:hover {
     background: #2b3644;
+}
+
+/* --------------------------------------------- mobile long-press selection */
+.sel-bar {
+    position: absolute;
+    z-index: 20;
+    display: none;
+    align-items: center;
+    gap: 4px;
+    padding: 5px;
+    border: 1px solid #2b3644;
+    border-radius: 10px;
+    background: #151b24;
+    box-shadow: 0 10px 28px rgba(0, 0, 0, 0.45);
+}
+.sel-bar.on {
+    display: flex;
+}
+.sel-bar button {
+    padding: 7px 12px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: #d6dbe4;
+    font-size: 12px;
+    white-space: nowrap;
+    cursor: pointer;
+}
+.sel-bar button:active {
+    background: #24303d;
+}
+.sel-bar button.primary {
+    background: #f03d08;
+    color: #fff;
 }
 
 /* -------------------------------------------------------------- key bar */
