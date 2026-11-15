@@ -321,6 +321,16 @@
     -webkit-user-select: none;
     user-select: none;
 }
+/* 触摸手势全部由 term.js 接管（长按选词、按字拖字、命中边缘自动翻历史都在里面）：
+   只要放行某个方向，浏览器就会抢先启动滚动手势，把后续 touch 序列（尤其是 touchend）
+   吃掉 —— 表现就是「拖到边缘后松手，选区卡住不弹复制条」。 */
+.pane,
+.pane .xterm,
+.pane .xterm-viewport,
+.pane .xterm-screen,
+.pane .xterm-rows {
+    touch-action: none;
+}
 .pane.on {
     display: block;
 }

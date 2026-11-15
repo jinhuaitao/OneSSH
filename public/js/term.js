@@ -1,7 +1,7 @@
 /* Terminal view: tabs, panes, websocket sessions, live host metrics, key bar. */
 
 import { $, el, icon, toast, modal, confirmModal, fmtBytes, fmtRate, fmtUptime, copyText } from './ui.js';
-import { LONG_PRESS_MS, LONG_PRESS_JITTER, MOVE_TOLERANCE, gestureIntent, shouldBlockPullToRefresh, isTapLike, cellAt, selectionRows, joinLines } from './touch-select.js';
+import { LONG_PRESS_MS, LONG_PRESS_JITTER, MOVE_TOLERANCE, gestureIntent, shouldBlockPullToRefresh, isTapLike, cellAt, selectionRows, clipRows, wordRange, joinLines } from './touch-select.js';
 
 const THEME = {
     background: '#070910',
@@ -343,17 +343,33 @@ export function createTerminalView(cfg) {
 
     /* ------------------------------------------------- touch selection */
 
-    // xterm 是 canvas 渲染，没有原生文本选择；它公开的 select() 又会被自己的
-    // SelectionService 中途清掉（触屏上表现为「一拖选区就没了」）。
-    // 所以这里干脆不依赖 xterm 的选区：
+    // xterm 自己的选区在触屏上不可靠（长按、合成鼠标事件都会让它清掉/被抢走），
+    // 所以这里完全不依赖它：
     //   · 高亮自己画（.tsel-layer 里的 .tsel-row）
     //   · 文字自己从 buffer 取（translateToString(trim, fromCol, endCol)）
-    // 这样无论 xterm 在触摸事件里做什么，选区和复制都不受影响。
-    let touchSel = null;        // { s, id, x0, y0, x, y, t0, start, end, active, timer, all }
+    // 选区两端存的是**绝对缓冲区行**，滚动（包括自动滚动）后仍然对齐内容。
+    let touchSel = null;        // { s, id, x0, y0, x, y, t0, anchor, focus, active, all, mode, timer }
     let suppressUntil = 0;      // 长按期间抑制 contextmenu（移动端长按会派发它）
     let suppressMouseUntil = 0; // 抑制浏览器合成的鼠标事件，免得 xterm 重开鼠标选择
     let lastTouchAt = 0;        // 兜底：系统 contextmenu 可能早于长按阈值派发
     let selBar = null;          // 「复制 / 全选 / 取消」浮动条，挂在 .term-body 上
+    let autoScroll = null;      // 拖到边缘自动翻历史 { step, last, raf }
+    let lastTap = null;         // { x, y, t } 双击选词用
+    let keepSelUntil = 0;       // 我们自己收/弹键盘导致的重排窗口，期间不要清掉选区
+    let flick = null;           // 松手后的惯性滚动 { raf }
+
+    const EDGE = 28;            // 距上下边缘多少像素开始自动滚动
+    const AUTO_MS = 55;         // 自动滚动每多少毫秒翻一行
+    const MAX_SEL_LINES = 5000; // 单次最多拼多少行，防手滑选中整个 8000 行缓冲
+
+    function bufOf(s) {
+        return s && s.term && s.term.buffer ? s.term.buffer.active : null;
+    }
+
+    function viewportY(s) {
+        const b = bufOf(s);
+        return b ? b.viewportY : 0;
+    }
 
     function ensureSelLayer(s) {
         if (s.selLayer && s.selLayer.parentNode === s.pane) return s.selLayer;
@@ -361,6 +377,37 @@ export function createTerminalView(cfg) {
         s.pane.appendChild(layer);
         s.selLayer = layer;
         return layer;
+    }
+
+    function screenRect(s) {
+        const node = s.term.element && s.term.element.querySelector('.xterm-screen');
+        return (node || s.pane).getBoundingClientRect();
+    }
+
+    function cellSize(s) {
+        const rect = screenRect(s);
+        const cols = s.term.cols || 0;
+        const rows = s.term.rows || 0;
+        const w = cols > 0 ? rect.width / cols : 0;
+        const h = rows > 0 ? rect.height / rows : 0;
+        return w > 0 && h > 0 ? { w, h, rect } : null;
+    }
+
+    // 触点 → 绝对缓冲区坐标。选区的两个端点都用绝对行，滚一下不会跑位。
+    function absCell(s, x, y) {
+        const c = cellAt(screenRect(s), s.term.cols, s.term.rows, x, y);
+        return { row: viewportY(s) + c.row, col: c.col };
+    }
+
+    function visibleBand(s) {
+        const y = viewportY(s);
+        return { first: y, last: y + (s.term.rows || 0) - 1 };
+    }
+
+    function buzz() {
+        try {
+            if (navigator.vibrate) navigator.vibrate(8);
+        } catch (_) {}
     }
 
     function ensureSelBar() {
@@ -375,19 +422,9 @@ export function createTerminalView(cfg) {
             });
             return b;
         };
-        selBar = el('div', { class: 'sel-bar' }, [
+        selBar = el('div', { class: 'sel-bar', role: 'toolbar', 'aria-label': '选区操作' }, [
             mk('复制', 'primary', copySelection),
-            mk('全选', '', () => {
-                const sel = touchSel;
-                if (!sel) return;
-                // 全选交给 xterm 自己（一次性操作，不怕被清），复制时走 getSelection()
-                sel.all = true;
-                renderSel(sel);
-                try {
-                    sel.s.term.selectAll();
-                } catch (_) {}
-                toast('已全选当前缓冲区，点「复制」即可');
-            }),
+            mk('全选', '', selectAllText),
             mk('取消', '', clearTouchSelection),
         ]);
         body.appendChild(selBar);
@@ -412,10 +449,93 @@ export function createTerminalView(cfg) {
         if (selBar) selBar.classList.remove('on');
     }
 
+    // 自己画高亮：一行一个矩形，坐标换算成相对 .pane 的像素；
+    // 只画视口内的行，跨几千行的选区也不会生成一堆 DOM。
+    function renderSel(sel) {
+        const s = sel && sel.s;
+        if (!s || !s.term) return;
+        const layer = ensureSelLayer(s);
+        layer.textContent = '';
+        const size = cellSize(s);
+        if (!size) return;
+        const b = bufOf(s);
+        const band = visibleBand(s);
+        let a;
+        let z;
+        if (sel.all) {
+            a = { row: band.first, col: 0 };
+            z = { row: Math.min(band.last, (b ? b.length : 1) - 1), col: (s.term.cols || 1) - 1 };
+        } else {
+            a = sel.anchor;
+            z = sel.focus;
+        }
+        if (!a || !z) return;
+        const box = s.pane.getBoundingClientRect();
+        const ox = size.rect.left - box.left;
+        const oy = size.rect.top - box.top;
+        const frag = document.createDocumentFragment();
+        for (const sp of clipRows(selectionRows(s.term.cols, a, z), band.first, band.last)) {
+            const d = el('div', { class: 'tsel-row' });
+            d.style.left = ox + sp.from * size.w + 'px';
+            d.style.top = oy + (sp.row - band.first) * size.h + 'px';
+            d.style.width = (sp.to - sp.from + 1) * size.w + 'px';
+            d.style.height = size.h + 'px';
+            frag.appendChild(d);
+        }
+        layer.appendChild(frag);
+    }
+
+    // 整个缓冲区（含回滚历史）的文字，全选复制用
+    function bufferText(s) {
+        const b = bufOf(s);
+        if (!b) return '';
+        const parts = [];
+        for (let i = 0; i < b.length; i++) {
+            const line = b.getLine(i);
+            if (!line) continue;
+            parts.push({ text: line.translateToString(true), wrapped: !!line.isWrapped });
+        }
+        // 末尾的空白行没必要带给用户
+        return joinLines(parts).replace(/[\s\u00a0]+$/, '');
+    }
+
+    // 自己取文字：直接按绝对行读缓冲区，和画出来的高亮严格一致
+    function selText(sel) {
+        const s = sel && sel.s;
+        if (!s) return '';
+        if (sel.all) return bufferText(s);
+        const b = bufOf(s);
+        if (!b || !sel.anchor || !sel.focus) return '';
+        const parts = [];
+        const spans = selectionRows(s.term.cols, sel.anchor, sel.focus);
+        for (let i = 0; i < spans.length && i < MAX_SEL_LINES; i++) {
+            const sp = spans[i];
+            const line = b.getLine(sp.row);
+            const text = line ? line.translateToString(true, sp.from, sp.to + 1) : '';
+            parts.push({ text, wrapped: !!(line && line.isWrapped) });
+        }
+        return joinLines(parts);
+    }
+
+    // 某一行某个列所在的词，长按 / 双击都用它
+    function wordAt(s, cell) {
+        const b = bufOf(s);
+        if (!b || !cell) return null;
+        const line = b.getLine(cell.row);
+        if (!line) return null;
+        const text = line.translateToString(true);
+        const wr = wordRange(text, cell.col);
+        if (wr && wr.to > wr.from) return { from: { row: cell.row, col: wr.from }, to: { row: cell.row, col: wr.to } };
+        // 落在行尾空白（终端每行都补齐到 cols）上：退一步选中整行，
+        // 总比「长按了却什么都没选」好；空行仍然什么都不做。
+        if (text.length) return { from: { row: cell.row, col: 0 }, to: { row: cell.row, col: text.length - 1 } };
+        return null;
+    }
+
     async function copySelection() {
         const sel = touchSel;
         if (!sel) return;
-        const text = sel.all ? sel.s.term.getSelection() : selText(sel);
+        const text = selText(sel);
         if (!text) {
             toast('没有选中内容', 'err');
             return;
@@ -429,7 +549,19 @@ export function createTerminalView(cfg) {
         }
     }
 
+    function selectAllText() {
+        const sel = touchSel;
+        if (!sel) return;
+        sel.all = true;
+        sel.anchor = null;
+        sel.focus = null;
+        renderSel(sel);
+        toast('已选中整个缓冲区，点「复制」即可');
+    }
+
     function clearTouchSelection() {
+        stopAutoScroll();
+        stopFlick();
         if (touchSel && touchSel.s) {
             if (touchSel.timer) clearTimeout(touchSel.timer);
             const s = touchSel.s;
@@ -445,84 +577,114 @@ export function createTerminalView(cfg) {
         hideSelBar();
     }
 
-    function screenRect(s) {
-        const node = s.term.element && s.term.element.querySelector('.xterm-screen');
-        return (node || s.pane).getBoundingClientRect();
+    /* --------------------------------------------------- auto scrolling */
+
+    // 手指拖到终端上下边缘就继续翻历史 —— 否则选中一段长输出时，
+    // 手指一离开屏幕就没法往下了（触屏上这是最常用的一条）。
+    function stopAutoScroll() {
+        if (!autoScroll) return;
+        if (autoScroll.raf) cancelAnimationFrame(autoScroll.raf);
+        autoScroll = null;
     }
 
-    function cellSize(s) {
-        const rect = screenRect(s);
-        const cols = s.term.cols || 0;
-        const rows = s.term.rows || 0;
-        const w = cols > 0 ? rect.width / cols : 0;
-        const h = rows > 0 ? rect.height / rows : 0;
-        return w > 0 && h > 0 ? { w, h, rect } : null;
+    function autoScrollTo(sel, step) {
+        if (!step || !sel || !sel.active) {
+            stopAutoScroll();
+            return;
+        }
+        if (autoScroll && autoScroll.step === step) return;
+        stopAutoScroll();
+        autoScroll = { step, last: 0, raf: 0 };
+        const tick = () => {
+            const a = autoScroll;
+            if (!a || touchSel !== sel || !sel.active) {
+                stopAutoScroll();
+                return;
+            }
+            if (Date.now() - a.last >= AUTO_MS) {
+                a.last = Date.now();
+                const before = viewportY(sel.s);
+                try {
+                    sel.s.term.scrollLines(a.step);
+                } catch (_) {}
+                const moved = viewportY(sel.s) - before;
+                // 到顶/到底就停住，别让终点继续跑
+                if (moved) {
+                    if (sel.focus) sel.focus.row = Math.max(0, sel.focus.row + moved);
+                    renderSel(sel);
+                }
+            }
+            a.raf = requestAnimationFrame(tick);
+        };
+        autoScroll.raf = requestAnimationFrame(tick);
     }
 
-    // 自己画高亮：一行一个矩形，坐标全部换算成相对 .pane 的像素
-    function renderSel(sel) {
-        const s = sel && sel.s;
-        if (!s || !s.term) return;
-        const layer = ensureSelLayer(s);
-        layer.textContent = '';
-        if (sel.all || !sel.start || !sel.end) return;
+    // 松手后的惯性：原生滚动被接管了，手感得自己补回来，否则「甩一下」不动。
+    function stopFlick() {
+        if (flick && flick.raf) cancelAnimationFrame(flick.raf);
+        flick = null;
+    }
+
+    function startFlick(s, v0) {
+        stopFlick();
         const size = cellSize(s);
         if (!size) return;
-        const box = s.pane.getBoundingClientRect();
-        const ox = size.rect.left - box.left;
-        const oy = size.rect.top - box.top;
-        const frag = document.createDocumentFragment();
-        for (const sp of selectionRows(s.term.cols, sel.start, sel.end)) {
-            const d = el('div', { class: 'tsel-row' });
-            d.style.left = ox + sp.from * size.w + 'px';
-            d.style.top = oy + sp.row * size.h + 'px';
-            d.style.width = (sp.to - sp.from + 1) * size.w + 'px';
-            d.style.height = size.h + 'px';
-            frag.appendChild(d);
-        }
-        layer.appendChild(frag);
+        let v = Math.max(-2.5, Math.min(2.5, v0)) * 16; // 每帧位移（px）
+        let acc = 0;
+        const tick = () => {
+            if (!flick) return;
+            v *= 0.94;
+            if (Math.abs(v) < 0.06) {
+                stopFlick();
+                return;
+            }
+            acc += v;
+            const lines = Math.trunc(acc / size.h);
+            if (lines) {
+                acc -= lines * size.h;
+                try {
+                    s.term.scrollLines(-lines);
+                } catch (_) {}
+            }
+            flick.raf = requestAnimationFrame(tick);
+        };
+        flick = { raf: requestAnimationFrame(tick) };
     }
 
-    // 自己取文字：视口第 N 行 = 缓冲区第 viewportY + N 行
-    function selText(sel) {
-        const s = sel && sel.s;
-        if (!s || sel.all || !sel.start || !sel.end) return '';
-        const buf = s.term.buffer && s.term.buffer.active;
-        if (!buf) return '';
-        const parts = [];
-        const spans = selectionRows(s.term.cols, sel.start, sel.end);
-        for (let i = 0; i < spans.length && i < 800; i++) {
-            const sp = spans[i];
-            const line = buf.getLine(buf.viewportY + sp.row);
-            const text = line ? line.translateToString(true, sp.from, sp.to + 1) : '';
-            parts.push({ text, wrapped: !!(line && line.isWrapped) });
-        }
-        return joinLines(parts);
-    }
+    /* ------------------------------------------------------- gestures */
 
-    function beginTouchSelection(sel) {
+    function beginTouchSelection(sel, byWord) {
         const s = sel.s;
         if (!s || !s.term || touchSel !== sel) return;
         sel.active = true;
         sel.all = false;
-        // 覆盖整个选择过程；松开后由 endTouchSelection 收窄到 900ms
+        // 覆盖整个选择过程；松开后由 endTouchSelection 收窄
         suppressUntil = Date.now() + 10000;
         // 这里刻意不 blur()：收起软键盘会触发 resize，行列重排会让刚算好的坐标失效
-        const rect = screenRect(s);
-        sel.start = cellAt(rect, s.term.cols, s.term.rows, sel.x0, sel.y0);
-        sel.end = sel.start;
+        const c = absCell(s, sel.x0, sel.y0);
+        sel.anchor = c;
+        sel.focus = c;
+        if (byWord) {
+            const w = wordAt(s, c);
+            if (w) {
+                sel.anchor = w.from;
+                sel.focus = w.to;
+            }
+        }
         renderSel(sel);
+        buzz();
     }
 
     function updateTouchSelection(sel, x, y) {
-        if (!sel.start) return;
-        sel.end = cellAt(screenRect(sel.s), sel.s.term.cols, sel.s.term.rows, x, y);
+        if (!sel.anchor) return;
+        sel.focus = absCell(sel.s, x, y);
         renderSel(sel);
     }
 
     function endTouchSelection(sel) {
         if (sel.timer) clearTimeout(sel.timer);
         sel.timer = null;
+        stopAutoScroll();
         if (!sel.active) {
             if (touchSel === sel) touchSel = null;
             return;
@@ -531,7 +693,8 @@ export function createTerminalView(cfg) {
         suppressUntil = Date.now() + 900;
         // 先按当前几何把文字取出来，再收软键盘：blur 会触发 resize，
         // 行列一重排，之前算好的坐标就作废了。
-        const text = sel.all ? sel.s.term.getSelection() : selText(sel);
+        const text = selText(sel);
+        keepSelUntil = Date.now() + 260;
         try {
             sel.s.term.blur();
         } catch (_) {}
@@ -544,6 +707,39 @@ export function createTerminalView(cfg) {
         } else {
             clearTouchSelection();
         }
+    }
+
+    // 双击选词：触屏上复制一个路径 / 文件名 / URL 最快的方式
+    function selectWordAt(s, x, y) {
+        const w = wordAt(s, absCell(s, x, y));
+        if (!w) return false;
+        if (touchSel) clearTouchSelection();
+        touchSel = {
+            s,
+            id: -1,
+            x0: x,
+            y0: y,
+            x,
+            y,
+            t0: Date.now(),
+            anchor: w.from,
+            focus: w.to,
+            active: false,
+            all: false,
+            mode: 'select',
+            timer: null,
+        };
+        renderSel(touchSel);
+        suppressUntil = Date.now() + 900;
+        suppressMouseUntil = Date.now() + 400;
+        // 双击前那次点击可能已经把软键盘叫出来了，收起来让选区完整可见
+        keepSelUntil = Date.now() + 260;
+        try {
+            s.term.blur();
+        } catch (_) {}
+        showSelBar(x, y);
+        buzz();
+        return true;
     }
 
     function bindTouchSelection() {
@@ -612,9 +808,10 @@ export function createTerminalView(cfg) {
                     return;
                 }
                 const t = ev.touches[0];
-                // 关键：从 touchstart 就把浏览器原生手势挡在门外（长按菜单、放大镜、
-                // 合成鼠标事件），这样按在「字」上和按在「空白」上走的是同一条路。
-                // 只 preventDefault，不 stopPropagation：xterm 用 JS 改 scrollTop 照常滚动。
+                // 从 touchstart 就接管：浏览器一旦把这串触摸识别成滚动手势，就会
+                // 吞掉 touchend（选区会卡在拖动状态）。代价是原生滚动也没了，
+                // 所以下面自己按行滚 scrollback，收益是手势边界完全可控。
+                // 只 preventDefault，不 stopPropagation，xterm 自己的滚动逻辑照旧安全。
                 if (ev.cancelable) ev.preventDefault();
                 clearTouchSelection();
                 const sel = {
@@ -624,9 +821,13 @@ export function createTerminalView(cfg) {
                     y0: t.clientY,
                     x: t.clientX,
                     y: t.clientY,
+                    lastY: t.clientY,
+                    lastT: Date.now(),
+                    v: 0,
+                    scrollAcc: 0,
                     t0: Date.now(),
-                    start: null,
-                    end: null,
+                    anchor: null,
+                    focus: null,
                     active: false,
                     all: false,
                     mode: '',
@@ -636,7 +837,8 @@ export function createTerminalView(cfg) {
                 suppressMouseUntil = 0;
                 sel.timer = setTimeout(() => {
                     if (touchSel !== sel || sel.active) return;
-                    beginTouchSelection(sel);
+                    // 长按默认选中整个词：移动端复制一段路径/文件名，这样最省事
+                    beginTouchSelection(sel, true);
                     suppressMouseUntil = Date.now() + 10000;
                 }, LONG_PRESS_MS);
             },
@@ -652,11 +854,19 @@ export function createTerminalView(cfg) {
                 if (!t) return;
                 sel.x = t.clientX;
                 sel.y = t.clientY;
+                const dyStep = t.clientY - sel.lastY;
+                sel.lastY = t.clientY;
 
                 if (sel.active) {
                     ev.preventDefault();
                     ev.stopPropagation();
-                    updateTouchSelection(sel, t.clientX, t.clientY);
+                    const r = screenRect(sel.s);
+                    const step = t.clientY < r.top + EDGE ? -1 : t.clientY > r.bottom - EDGE ? 1 : 0;
+                    // 已经进入自动滚动时不要再用触点重置终点，否则选区会来回缩。
+                    if (!(step && autoScroll && autoScroll.step === step)) {
+                        updateTouchSelection(sel, t.clientX, t.clientY);
+                    }
+                    autoScrollTo(sel, step);
                     return;
                 }
 
@@ -677,8 +887,24 @@ export function createTerminalView(cfg) {
                 if (sel.mode === 'scroll') {
                     if (sel.timer) clearTimeout(sel.timer);
                     sel.timer = null;
-                    // 滚动是 xterm 的活儿，别抢手势
-                    touchSel = null;
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    // 原生滚动被接管了，按「手指移动了多少像素」换算成行自己滚。
+                    // 手指下滑（dy>0）是想看更早的输出 → scrollLines 用负行数。
+                    const size = cellSize(sel.s);
+                    if (!size) return;
+                    const dt = Math.max(1, Date.now() - sel.lastT);
+                    sel.lastT = Date.now();
+                    // 指数平滑，松手后用它算惯性
+                    sel.v = sel.v * 0.6 + (dyStep / dt) * 0.4;
+                    sel.scrollAcc += dyStep;
+                    const lines = Math.trunc(sel.scrollAcc / size.h);
+                    if (lines) {
+                        sel.scrollAcc -= lines * size.h;
+                        try {
+                            sel.s.term.scrollLines(-lines);
+                        } catch (_) {}
+                    }
                     return;
                 }
 
@@ -689,7 +915,7 @@ export function createTerminalView(cfg) {
                     ev.stopPropagation();
                     if (sel.timer) clearTimeout(sel.timer);
                     sel.timer = null;
-                    beginTouchSelection(sel);
+                    beginTouchSelection(sel, false);
                     suppressMouseUntil = Date.now() + 10000;
                     updateTouchSelection(sel, t.clientX, t.clientY);
                 }
@@ -700,12 +926,26 @@ export function createTerminalView(cfg) {
         const finish = (ev) => {
             const sel = touchSel;
             if (!sel) return;
+            const tap = !sel.active && sel.mode !== 'scroll' && isTapLike(sel.x - sel.x0, sel.y - sel.y0, Date.now() - sel.t0, MOVE_TOLERANCE);
             if (sel.active) {
                 ev.preventDefault();
                 ev.stopPropagation();
                 // 只有真正进入过选区才开抑制窗口，普通点击/滚动不受影响
                 suppressMouseUntil = Date.now() + 400;
-            } else if (sel.mode !== 'scroll' && isTapLike(sel.x - sel.x0, sel.y - sel.y0, Date.now() - sel.t0, MOVE_TOLERANCE)) {
+            } else if (sel.mode === 'scroll' && Math.abs(sel.v) > 0.08) {
+                // 甩一下继续滑：只在确实是滚动、且松手时还有速度时触发
+                startFlick(sel.s, sel.v);
+            } else if (tap) {
+                // 双击 → 选中手指下的整个词
+                const prev = lastTap;
+                const dbl = prev && Date.now() - prev.t < 320 && Math.abs(sel.x - prev.x) < 28 && Math.abs(sel.y - prev.y) < 28;
+                if (dbl && selectWordAt(sel.s, sel.x, sel.y)) {
+                    lastTap = null;
+                    ev.preventDefault();
+                    ev.stopPropagation();
+                    return;
+                }
+                lastTap = { x: sel.x, y: sel.y, t: Date.now() };
                 // touchstart 被 preventDefault 后浏览器不会合成 mousedown / 自动聚焦，
                 // 纯点击要手动补一次，否则触屏点终端弹不出软键盘。
                 try {
@@ -718,6 +958,32 @@ export function createTerminalView(cfg) {
         };
         document.addEventListener('touchend', finish, DOC);
         document.addEventListener('touchcancel', finish, DOC);
+
+        // 兜底：手指一抬起浏览器就可能把整串触摸转成滚动手势，
+        // 这时 touchend / touchcancel 都可能不再派发（自动翻历史时最容易复现），
+        // 选区会一直卡在拖动状态。pointerup 不受这个影响，用它补一次收尾。
+        // 软键盘弹出 / 转屏会让终端重排：高亮按新几何重画一次，别停在旧位置
+        const reflow = () => {
+            if (!touchSel) return;
+            requestAnimationFrame(() => {
+                if (touchSel) renderSel(touchSel);
+            });
+        };
+        window.addEventListener('resize', reflow, { passive: true });
+        if (window.visualViewport) window.visualViewport.addEventListener('resize', reflow, { passive: true });
+
+        document.addEventListener(
+            'pointerup',
+            (ev) => {
+                if (ev.pointerType === 'mouse') return;
+                const sel = touchSel;
+                if (!sel || !sel.active) return;
+                setTimeout(() => {
+                    if (touchSel === sel && sel.active) endTouchSelection(sel);
+                }, 120);
+            },
+            true
+        );
     }
 
     /* ------------------------------------------------- overscroll guard */
@@ -1127,6 +1393,35 @@ export function createTerminalView(cfg) {
 
         term.onData((data) => sendInput(s, data));
         term.onResize(({ cols, rows }) => send(s, { t: 'resize', cols, rows }));
+
+        // 滚动（翻历史、自动滚动、键盘弹出重排）会让屏幕坐标和内容错位：
+        // 正在拖的选区按新几何重画，已经完成的选区直接收掉，避免高亮浮在错的位置。
+        const vp = term.element && term.element.querySelector('.xterm-viewport');
+        if (vp) {
+            vp.addEventListener(
+                'scroll',
+                () => {
+                    if (!touchSel || touchSel.s !== s) return;
+                    // 选区还看得见就按新几何重画（收键盘导致的重排也走这条）；
+                    // 整个滚出视口了就收起来，免得留一条悬空的浮动条。
+                    if (Date.now() < keepSelUntil) {
+                        // 刚收起/弹出软键盘触发的重排：按新几何重画，别把选区丢掉
+                        renderSel(touchSel);
+                        return;
+                    }
+                    const band = visibleBand(s);
+                    const a = touchSel.anchor;
+                    const z = touchSel.focus;
+                    let visible = true;
+                    if (!touchSel.all && a && z) {
+                        visible = Math.max(a.row, z.row) >= band.first && Math.min(a.row, z.row) <= band.last;
+                    }
+                    if (visible) renderSel(touchSel);
+                    else clearTouchSelection();
+                },
+                { passive: true }
+            );
+        }
 
         // right click pastes (keeps the muscle memory of desktop terminals)
         pane.addEventListener('contextmenu', async (ev) => {

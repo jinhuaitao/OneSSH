@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LONG_PRESS_MS, LONG_PRESS_JITTER, MOVE_TOLERANCE, gestureIntent, shouldBlockPullToRefresh, isTapLike, cellAt, selectionRange, normalizeSel, selectionRows, joinLines } from '../public/js/touch-select.js';
+import { LONG_PRESS_MS, LONG_PRESS_JITTER, MOVE_TOLERANCE, gestureIntent, shouldBlockPullToRefresh, isTapLike, cellAt, selectionRange, normalizeSel, selectionRows, clipRows, wordRange, joinLines } from '../public/js/touch-select.js';
 
 const rect = { left: 12, top: 8, width: 800, height: 400 };
 
@@ -121,4 +121,34 @@ test('joinLines：软换行的续行不插换行符', () => {
     assert.equal(joinLines([{ text: '' }, { text: 'x' }]), '\nx');
     assert.equal(joinLines([]), '');
     assert.equal(joinLines(null), '');
+});
+
+test('wordRange：长按 / 双击选中整个 token', () => {
+    const line = 'cd /usr/local/lib/node_modules';
+    // 点在路径中间 → 整段路径
+    assert.deepEqual(wordRange(line, 8), { from: 3, to: 29 });
+    // 点在 cd 上
+    assert.deepEqual(wordRange(line, 1), { from: 0, to: 1 });
+    // 命令参数算一个词（-m 是一个整体，空格是边界）
+    assert.deepEqual(wordRange('git commit -m "fix: x"', 12), { from: 11, to: 12 });
+    assert.deepEqual(wordRange('git commit -m "fix: x"', 18), { from: 14, to: 18 });
+    // 点在空白上 → 只选那一格，不做扩展
+    assert.deepEqual(wordRange(line, 2), { from: 2, to: 2 });
+    // 空行 / 越界列
+    assert.equal(wordRange('', 0), null);
+    assert.equal(wordRange(null, 3), null);
+    assert.equal(wordRange('abc', 99), null); // 行尾填充区不算字
+    assert.deepEqual(wordRange('a b', 1), { from: 1, to: 1 });
+});
+
+test('clipRows：跨几千行的选区只保留视口内的行', () => {
+    const spans = selectionRows(80, { col: 0, row: 0 }, { col: 5, row: 500 });
+    assert.equal(spans.length, 501);
+    const vis = clipRows(spans, 480, 503);
+    assert.equal(vis.length, 21);
+    assert.equal(vis[0].row, 480);
+    assert.equal(vis[vis.length - 1].row, 500);
+    // 视口完全在选区之外
+    assert.deepEqual(clipRows(spans, 600, 620), []);
+    assert.deepEqual(clipRows(null, 0, 10), []);
 });

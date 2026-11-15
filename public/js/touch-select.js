@@ -98,6 +98,45 @@ export function selectionRows(cols, a, b) {
 }
 
 /**
+ * 终端里「一个词」由哪些字符组成。路径、URL、命令行参数、文件名都算整体，
+ * 长按一下就能整段复制，比逐字拖要顺手得多。
+ */
+const WORD_CHARS = /[A-Za-z0-9_\-./~:@%+=?&#$!*(){}[\]'"<>|\\]/;
+
+/**
+ * 行内某个列所在的「词」区间（闭区间）。落在空白上就只返回那一格，
+ * 返回 null 表示列号越界（终端行尾的填充空格）。
+ */
+export function wordRange(text, col) {
+    const s = text == null ? '' : String(text);
+    const n = s.length;
+    if (!n) return null;
+    const i = Math.floor(Number(col) || 0);
+    // 列号落在行尾填充区（终端每行都补到 cols）：这不是「某个字」，返回 null
+    if (i < 0 || i >= n) return null;
+    if (!WORD_CHARS.test(s[i])) return { from: i, to: i };
+    let a = i;
+    let b = i;
+    while (a > 0 && WORD_CHARS.test(s[a - 1])) a--;
+    while (b < n - 1 && WORD_CHARS.test(s[b + 1])) b++;
+    return { from: a, to: b };
+}
+
+/**
+ * 只保留与视口相交的行。选区可以跨几千行缓冲区，
+ * 但屏幕上最多只画得下 `rows` 行 —— 先裁掉，避免生成大量 DOM。
+ */
+export function clipRows(spans, firstRow, lastRow) {
+    const out = [];
+    for (const sp of spans || []) {
+        if (!sp) continue;
+        if (sp.row < firstRow || sp.row > lastRow) continue;
+        out.push(sp);
+    }
+    return out;
+}
+
+/**
  * 把逐行取到的文字拼回一段文本：xterm 里软换行的续行（isWrapped）不能插换行，
  * 否则复制出来的命令会被截断。
  */
