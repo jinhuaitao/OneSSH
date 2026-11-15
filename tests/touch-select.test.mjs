@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LONG_PRESS_MS, MOVE_TOLERANCE, gestureIntent, shouldBlockPullToRefresh, cellAt, selectionRange } from '../public/js/touch-select.js';
+import { LONG_PRESS_MS, MOVE_TOLERANCE, gestureIntent, shouldBlockPullToRefresh, isTapLike, cellAt, selectionRange } from '../public/js/touch-select.js';
 
 const rect = { left: 12, top: 8, width: 800, height: 400 };
 
@@ -47,6 +47,13 @@ test('shouldBlockPullToRefresh：只有滚到顶后继续下拉才拦', () => {
     assert.equal(shouldBlockPullToRefresh(-30, 0), false); // 上滑看最新输出，不拦
     assert.equal(shouldBlockPullToRefresh(0, 0), false);
     assert.equal(shouldBlockPullToRefresh(8, undefined), true);
+});
+
+test('isTapLike：只有短按且几乎不移动才补聚焦', () => {
+    assert.equal(isTapLike(2, 3, 120, MOVE_TOLERANCE), true);
+    assert.equal(isTapLike(30, 0, 120, MOVE_TOLERANCE), false); // 拖动选字
+    assert.equal(isTapLike(0, 40, 120, MOVE_TOLERANCE), false); // 滚历史
+    assert.equal(isTapLike(0, 0, LONG_PRESS_MS, MOVE_TOLERANCE), false); // 长按
 });
 
 test('gestureIntent：按在一个字上横向拖到另一个字，立即进入选择', () => {

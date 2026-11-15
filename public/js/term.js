@@ -1,7 +1,7 @@
 /* Terminal view: tabs, panes, websocket sessions, live host metrics, key bar. */
 
 import { $, el, icon, toast, modal, confirmModal, fmtBytes, fmtRate, fmtUptime, copyText } from './ui.js';
-import { LONG_PRESS_MS, MOVE_TOLERANCE, gestureIntent, shouldBlockPullToRefresh, cellAt, selectionRange } from './touch-select.js';
+import { LONG_PRESS_MS, MOVE_TOLERANCE, gestureIntent, shouldBlockPullToRefresh, isTapLike, cellAt, selectionRange } from './touch-select.js';
 
 const THEME = {
     background: '#070910',
@@ -539,6 +539,13 @@ export function createTerminalView(cfg) {
                     return;
                 }
                 const t = ev.touches[0];
+                // 关键：从 touchstart 就把浏览器的原生手势挡在门外。
+                // 按在「字」（canvas）上时，浏览器会合成 mousedown / 弹长按菜单；
+                // xterm 的 mousedown 又会 focus() 并让 SelectionService 重开一次鼠标选择，
+                // 把我们用 select() 画好的选区清掉 —— 表现就是「字上拖不动，
+                // 落在空白处（不在 xterm 元素上）反而正常」。
+                // 只 preventDefault，不 stopPropagation：xterm 用 JS 改 scrollTop 照常滚动。
+                if (ev.cancelable) ev.preventDefault();
                 lastTouchAt = Date.now();
                 clearTouchSelection(); // 任何新触摸先清掉上一次选区
                 const sel = {
@@ -612,6 +619,12 @@ export function createTerminalView(cfg) {
                 ev.stopPropagation();
                 // 只有真正进入过选择模式才开抑制窗口，普通点击/滚动不受影响
                 suppressMouseUntil = Date.now() + 300;
+            } else if (isTapLike(sel.x - sel.x0, sel.y - sel.y0, Date.now() - sel.t0, MOVE_TOLERANCE)) {
+                // touchstart 被 preventDefault 后浏览器不会合成 mousedown / 自动聚焦，
+                // 纯点击要手动补一次，否则触屏点终端弹不出软键盘。
+                try {
+                    sel.s.term.focus();
+                } catch (_) {}
             }
             // 系统手势（放大镜 / callout）可能派发 touchcancel：选区已经画出来了，
             // 别把它丢掉，照样给复制条。

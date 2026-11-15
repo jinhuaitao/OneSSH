@@ -13,6 +13,15 @@ export function shouldBlockPullToRefresh(dy, scrollTop) {
 }
 
 /**
+ * touchstart 被 preventDefault 后浏览器不会合成 mousedown / 自动聚焦，
+ * 纯点击（几乎没位移、时间很短）需要手动补一次 term.focus() 才能弹出软键盘。
+ */
+export function isTapLike(dx, dy, elapsedMs, tolerance) {
+    const tol = Number(tolerance) || MOVE_TOLERANCE;
+    return Math.abs(dx) <= tol && Math.abs(dy) <= tol && elapsedMs < LONG_PRESS_MS;
+}
+
+/**
  * 判定一次触摸是「滚动」还是「选字」。纯函数，方便单测。
  *
  * 终端只有垂直滚动（xterm 的 handleTouchMove 只看 pageY 差值），所以：
