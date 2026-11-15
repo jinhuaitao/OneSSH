@@ -136,12 +136,6 @@
     border-color: #2b3644;
     background: #151b23;
 }
-/* 「选择」开关开启态 */
-.tbtn.ghost.on {
-    border-color: #f03d08;
-    background: #2a1508;
-    color: #ffb59b;
-}
 .tbtn.danger:hover {
     color: #ff8f85;
     border-color: #3a1f1f;
@@ -373,15 +367,6 @@
     border-radius: 2px;
     pointer-events: none;
 }
-/* 选择模式下的透明盾牌：xterm 完全收不到触摸，按在字上和按在空白处一模一样 */
-.tsel-shield {
-    position: absolute;
-    inset: 0;
-    z-index: 2;
-    background: transparent;
-    touch-action: none;
-}
-
 .sel-bar {
     position: absolute;
     z-index: 20;

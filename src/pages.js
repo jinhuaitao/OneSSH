@@ -188,7 +188,6 @@ export function renderShell() {
     </div>
     <div class="hb-stats" id="hb-stats"></div>
     <div class="hb-actions">
-      <button class="tbtn ghost" id="btn-select" title="选择文本（触屏按住拖动即可选中）">${icon('edit', 15)}<span>选择</span></button>
       <button class="tbtn ghost" id="btn-files">${icon('folder', 15)}<span>文件</span></button>
       <button class="tbtn ghost" id="btn-snippets">${icon('code', 15)}<span>代码片段</span></button>
       <button class="tbtn ghost" id="btn-dup" title="新开一个会话">${icon('plus', 15)}</button>

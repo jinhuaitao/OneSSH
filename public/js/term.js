@@ -354,9 +354,6 @@ export function createTerminalView(cfg) {
     let suppressMouseUntil = 0; // 抑制浏览器合成的鼠标事件，免得 xterm 重开鼠标选择
     let lastTouchAt = 0;        // 兜底：系统 contextmenu 可能早于长按阈值派发
     let selBar = null;          // 「复制 / 全选 / 取消」浮动条，挂在 .term-body 上
-    let selectMode = false;     // 「选择」开关：开启后整块终端盖上透明盾牌
-    let selShield = null;
-    let scrollAcc = 0;          // 选择模式下自己转发滚动时的像素余数
 
     function ensureSelLayer(s) {
         if (s.selLayer && s.selLayer.parentNode === s.pane) return s.selLayer;
@@ -364,34 +361,6 @@ export function createTerminalView(cfg) {
         s.pane.appendChild(layer);
         s.selLayer = layer;
         return layer;
-    }
-
-    function ensureSelShield(s) {
-        if (!s || !s.pane) return null;
-        if (selShield && selShield.parentNode === s.pane) return selShield;
-        if (selShield) selShield.remove();
-        selShield = el('div', { class: 'tsel-shield' });
-        s.pane.appendChild(selShield);
-        return selShield;
-    }
-
-    function dropSelShield() {
-        if (selShield) selShield.remove();
-        selShield = null;
-    }
-
-    function setSelectMode(on, silent) {
-        selectMode = !!on;
-        const btn = $('#btn-select');
-        if (btn) btn.classList.toggle('on', selectMode);
-        if (selectMode) {
-            const s = active();
-            if (s) ensureSelShield(s);
-        } else {
-            dropSelShield();
-            clearTouchSelection();
-        }
-        if (!silent) toast(selectMode ? '选择模式已开启：按住文字拖动即可选中' : '已退出选择模式');
     }
 
     function ensureSelBar() {
@@ -655,7 +624,6 @@ export function createTerminalView(cfg) {
                     y0: t.clientY,
                     x: t.clientX,
                     y: t.clientY,
-                    lastY: t.clientY,
                     t0: Date.now(),
                     start: null,
                     end: null,
@@ -665,7 +633,6 @@ export function createTerminalView(cfg) {
                     timer: null,
                 };
                 touchSel = sel;
-                scrollAcc = 0;
                 suppressMouseUntil = 0;
                 sel.timer = setTimeout(() => {
                     if (touchSel !== sel || sel.active) return;
@@ -683,8 +650,6 @@ export function createTerminalView(cfg) {
                 if (!sel) return;
                 const t = Array.from(ev.touches).find((p) => p.identifier === sel.id);
                 if (!t) return;
-                const dyStep = t.clientY - sel.lastY;
-                sel.lastY = t.clientY;
                 sel.x = t.clientX;
                 sel.y = t.clientY;
 
@@ -703,8 +668,7 @@ export function createTerminalView(cfg) {
                     clearTimeout(sel.timer);
                     sel.timer = null;
                 }
-                // 选择模式：整块终端被盾牌挡住，xterm 收不到事件，滚动得自己转发
-                // 注意 'wait' 是中间态，不能锁存，否则手指先动一点再滑就永远滚不动
+                // 'wait' 是中间态，不能锁存，否则手指先动一点再滑就永远滚不动
                 if (!sel.mode) {
                     const intent = gestureIntent(dx, dy, Date.now() - sel.t0, MOVE_TOLERANCE);
                     if (intent !== 'wait') sel.mode = intent;
@@ -713,29 +677,13 @@ export function createTerminalView(cfg) {
                 if (sel.mode === 'scroll') {
                     if (sel.timer) clearTimeout(sel.timer);
                     sel.timer = null;
-                    if (!selectMode) {
-                        // 普通模式：滚动是 xterm 的活儿，别抢手势
-                        touchSel = null;
-                        return;
-                    }
-                    ev.preventDefault();
-                    ev.stopPropagation();
-                    const size = cellSize(sel.s);
-                    if (!size) return;
-                    // 手指下滑（dy>0）要翻更早的历史 → scrollLines 用负行数
-                    scrollAcc -= dyStep;
-                    const lines = Math.trunc(scrollAcc / size.h);
-                    if (lines) {
-                        scrollAcc -= lines * size.h;
-                        try {
-                            sel.s.term.scrollLines(lines);
-                        } catch (_) {}
-                    }
+                    // 滚动是 xterm 的活儿，别抢手势
+                    touchSel = null;
                     return;
                 }
 
                 if (sel.mode === 'select') {
-                    // 「按在字 A 上 → 拖到字 B」：不用等长按，立刻进选择模式，
+                    // 「按在字 A 上 → 拖到字 B」：不用等长按，立刻开始选字，
                     // 起点就是按下那个字，终点是手指下的字。
                     ev.preventDefault();
                     ev.stopPropagation();
@@ -755,7 +703,7 @@ export function createTerminalView(cfg) {
             if (sel.active) {
                 ev.preventDefault();
                 ev.stopPropagation();
-                // 只有真正进入过选择模式才开抑制窗口，普通点击/滚动不受影响
+                // 只有真正进入过选区才开抑制窗口，普通点击/滚动不受影响
                 suppressMouseUntil = Date.now() + 400;
             } else if (sel.mode !== 'scroll' && isTapLike(sel.x - sel.x0, sel.y - sel.y0, Date.now() - sel.t0, MOVE_TOLERANCE)) {
                 // touchstart 被 preventDefault 后浏览器不会合成 mousedown / 自动聚焦，
@@ -792,7 +740,7 @@ export function createTerminalView(cfg) {
             'touchmove',
             (ev) => {
                 if (y0 == null || !ev.touches.length) return;
-                // 选择模式已接管手势，别插手
+                // 正在选字，别插手
                 if (touchSel && touchSel.active) return;
                 const t = ev.touches[0];
                 const s = active();
@@ -1205,8 +1153,6 @@ export function createTerminalView(cfg) {
         // 切到别的标签时收起上一个会话的选区与浮动条
         if (touchSel && touchSel.s && touchSel.s.id !== id) clearTouchSelection();
         state.activeId = id;
-        // 选择模式是全局开关，切标签要把盾牌搬到当前 pane 上
-        if (selectMode) ensureSelShield(s);
         for (const other of state.sessions) {
             other.pane.classList.toggle('on', other.id === id);
             if (other.tabEl) other.tabEl.classList.toggle('on', other.id === id);
@@ -1247,11 +1193,6 @@ export function createTerminalView(cfg) {
         }
         renderTabs();
         renderHostbar();
-        if (!state.sessions.length) {
-            // 会话全关了就退出选择模式，别把开关留给下一个会话
-            if (selectMode) setSelectMode(false, true);
-            dropSelShield();
-        }
         if (!state.sessions.length && c.onEmpty) c.onEmpty();
     }
 
@@ -1343,13 +1284,6 @@ export function createTerminalView(cfg) {
         on('.term-top-actions [data-act="settings"]', 'click', () => c.onSettings && c.onSettings());
         on('.term-top-actions [data-act="logout"]', 'click', () => c.onLogout && c.onLogout());
         on('#btn-snippets', 'click', () => c.onSnippets && c.onSnippets(sendToActive));
-        on('#btn-select', 'click', () => {
-            if (!active()) {
-                toast('当前没有打开的会话', 'err');
-                return;
-            }
-            setSelectMode(!selectMode);
-        });
         on('#btn-files', 'click', () => {
             const s = active();
             if (!s) {
