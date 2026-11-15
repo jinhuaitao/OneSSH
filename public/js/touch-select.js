@@ -2,6 +2,12 @@
 
 export const LONG_PRESS_MS = 420;
 export const MOVE_TOLERANCE = 16;
+/**
+ * 手指的抖动容差：超过它可以认定「用户开始动了」，就该取消长按计时器。
+ * 比 MOVE_TOLERANCE 小 —— 手指慢慢滑出去时，绝不能还被判成长按，
+ * 否则想滚历史的手势会变成选字。
+ */
+export const LONG_PRESS_JITTER = 6;
 
 /**
  * 旧版 iOS Safari 不认 overscroll-behavior 时的兜底判定。
@@ -58,9 +64,62 @@ export function cellAt(rect, cols, rows, clientX, clientY) {
 }
 
 /**
+ * 把两个字符坐标归一成「起点在前、终点在后」的区间。
+ * 反向拖动（从字 B 拖回字 A）也能得到同一段选区。
+ */
+export function normalizeSel(cols, a, b) {
+    const n = Math.max(1, cols);
+    const i1 = a.row * n + a.col;
+    const i2 = b.row * n + b.col;
+    const from = Math.min(i1, i2);
+    const to = Math.max(i1, i2);
+    return {
+        from: { row: Math.floor(from / n), col: from % n },
+        to: { row: Math.floor(to / n), col: to % n },
+        forward: i2 >= i1,
+        cells: to - from + 1,
+    };
+}
+
+/**
+ * 逐行的列跨度（闭区间），用来自己画高亮：
+ * 首行从起点列开始，末行到终点列结束，中间整行全选。
+ */
+export function selectionRows(cols, a, b) {
+    const { from, to } = normalizeSel(cols, a, b);
+    const n = Math.max(1, cols);
+    const rows = [];
+    for (let row = from.row; row <= to.row; row++) {
+        const c1 = row === from.row ? from.col : 0;
+        const c2 = row === to.row ? to.col : n - 1;
+        if (c2 >= c1) rows.push({ row, from: c1, to: c2 });
+    }
+    return rows;
+}
+
+/**
+ * 把逐行取到的文字拼回一段文本：xterm 里软换行的续行（isWrapped）不能插换行，
+ * 否则复制出来的命令会被截断。
+ */
+export function joinLines(parts) {
+    let out = '';
+    let first = true;
+    for (const p of parts || []) {
+        const text = p && p.text != null ? String(p.text) : '';
+        if (!first && !(p && p.wrapped)) out += '\n';
+        out += text;
+        first = false;
+    }
+    return out;
+}
+
+/**
  * 两个字符坐标之间的选区，转成 xterm 的 select(column, row, length)。
  * length 是「从起点开始的字符数」，xterm 自己会沿 buffer 跨行展开，
  * 所以这里把视口坐标拉平成一维索引再算差值，反向拖动也能正确工作。
+ *
+ * 注：触屏选择现在由 term.js 自绘高亮 + 自己取文字，不再依赖 xterm 的选区，
+ * 这个函数保留给需要调用 term.select() 的场景。
  */
 export function selectionRange(cols, a, b, rowOffset) {
     const n = Math.max(1, cols);

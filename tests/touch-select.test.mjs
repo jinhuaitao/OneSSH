@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LONG_PRESS_MS, MOVE_TOLERANCE, gestureIntent, shouldBlockPullToRefresh, isTapLike, cellAt, selectionRange } from '../public/js/touch-select.js';
+import { LONG_PRESS_MS, LONG_PRESS_JITTER, MOVE_TOLERANCE, gestureIntent, shouldBlockPullToRefresh, isTapLike, cellAt, selectionRange, normalizeSel, selectionRows, joinLines } from '../public/js/touch-select.js';
 
 const rect = { left: 12, top: 8, width: 800, height: 400 };
 
@@ -83,4 +83,42 @@ test('gestureIntent：静止够久才长按，轻微抖动继续等', () => {
 test('长按阈值与移动容差在可用区间', () => {
     assert.ok(LONG_PRESS_MS >= 300 && LONG_PRESS_MS <= 800);
     assert.ok(MOVE_TOLERANCE > 0 && MOVE_TOLERANCE <= 20);
+});
+
+test('抖动容差小于移动容差：一动手就不再算长按', () => {
+    assert.ok(LONG_PRESS_JITTER > 0);
+    assert.ok(LONG_PRESS_JITTER < MOVE_TOLERANCE);
+});
+
+test('normalizeSel：正向与反向拖动得到同一段区间', () => {
+    const fwd = normalizeSel(80, { col: 2, row: 1 }, { col: 5, row: 1 });
+    assert.deepEqual(fwd, { from: { row: 1, col: 2 }, to: { row: 1, col: 5 }, forward: true, cells: 4 });
+    const back = normalizeSel(80, { col: 5, row: 3 }, { col: 2, row: 1 });
+    assert.deepEqual(back, { from: { row: 1, col: 2 }, to: { row: 3, col: 5 }, forward: false, cells: 164 });
+});
+
+test('selectionRows：单行 / 跨行 / 反向的逐行跨度', () => {
+    // 同一行：只覆盖起止列之间
+    assert.deepEqual(selectionRows(80, { col: 2, row: 1 }, { col: 5, row: 1 }), [{ row: 1, from: 2, to: 5 }]);
+    // 跨行：首行到尾列、中间整行、末行从 0 开始
+    const spans = selectionRows(80, { col: 78, row: 0 }, { col: 1, row: 2 });
+    assert.deepEqual(spans, [
+        { row: 0, from: 78, to: 79 },
+        { row: 1, from: 0, to: 79 },
+        { row: 2, from: 0, to: 1 },
+    ]);
+    // 反向拖动（从下面的字拖回上面的字）结果一致
+    assert.deepEqual(selectionRows(80, { col: 1, row: 2 }, { col: 78, row: 0 }), spans);
+});
+
+test('selectionRows：单点选择覆盖一个字符', () => {
+    assert.deepEqual(selectionRows(80, { col: 4, row: 2 }, { col: 4, row: 2 }), [{ row: 2, from: 4, to: 4 }]);
+});
+
+test('joinLines：软换行的续行不插换行符', () => {
+    assert.equal(joinLines([{ text: 'abc' }, { text: 'def', wrapped: true }]), 'abcdef');
+    assert.equal(joinLines([{ text: 'abc' }, { text: 'def' }]), 'abc\ndef');
+    assert.equal(joinLines([{ text: '' }, { text: 'x' }]), '\nx');
+    assert.equal(joinLines([]), '');
+    assert.equal(joinLines(null), '');
 });
