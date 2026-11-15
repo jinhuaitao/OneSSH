@@ -225,6 +225,26 @@ test('首页骨架带「返回终端」入口，且无会话时默认隐藏', as
     assert.ok(html.includes('返回终端'));
 });
 
+test('前端脚本与样式强制校验缓存，避免部署后仍跑旧 JS', async () => {
+    const env = makeEnv({ __worker: worker });
+    env.ASSETS = {
+        fetch: async () => new Response('/* stub */', {
+            status: 200,
+            headers: { 'content-type': 'application/javascript; charset=utf-8', etag: '"stub"' },
+        }),
+    };
+    const js = await call(env, '/js/app.js');
+    assert.equal(js.status, 200);
+    assert.equal(js.headers.get('cache-control'), 'no-cache');
+
+    const css = await call(env, '/term.css');
+    assert.equal(css.headers.get('cache-control'), 'no-cache');
+
+    // 很少改动的 vendor 仍按原缓存策略，没必要每次校验
+    const vendor = await call(env, '/vendor/xterm.js');
+    assert.notEqual(vendor.headers.get('cache-control'), 'no-cache');
+});
+
 /* ------------------------------------------------------------------- 主机 */
 
 test('主机 CRUD：密文不外泄、更新时保留旧凭据', async () => {

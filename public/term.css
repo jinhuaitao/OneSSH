@@ -136,6 +136,12 @@
     border-color: #2b3644;
     background: #151b23;
 }
+/* 「选择」模式开启时高亮，避免用户不知道为什么触摸不再输入 */
+.tbtn.ghost.on {
+    border-color: #f03d08;
+    background: #2a1710;
+    color: #ffb59b;
+}
 .tbtn.danger:hover {
     color: #ff8f85;
     border-color: #3a1f1f;

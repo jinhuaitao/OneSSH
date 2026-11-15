@@ -868,6 +868,12 @@ export default {
                 if (path.endsWith('.webmanifest') && !/manifest\+json/.test(headers.get('content-type') || '')) {
                     headers.set('content-type', 'application/manifest+json; charset=utf-8');
                 }
+                // 前端代码改得勤，浏览器 / PWA 缓存住旧 JS 会让人一直看到旧行为
+                // （比如新加的「选择」按钮根本不存在）。自家脚本与样式每次都校验，
+                // 内容没变靠 ETag 走 304 不传正文；vendor/ 与图标仍可长缓存。
+                if (/^\/js\/.*\.js$/.test(path) || path === '/style.css' || path === '/term.css') {
+                    headers.set('cache-control', 'no-cache');
+                }
                 for (const [k, v] of Object.entries(securityHeaders(request))) {
                     if (!headers.has(k)) headers.set(k, v);
                 }
