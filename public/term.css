@@ -329,6 +329,16 @@
 }
 .pane .xterm-viewport {
     background: transparent !important;
+    /* xterm 用 JS 改 scrollTop 滚动；关掉 iOS 的惯性层，别把 overscroll 传给页面 */
+    -webkit-overflow-scrolling: auto;
+}
+/* 内部滚动到边界不向页面传导，避免「滚到顶继续下拉」变成刷新网页 */
+.term,
+.term-body,
+.panes,
+.pane,
+.pane .xterm-viewport {
+    overscroll-behavior: contain;
 }
 .pane .xterm-viewport::-webkit-scrollbar {
     width: 9px;

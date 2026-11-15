@@ -1,7 +1,7 @@
 /* Terminal view: tabs, panes, websocket sessions, live host metrics, key bar. */
 
 import { $, el, icon, toast, modal, confirmModal, fmtBytes, fmtRate, fmtUptime, copyText } from './ui.js';
-import { LONG_PRESS_MS, MOVE_TOLERANCE, gestureIntent, cellAt, selectionRange } from './touch-select.js';
+import { LONG_PRESS_MS, MOVE_TOLERANCE, gestureIntent, shouldBlockPullToRefresh, cellAt, selectionRange } from './touch-select.js';
 
 const THEME = {
     background: '#070910',
@@ -621,6 +621,48 @@ export function createTerminalView(cfg) {
         view.addEventListener('touchcancel', finish, opts);
     }
 
+    /* ------------------------------------------------- overscroll guard */
+
+    // 终端里上下滑看历史时，旧版 iOS Safari 会把「滚到顶后继续下拉」解释成
+    // 浏览器下拉刷新 —— 页面一刷新，WebSocket 断开，SSH 会话彻底没了。
+    // 现代浏览器靠 CSS overscroll-behavior 解决，这里是给不认它的浏览器兜底。
+    function bindOverscrollGuard() {
+        const view = $('#view-term');
+        if (!view) return;
+        let y0 = null;
+        view.addEventListener(
+            'touchstart',
+            (ev) => {
+                y0 = ev.touches.length === 1 ? ev.touches[0].clientY : null;
+            },
+            { passive: true, capture: true }
+        );
+        view.addEventListener(
+            'touchmove',
+            (ev) => {
+                if (y0 == null || !ev.touches.length) return;
+                // 选择模式已接管手势，别插手
+                if (touchSel && touchSel.active) return;
+                const t = ev.touches[0];
+                const s = active();
+                if (!s || !s.pane) return;
+                // 只管终端内容区，按键条 / 标签栏的横向滑动照旧
+                const r = s.pane.getBoundingClientRect();
+                if (t.clientX < r.left || t.clientX > r.right || t.clientY < r.top || t.clientY > r.bottom) return;
+                const vp = s.term.element && s.term.element.querySelector('.xterm-viewport');
+                const top = vp ? vp.scrollTop : 0;
+                if (shouldBlockPullToRefresh(t.clientY - y0, top)) ev.preventDefault();
+                // 只挡浏览器默认行为，不 stopPropagation：xterm 用 JS 改 scrollTop 照常滚
+            },
+            { passive: false, capture: true }
+        );
+        const end = () => {
+            y0 = null;
+        };
+        view.addEventListener('touchend', end, { passive: true, capture: true });
+        view.addEventListener('touchcancel', end, { passive: true, capture: true });
+    }
+
     /* ------------------------------------------------------------ session */
 
     function wsUrl(opts) {
@@ -1131,6 +1173,8 @@ export function createTerminalView(cfg) {
         renderHostbar();
         // 只绑一次，挂在 #view-term 捕获阶段，覆盖所有会话的 pane
         bindTouchSelection();
+        // 防止上下翻历史时带出浏览器的下拉刷新
+        bindOverscrollGuard();
 
         const on = (sel, ev, fn) => {
             const node = $(sel);

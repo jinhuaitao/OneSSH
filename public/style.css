@@ -39,6 +39,10 @@ body {
     font-family: var(--sans);
     -webkit-font-smoothing: antialiased;
     text-rendering: optimizeLegibility;
+    /* 终端里上下翻历史时，别让页面级橡皮筋 / 下拉刷新把整页重载掉
+       （一刷新 WebSocket 断开，SSH 会话就没了）；不影响容器内部滚动 */
+    overscroll-behavior: none;
+    overscroll-behavior-y: none;
 }
 
 [hidden] {

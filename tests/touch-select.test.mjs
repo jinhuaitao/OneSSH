@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { LONG_PRESS_MS, MOVE_TOLERANCE, gestureIntent, cellAt, selectionRange } from '../public/js/touch-select.js';
+import { LONG_PRESS_MS, MOVE_TOLERANCE, gestureIntent, shouldBlockPullToRefresh, cellAt, selectionRange } from '../public/js/touch-select.js';
 
 const rect = { left: 12, top: 8, width: 800, height: 400 };
 
@@ -39,6 +39,14 @@ test('selectionRange：滚动过 scrollback 时叠加 viewportY', () => {
     // 视口第 3 行 = 缓冲区第 123 行（viewportY=120）
     assert.deepEqual(selectionRange(80, { col: 2, row: 3 }, { col: 7, row: 3 }, 120), { col: 2, row: 123, length: 6 });
     assert.deepEqual(selectionRange(80, { col: 70, row: 2 }, { col: 5, row: 3 }, 120), { col: 70, row: 122, length: 16 });
+});
+
+test('shouldBlockPullToRefresh：只有滚到顶后继续下拉才拦', () => {
+    assert.equal(shouldBlockPullToRefresh(30, 0), true);
+    assert.equal(shouldBlockPullToRefresh(30, 120), false); // 还在翻历史，正常滚
+    assert.equal(shouldBlockPullToRefresh(-30, 0), false); // 上滑看最新输出，不拦
+    assert.equal(shouldBlockPullToRefresh(0, 0), false);
+    assert.equal(shouldBlockPullToRefresh(8, undefined), true);
 });
 
 test('gestureIntent：按在一个字上横向拖到另一个字，立即进入选择', () => {

@@ -4,6 +4,15 @@ export const LONG_PRESS_MS = 420;
 export const MOVE_TOLERANCE = 16;
 
 /**
+ * 旧版 iOS Safari 不认 overscroll-behavior 时的兜底判定。
+ * dy > 0 表示手指往下拉；xterm 的 viewport 已经到顶（scrollTop<=0）时，
+ * 浏览器会把继续下拉解释成「刷新页面」—— 一刷新 SSH 会话就全没了。
+ */
+export function shouldBlockPullToRefresh(dy, scrollTop) {
+    return dy > 0 && (Number(scrollTop) || 0) <= 0;
+}
+
+/**
  * 判定一次触摸是「滚动」还是「选字」。纯函数，方便单测。
  *
  * 终端只有垂直滚动（xterm 的 handleTouchMove 只看 pageY 差值），所以：
