@@ -628,11 +628,16 @@ textarea {
     display: grid;
     grid-template-columns: 66px minmax(0, 610px) minmax(0, 1fr);
     height: 100dvh;
+    overflow: hidden; /* 页面级不滚动：滚动只发生在列表 / 终端内部 */
     background: var(--paper);
 }
 
 /* rail */
 .rail {
+    position: sticky;
+    top: 0;
+    height: 100dvh;
+    flex-shrink: 0;
     display: flex;
     flex-direction: column;
     align-items: center;
@@ -713,6 +718,7 @@ textarea {
     display: flex;
     flex-direction: column;
     min-width: 0;
+    min-height: 0; /* 允许内部列表滚动，而不是把整页撑高 */
     padding: 42px 40px 16px;
 }
 .dash-head {
@@ -1014,6 +1020,7 @@ textarea {
     display: flex;
     flex-direction: column;
     min-width: 0;
+    min-height: 0;
     padding: 42px 38px 16px;
     border-left: 1px solid var(--line);
     background-color: var(--paper);
