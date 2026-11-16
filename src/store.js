@@ -75,4 +75,46 @@ export async function list(env, prefix, includeMeta) {
     return out;
 }
 
+/* ----------------------------------------------------- 并发批量读写 */
+
+// R2 单次读的延迟在 10-50ms 量级，串行回读 100 个对象就是「首页打不开」。
+// 分批并发把总耗时压到原来的约 1/24，且不改变总请求数（免费计划 50 子请求
+// 的上限由对象数量决定，并发方式不影响它）。
+const BATCH = 24;
+
+export async function getJSONAll(env, keys, batchSize = BATCH) {
+    const out = new Array(keys.length).fill(null);
+    for (let i = 0; i < keys.length; i += batchSize) {
+        const chunk = keys.slice(i, i + batchSize);
+        const parts = await Promise.all(chunk.map((k) => getJSON(env, k)));
+        for (let j = 0; j < chunk.length; j++) out[i + j] = parts[j];
+    }
+    return out;
+}
+
+/** 列出前缀下所有对象并并发回读内容：[ { key, rec } ]，读取失败/为空的条目跳过 */
+export async function listJSON(env, prefix, batchSize = BATCH) {
+    const objs = await list(env, prefix);
+    const recs = await getJSONAll(env, objs.map((o) => o.key), batchSize);
+    const out = [];
+    for (let i = 0; i < objs.length; i++) {
+        if (recs[i]) out.push({ key: objs[i].key, rec: recs[i] });
+    }
+    return out;
+}
+
+export async function putJSONAll(env, pairs, batchSize = BATCH) {
+    for (let i = 0; i < pairs.length; i += batchSize) {
+        const chunk = pairs.slice(i, i + batchSize);
+        await Promise.all(chunk.map((p) => putJSON(env, p.key, p.rec, p.meta)));
+    }
+}
+
+export async function delAll(env, keys, batchSize = BATCH) {
+    for (let i = 0; i < keys.length; i += batchSize) {
+        const chunk = keys.slice(i, i + batchSize);
+        await Promise.all(chunk.map((k) => del(env, k)));
+    }
+}
+
 export { enc, dec };

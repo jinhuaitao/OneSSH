@@ -1,5 +1,5 @@
 // Account, session, throttle and at-rest secret encryption.
-import { getJSON, putJSON, putJSONIfAbsent, del, list } from './store.js';
+import { getJSON, putJSON, putJSONIfAbsent, del, list, getJSONAll, delAll } from './store.js';
 
 const ADMIN_KEY = 'sys/admin';
 const MASTER_KEY = 'sys/master';
@@ -389,18 +389,20 @@ export async function destroySession(env, token) {
 
 /** 改密后调用：让所有已登录设备失效（可保留当前 token） */
 export async function destroyAllSessions(env, exceptToken) {
-    for (const o of await list(env, SESSION_PREFIX)) {
-        if (exceptToken && o.key === SESSION_PREFIX + exceptToken) continue;
-        await del(env, o.key);
-    }
+    const objs = await list(env, SESSION_PREFIX);
+    const doomed = objs.map((o) => o.key).filter((k) => !exceptToken || k !== SESSION_PREFIX + exceptToken);
+    await delAll(env, doomed);
 }
 
 export async function pruneSessions(env) {
     const objs = await list(env, SESSION_PREFIX);
-    for (const o of objs) {
-        const rec = await getJSON(env, o.key);
-        if (!rec || !rec.exp || rec.exp < Date.now()) await del(env, o.key);
+    const recs = await getJSONAll(env, objs.map((o) => o.key));
+    const doomed = [];
+    for (let i = 0; i < objs.length; i++) {
+        const rec = recs[i];
+        if (!rec || !rec.exp || rec.exp < Date.now()) doomed.push(objs[i].key);
     }
+    await delAll(env, doomed);
 }
 
 /* --------------------------------------------------------------- throttle */
@@ -420,12 +422,14 @@ export async function checkThrottle(env, ip) {
     const prefix = throttlePrefix(ip);
     const now = Date.now();
     const stamps = [];
+    const stale = [];
     for (const o of await list(env, prefix)) {
         const ts = parseInt(o.key.slice(prefix.length), 10);
         if (!Number.isFinite(ts)) continue;
         if (now - ts <= THROTTLE_WINDOW) stamps.push(ts);
-        else del(env, o.key).catch(() => {}); // 顺手清理过期记录（不阻塞判定）
+        else stale.push(o.key); // 过期记录顺手清理（登录路径上每次都扫一遍）
     }
+    await delAll(env, stale).catch(() => {});
     if (stamps.length < THROTTLE_LIMIT) return { locked: false };
     const until = Math.max(...stamps) + THROTTLE_LOCK;
     if (until > now) return { locked: true, retryAfter: Math.ceil((until - now) / 1000) };
@@ -440,7 +444,7 @@ export async function recordFailure(env, ip) {
 export async function clearFailures(env, ip) {
     if (!ip) return;
     const prefix = throttlePrefix(ip);
-    for (const o of await list(env, prefix)) await del(env, o.key).catch(() => {});
+    await delAll(env, (await list(env, prefix)).map((o) => o.key)).catch(() => {});
 }
 
 /* ------------------------------------------------------- secret at rest */

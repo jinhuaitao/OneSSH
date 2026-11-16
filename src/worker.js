@@ -3,7 +3,7 @@ import { Terminal } from './session.js';
 import { normalizeHost } from './hostaddr.js';
 import { connect } from 'cloudflare:sockets';
 import * as auth from './auth.js';
-import { getJSON, putJSON, del, list, getBytes } from './store.js';
+import { getJSON, putJSON, del, list, getBytes, listJSON, putJSONAll } from './store.js';
 import { renderShell } from './pages.js';
 import { loadPrivateKey } from './ssh/keys.js';
 import { fingerprint } from './ssh/crypto.js';
@@ -168,8 +168,7 @@ async function listGroups(env) {
         }
     }
     // hosts saved before groups were a first-class concept still count
-    for (const o of await list(env, 'hosts/')) {
-        const rec = await getJSON(env, o.key);
+    for (const { rec } of await listJSON(env, 'hosts/')) {
         const name = rec && String(rec.group || '').trim();
         if (name && !seen.has(name)) {
             seen.add(name);
@@ -180,16 +179,16 @@ async function listGroups(env) {
 }
 
 async function retagHosts(env, from, to) {
-    let n = 0;
-    for (const o of await list(env, 'hosts/')) {
-        const rec = await getJSON(env, o.key);
+    const pairs = await listJSON(env, 'hosts/');
+    const changed = [];
+    for (const { key, rec } of pairs) {
         if (!rec || String(rec.group || '').trim() !== from) continue;
         rec.group = to;
         rec.updatedAt = Date.now();
-        await putJSON(env, o.key, rec);
-        n++;
+        changed.push({ key, rec });
     }
-    return n;
+    await putJSONAll(env, changed);
+    return changed.length;
 }
 
 /* ------------------------------------------------------------------ keys */
@@ -463,11 +462,8 @@ async function handleApi(request, env, url) {
         if (!/^[a-zA-Z0-9]+$/.test(id)) return json({ error: 'bad_id', message: '无效的密钥 ID' }, 400);
         const keys = await storedKeys(env);
         if (!keys.some((k) => k.id === id)) return json({ error: 'not_found', message: '密钥不存在' }, 404);
-        let used = 0;
-        for (const o of await list(env, 'hosts/')) {
-            const rec = await getJSON(env, o.key);
-            if (rec && rec.keyId === id) used++;
-        }
+        const pairs = await listJSON(env, 'hosts/');
+        const used = pairs.filter((p) => p.rec.keyId === id).length;
         if (used) return json({ error: 'in_use', message: `该密钥正被 ${used} 台主机使用，请先改用其他凭据` }, 409);
         await putJSON(env, 'sys/keys', { keys: keys.filter((k) => k.id !== id), updatedAt: Date.now() });
         return json({ ok: true });
@@ -503,14 +499,16 @@ async function handleApi(request, env, url) {
             await putJSON(env, 'sys/creds', { creds: next, updatedAt: Date.now() });
             // hosts keep a denormalised username for list rendering
             if (entry && entry.username !== username) {
-                for (const o of await list(env, 'hosts/')) {
-                    const host = await getJSON(env, o.key);
+                const pairs = await listJSON(env, 'hosts/');
+                const changed = [];
+                for (const { key, rec: host } of pairs) {
                     if (host && host.credId === rec.id) {
                         host.username = username;
                         host.updatedAt = Date.now();
-                        await putJSON(env, o.key, host);
+                        changed.push({ key, rec: host });
                     }
                 }
+                await putJSONAll(env, changed);
             }
             return json({ cred: publicCredMeta(rec) });
         }
@@ -521,11 +519,8 @@ async function handleApi(request, env, url) {
         if (!/^[a-zA-Z0-9]+$/.test(id)) return json({ error: 'bad_id', message: '无效的账号 ID' }, 400);
         const creds = await storedCreds(env);
         if (!creds.some((c) => c.id === id)) return json({ error: 'not_found', message: '常用账号不存在' }, 404);
-        let used = 0;
-        for (const o of await list(env, 'hosts/')) {
-            const rec = await getJSON(env, o.key);
-            if (rec && rec.credId === id) used++;
-        }
+        const pairs = await listJSON(env, 'hosts/');
+        const used = pairs.filter((p) => p.rec.credId === id).length;
         if (used) return json({ error: 'in_use', message: `该账号正被 ${used} 台主机使用，请先改用其他凭据` }, 409);
         await putJSON(env, 'sys/creds', { creds: creds.filter((c) => c.id !== id), updatedAt: Date.now() });
         return json({ ok: true });
@@ -533,12 +528,8 @@ async function handleApi(request, env, url) {
 
     if (path === '/api/hosts') {
         if (method === 'GET') {
-            const objs = await list(env, 'hosts/');
-            const hosts = [];
-            for (const o of objs) {
-                const rec = await getJSON(env, o.key);
-                if (rec) hosts.push(publicHost(rec));
-            }
+            // list 之后并发回读（分批 24 个），串行 100 台主机要挂好几秒
+            const hosts = (await listJSON(env, 'hosts/')).map((p) => publicHost(p.rec));
             hosts.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || (a.name || '').localeCompare(b.name || ''));
             return json({ hosts });
         }
@@ -636,12 +627,7 @@ async function handleApi(request, env, url) {
 
     if (path === '/api/known') {
         if (method === 'GET') {
-            const objs = await list(env, 'known/');
-            const items = [];
-            for (const o of objs) {
-                const rec = await getJSON(env, o.key);
-                if (rec) items.push({ key: o.key, ...rec });
-            }
+            const items = (await listJSON(env, 'known/')).map((p) => ({ key: p.key, ...p.rec }));
             items.sort((a, b) => String(a.host).localeCompare(String(b.host)));
             return json({ known: items });
         }
