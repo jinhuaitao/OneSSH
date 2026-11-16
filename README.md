@@ -94,7 +94,7 @@ npm test                # 115 个用例，无需 Cloudflare / sshd / 浏览器
 npx wrangler deploy     # 需先 wrangler login
 ```
 
-`npm test` 用 Node 内置 `node:test`：内存 R2（含条件写与分页）+ `cloudflare:sockets` 桩，覆盖加解密、SFTP、API 鉴权、限流、安全加固等。删 `.wrangler/state` 清空本地数据。
+`npm test` 用 Node 内置 `node:test`：内存 R2（含条件写与分页）+ `cloudflare:sockets` 桩，覆盖加解密、SFTP、API 鉴权、限流、安全加固等。
 
 ---
 
