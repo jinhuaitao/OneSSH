@@ -156,6 +156,21 @@ function shakeForm(form) {
     form.classList.add('shake');
 }
 
+/**
+ * 防浏览器自动填充：Chrome 在页面上出现密码字段时，会把保存的账号名
+ * 塞进第一个可见的文本框（典型症状：点开「设置」后搜索框里冒出 admin）。
+ * autocomplete 属性拦不住这个启发式，但只读输入框不会被填充 ——
+ * 所以先挂 readonly，用户真正点/碰到的瞬间再解锁，输入不受影响。
+ */
+function unlockOnInteract(input) {
+    input.setAttribute('readonly', 'readonly');
+    const unlock = () => input.removeAttribute('readonly');
+    input.addEventListener('pointerdown', unlock);
+    input.addEventListener('touchstart', unlock, { passive: true });
+    input.addEventListener('focus', unlock);
+    input.addEventListener('keydown', unlock);
+}
+
 function bindAuth() {
     bindPwToggles();
 
@@ -1528,8 +1543,11 @@ function openSettings() {
     });
     const recordIn = el('input', { type: 'checkbox', checked: !!state.settings.record });
 
-    const curIn = el('input', { type: 'password', autocomplete: 'current-password' });
-    const nextIn = el('input', { type: 'password', autocomplete: 'new-password', placeholder: '至少 10 位' });
+    const curIn = el('input', { type: 'password', autocomplete: 'current-password', name: 'cur-password' });
+    const nextIn = el('input', { type: 'password', autocomplete: 'new-password', name: 'next-password', placeholder: '至少 10 位' });
+    // 弹窗一打开就被浏览器自动填上保存的密码 → 两个密码框同样走 readonly 解锁
+    unlockOnInteract(curIn);
+    unlockOnInteract(nextIn);
     const pwMsg = el('p', { class: 'form-error', style: 'margin:0' });
 
     const body = el('div', { style: 'display:flex;flex-direction:column;gap:16px' }, [
@@ -1767,6 +1785,7 @@ function bindStatic() {
 
     const searchIn = $('#host-search');
     if (searchIn) {
+        unlockOnInteract(searchIn);
         const apply = debounce(() => {
             state.query = searchIn.value;
             renderList();
