@@ -1717,6 +1717,54 @@ function bindStatic() {
     const refresh = $('#btn-refresh');
     if (refresh) refresh.addEventListener('click', () => loadHosts());
 
+    // 地区筛选条：桌面端滚轮上下滚动 → 横向滚动；按住鼠标左键拖拽平移。
+    // 触屏设备走原生触摸滚动，不做处理。
+    const filters = $('#filters');
+    if (filters) {
+        const canPan = () => filters.scrollWidth > filters.clientWidth + 1;
+        filters.addEventListener('wheel', (ev) => {
+            if (Math.abs(ev.deltaY) <= Math.abs(ev.deltaX)) return; // 已经是横向滚动
+            if (!canPan()) return; // 没溢出时不拦截，让页面正常滚动
+            ev.preventDefault();
+            filters.scrollLeft += ev.deltaY;
+        }, { passive: false });
+
+        let panning = false;
+        let startX = 0;
+        let startLeft = 0;
+        let moved = false;
+        filters.addEventListener('pointerdown', (ev) => {
+            if (ev.pointerType === 'touch' || ev.button !== 0 || !canPan()) return;
+            panning = true;
+            moved = false;
+            startX = ev.clientX;
+            startLeft = filters.scrollLeft;
+        });
+        window.addEventListener('pointermove', (ev) => {
+            if (!panning) return;
+            const dx = ev.clientX - startX;
+            if (Math.abs(dx) > 4) {
+                moved = true;
+                filters.style.cursor = 'grabbing';
+            }
+            if (moved) filters.scrollLeft = startLeft - dx;
+        });
+        const stopPan = () => {
+            panning = false;
+            filters.style.cursor = '';
+        };
+        window.addEventListener('pointerup', stopPan);
+        window.addEventListener('pointercancel', stopPan);
+        // 拖拽松手后的那次 click 是误触，拦掉，避免切到不想点的筛选
+        filters.addEventListener('click', (ev) => {
+            if (moved) {
+                ev.stopPropagation();
+                ev.preventDefault();
+                moved = false;
+            }
+        }, true);
+    }
+
     const searchIn = $('#host-search');
     if (searchIn) {
         const apply = debounce(() => {

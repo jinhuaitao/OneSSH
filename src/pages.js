@@ -196,7 +196,7 @@ export function renderShell() {
       <div class="dash-tools">
         <label class="search">
           ${icon('search', 15)}
-          <input id="host-search" type="search" placeholder="搜索名称 / 地址 / 备注" title="可按名称、地址、用户名、分组、城市、备注搜索" autocomplete="off" spellcheck="false" aria-label="搜索主机">
+          <input id="host-search" type="text" placeholder="搜索名称 / 地址 / 备注" title="可按名称、地址、用户名、分组、城市、备注搜索" autocomplete="host-search-off" enterkeyhint="search" autocapitalize="off" spellcheck="false" aria-label="搜索主机">
         </label>
         <button class="btn primary" id="btn-add-host">${icon('plus', 15)} 添加主机</button>
       </div>
