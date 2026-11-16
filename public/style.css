@@ -1313,6 +1313,65 @@ textarea {
     padding: 22px 12px;
     line-height: 1.8;
 }
+
+/* 设置弹窗里的折叠区块（主机密钥） */
+.fold {
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: #fff;
+}
+.fold-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 10px 12px;
+    border: 0;
+    background: none;
+    cursor: pointer;
+    text-align: left;
+    font-family: inherit;
+    border-radius: 10px;
+    transition: background 0.15s ease;
+}
+.fold-head:hover {
+    background: var(--paper-2);
+}
+.fold-head .ttl {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+}
+.fold-head .fold-sub {
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 2px;
+}
+.fold-head .flag {
+    display: inline-flex;
+    color: var(--muted);
+}
+.fold-head .grow {
+    flex: 1;
+    min-width: 0;
+}
+.fold-chev {
+    color: var(--muted-2);
+    display: inline-flex;
+    transition: transform 0.18s ease;
+}
+.fold-head.open .fold-chev {
+    transform: rotate(180deg);
+}
+.fold > .list {
+    padding: 10px 12px 12px;
+    border-top: 1px solid var(--line-2);
+    max-height: 240px;
+    overflow-y: auto;
+}
+.fold > .list .empty-hint {
+    padding: 12px;
+}
 .vault-sec + .vault-sec {
     margin-top: 18px;
 }

@@ -86,6 +86,10 @@ export function createGlobe(canvas, labelLayer, opts) {
     let yaw = -1.92; // centres the disk on ~110°E
     let pitch = 0.28; // and tilts it up to ~16°N
     let auto = options.autoRotate !== false;
+    // 自动旋转预算：转满一圈（2π）后自动停；手动点「继续旋转」会重置为新一圈
+    const SPIN_TURN = Math.PI * 2;
+    let spinLeft = SPIN_TURN;
+    const onAutoStop = typeof options.onAutoStop === 'function' ? options.onAutoStop : null;
     let dragging = false;
     let lastX = 0;
     let lastY = 0;
@@ -477,9 +481,16 @@ export function createGlobe(canvas, labelLayer, opts) {
         const dt = last ? Math.min(60, t - last) : 16;
         last = t;
         if (auto && !dragging && !selected) {
-            yaw += dt * 0.00011;
+            const step = Math.min(dt * 0.00011, spinLeft);
+            yaw += step;
+            spinLeft -= step;
             cosYaw = Math.cos(yaw);
             sinYaw = Math.sin(yaw);
+            if (spinLeft <= 0) {
+                auto = false;
+                spinLeft = 0;
+                if (onAutoStop) onAutoStop();
+            }
         }
         if (glOk && texReady) drawGL();
         ctx.clearRect(0, 0, W, H);
@@ -575,9 +586,13 @@ export function createGlobe(canvas, labelLayer, opts) {
         },
         setAutoRotate(on) {
             auto = !!on;
+            if (auto) spinLeft = SPIN_TURN; // 重新开转时给满一圈的预算
         },
         isAutoRotate() {
             return auto;
+        },
+        spinRemaining() {
+            return spinLeft;
         },
         nudge() {
             yaw += 0.12;

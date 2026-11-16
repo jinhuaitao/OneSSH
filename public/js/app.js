@@ -458,6 +458,11 @@ function ensureGlobe() {
     if (!canvas) return;
     state.globe = createGlobe(canvas, labels, {
         autoRotate: true,
+        // 自动旋转满一圈后停下，按钮同步显示「继续旋转」
+        onAutoStop: () => {
+            const btn = $('#btn-rotate');
+            if (btn) btn.textContent = '继续旋转';
+        },
         onPick: (p) => {
             const host = state.hosts.find((h) => h.id === p.id);
             if (host) connectHost(host);
@@ -1358,18 +1363,29 @@ async function persistSnippets() {
 
 /* ------------------------------------------------------------- known keys */
 
-function openKnown() {
-    setNav('known');
-    const box = el('div', { class: 'list' });
+/* 主机密钥折叠区块：放在设置弹窗里，默认收起，点开才加载列表 */
+function knownFoldSection() {
+    const list = el('div', { class: 'list', hidden: true });
+    const chev = el('span', { class: 'fold-chev', html: icon('chevron', 15) });
+    const head = el('button', { type: 'button', class: 'fold-head' }, [
+        el('span', { class: 'flag', text: '🔑' }),
+        el('div', { class: 'grow' }, [
+            el('div', { class: 'ttl', text: '主机密钥' }),
+            el('div', { class: 'fold-sub', text: '已信任的主机指纹（首次连接时记录）' }),
+        ]),
+        chev,
+    ]);
+
     const render = (items) => {
-        box.textContent = '';
+        list.textContent = '';
         if (!items.length) {
-            box.appendChild(el('div', { class: 'empty-hint', html: '还没有记录。<br>第一次连接某台主机时会询问你是否信任它的主机密钥。' }));
+            list.appendChild(el('div', { class: 'empty-hint', html: '还没有记录。<br>第一次连接某台主机时会询问你是否信任它的主机密钥。' }));
             return;
         }
         for (const k of items) {
             const del = el('button', { class: 'act icon-only', type: 'button', title: '忘记这台主机', html: icon('trash', 14) });
-            del.addEventListener('click', async () => {
+            del.addEventListener('click', async (ev) => {
+                ev.stopPropagation();
                 // 删除信任记录 = 撤掉这台主机的中间人防护，必须二次确认，不能一键直删
                 const ok = await confirmModal(
                     '忘记这台主机',
@@ -1382,9 +1398,9 @@ function openKnown() {
                 const res = await safe(() => api('/api/known?key=' + encodeURIComponent(k.key), { method: 'DELETE' }));
                 if (!res) return;
                 toast('已移除');
-                openKnownRefresh();
+                load();
             });
-            box.appendChild(
+            list.appendChild(
                 el('div', { class: 'list-row' }, [
                     el('span', { class: 'flag', text: '🔑' }),
                     el('div', { class: 'grow' }, [
@@ -1396,14 +1412,21 @@ function openKnown() {
             );
         }
     };
-    let m;
-    const openKnownRefresh = async () => {
+
+    async function load() {
         const res = await safe(() => api('/api/known'));
         if (!res) return;
         render(res.known || []);
-    };
-    m = modal({ title: '主机密钥', body: box, onClose: () => setNav('overview') });
-    openKnownRefresh();
+    }
+
+    head.addEventListener('click', () => {
+        const opening = list.hidden;
+        list.hidden = !opening;
+        head.classList.toggle('open', opening);
+        if (opening && !list.childElementCount) load(); // 第一次展开才请求
+    });
+
+    return el('div', { class: 'fold' }, [head, list]);
 }
 
 /* ------------------------------------------------------------------- logs */
@@ -1515,6 +1538,7 @@ function openSettings() {
             el('div', { style: 'display:flex;align-items:center;gap:10px' }, [sizeIn, sizeVal]),
         ]),
         el('label', { class: 'check' }, [recordIn, el('span', { text: '默认录制会话输出（加密后保存在 R2，可随时回看）' })]),
+        knownFoldSection(),
         el('hr', { style: 'border:0;border-top:1px solid #f0ebe2;margin:2px 0' }),
         el('div', { class: 'eyebrow', style: 'margin:0', text: 'CHANGE PASSWORD' }),
         field('当前密码', curIn),
@@ -1747,7 +1771,6 @@ function bindStatic() {
             } else if (nav === 'groups') openGroups();
             else if (nav === 'snippets') openSnippets(state.term && !$('#view-term').hidden ? (cmd) => state.term.sendToActive(cmd) : null);
             else if (nav === 'quick') openQuickConnect();
-            else if (nav === 'known') openKnown();
             else if (nav === 'keys') openVault();
             else if (nav === 'settings') openSettings();
             else if (nav === 'logout') logout();
