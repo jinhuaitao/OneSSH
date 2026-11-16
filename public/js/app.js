@@ -126,7 +126,39 @@ function promptText(title, label, value, okLabel, hint) {
 
 /* ------------------------------------------------------------------- auth */
 
+// 登录/初始化表单里的小眼睛：切换密码明文显隐
+function bindPwToggles() {
+    document.querySelectorAll('#view-auth .pw-toggle').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const input = btn.parentElement.querySelector('input');
+            if (!input) return;
+            const show = input.type === 'password';
+            input.type = show ? 'text' : 'password';
+            btn.classList.toggle('on', show);
+            btn.setAttribute('aria-label', show ? '隐藏密码' : '显示密码');
+            input.focus();
+        });
+    });
+}
+
+// 提交期间的按钮加载态：转圈小 spinner，防止重复点击
+function setLoading(form, on) {
+    const btn = form.querySelector('button[type="submit"]');
+    if (!btn) return;
+    btn.classList.toggle('loading', !!on);
+    btn.disabled = !!on;
+}
+
+// 登录失败时表单抖一下，视觉上和错误提示呼应
+function shakeForm(form) {
+    form.classList.remove('shake');
+    void form.offsetWidth; // 重新触发动画
+    form.classList.add('shake');
+}
+
 function bindAuth() {
+    bindPwToggles();
+
     const setupForm = $('#form-setup');
     setupForm.addEventListener('submit', async (ev) => {
         ev.preventDefault();
@@ -138,10 +170,10 @@ function bindAuth() {
         const password2 = String(fd.get('password2') || '');
         if (password !== password2) {
             errEl.textContent = '两次输入的密码不一致';
+            shakeForm(setupForm);
             return;
         }
-        const btn = setupForm.querySelector('button[type="submit"]');
-        btn.disabled = true;
+        setLoading(setupForm, true);
         try {
             await api('/api/setup', { method: 'POST', body: { username, password, token: String(fd.get('token') || '') } });
             state.setup = true;
@@ -150,8 +182,9 @@ function bindAuth() {
             enterApp();
         } catch (e) {
             errEl.textContent = e.message;
+            shakeForm(setupForm);
         } finally {
-            btn.disabled = false;
+            setLoading(setupForm, false);
         }
     });
 
@@ -161,8 +194,7 @@ function bindAuth() {
         const errEl = $('#login-error');
         errEl.textContent = '';
         const fd = new FormData(loginForm);
-        const btn = loginForm.querySelector('button[type="submit"]');
-        btn.disabled = true;
+        setLoading(loginForm, true);
         try {
             const res = await api('/api/login', {
                 method: 'POST',
@@ -173,8 +205,9 @@ function bindAuth() {
             enterApp();
         } catch (e) {
             errEl.textContent = e.message;
+            shakeForm(loginForm);
         } finally {
-            btn.disabled = false;
+            setLoading(loginForm, false);
         }
     });
 }

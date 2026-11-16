@@ -19,6 +19,9 @@ const ICONS = {
     log: '<path d="M6 3.5h7l5 5v12H6z"/><path d="M13 3.5v5h5M9 13h6M9 16.5h4"/>',
     folder: '<path d="M3.5 6.5h6l1.8 2h9.2v10.5a1 1 0 0 1-1 1h-15a1 1 0 0 1-1-1z"/>',
     lock: '<rect x="4" y="10" width="16" height="10" rx="2.5"/><path d="M8 10V7a4 4 0 0 1 8 0v3"/>',
+    user: '<circle cx="12" cy="8" r="3.6"/><path d="M5 20a7.2 7.2 0 0 1 14 0"/>',
+    eye: '<path d="M2.5 12S6 5.8 12 5.8 21.5 12 21.5 12 18 18.2 12 18.2 2.5 12 2.5 12z"/><circle cx="12" cy="12" r="2.8"/>',
+    eyeoff: '<path d="M4 4l16 16"/><path d="M9.9 5.3A9.4 9.4 0 0 1 12 5.2c6 0 9.5 6.8 9.5 6.8a17 17 0 0 1-2.9 3.8M6.3 6.9A16.3 16.3 0 0 0 2.5 12s3.5 6.8 9.5 6.8a9.4 9.4 0 0 0 3.6-.7"/>',
     search: '<circle cx="10.5" cy="10.5" r="6"/><path d="m15 15 4.5 4.5"/>',
 };
 
@@ -66,38 +69,105 @@ export function renderShell() {
 
 <!-- ============================ 登录 / 初始化 ============================ -->
 <div class="auth" id="view-auth" hidden>
-  <div class="auth-card">
-    <div class="auth-brand">
-      <div class="brand-mark">${icon('terminal', 20)}</div>
-      <div>
-        <h1>WebSSH</h1>
-        <p>在浏览器中安全连接你的服务器</p>
+  <div class="auth-stage">
+    <aside class="auth-hero">
+      <div class="hero-top">
+        <div class="brand-mark">${icon('terminal', 18)}</div>
+        <span class="hero-word">WebSSH</span>
+        <span class="hero-chip">Workers · R2</span>
       </div>
-    </div>
 
-    <form id="form-setup" class="auth-form" hidden autocomplete="off">
-      <p class="eyebrow">FIRST RUN</p>
-      <h2>初始化管理员</h2>
-      <p class="hint">设置访问本工具的账号与密码，凭据只保存在你自己的 R2 存储里。</p>
-      <label>用户名<input name="username" type="text" placeholder="admin" autocomplete="username" required minlength="3" maxlength="32"></label>
-      <label id="setup-token-field">初始化口令<input name="token" type="password" placeholder="部署时设置的 WEBSSH_SETUP_TOKEN" autocomplete="off" required></label>
-      <p class="form-hint" id="setup-token-hint" hidden>还没配置 <code>WEBSSH_SETUP_TOKEN</code>：先到 Worker 的变量里设置它，否则无法初始化（未设置时任何人都能抢先成为管理员）。</p>
-      <label>密码<input name="password" type="password" placeholder="至少 10 位" autocomplete="new-password" required minlength="10" maxlength="200"></label>
-      <label>确认密码<input name="password2" type="password" placeholder="再次输入" autocomplete="new-password" required minlength="10" maxlength="200"></label>
-      <button type="submit" class="btn primary block">创建并进入</button>
-      <p class="form-error" id="setup-error"></p>
-    </form>
+      <div class="hero-copy">
+        <p class="eyebrow">SSH · IN · YOUR · BROWSER</p>
+        <h2>把终端装进浏览器，<br><em>服务器近在指尖。</em></h2>
+        <p class="hero-sub">无需安装任何客户端，打开网页即可连接、管理你的每一台服务器。</p>
+      </div>
 
-    <form id="form-login" class="auth-form" hidden autocomplete="off">
-      <p class="eyebrow">SIGN IN</p>
-      <h2>登录</h2>
-      <label>用户名<input name="username" type="text" autocomplete="username" required></label>
-      <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
-      <button type="submit" class="btn primary block">登录</button>
-      <p class="form-error" id="login-error"></p>
-    </form>
+      <ul class="hero-feats">
+        <li>${icon('lock', 14)}<div><b>端到端加密</b><span>凭据 AES-GCM 加密，只存在你自己的 R2 里</span></div></li>
+        <li>${icon('terminal', 14)}<div><b>xterm.js 终端</b><span>多标签会话、快捷按键、代码片段一键发送</span></div></li>
+        <li>${icon('folder', 14)}<div><b>SFTP 文件管理</b><span>浏览、上传、在线编辑，随手完成</span></div></li>
+      </ul>
+
+      <div class="hero-term" aria-hidden="true">
+        <div class="ht-bar"><i></i><i></i><i></i><span>ssh admin@prod-web-01</span></div>
+        <div class="ht-body">
+          <p><span class="ht-p">➜</span> <span class="ht-cmd">uptime</span></p>
+          <p class="ht-out">14:02:11 up 42 days, 1 user, load average: 0.08</p>
+          <p><span class="ht-p">➜</span> <span class="ht-cursor"></span></p>
+        </div>
+      </div>
+
+      <footer class="hero-foot">☁️ Cloudflare Workers · 🗄️ 数据保存在你自己的 R2</footer>
+    </aside>
+
+    <main class="auth-pane">
+      <div class="auth-brand">
+        <div class="brand-mark">${icon('terminal', 18)}</div>
+        <div>
+          <h1>WebSSH</h1>
+          <p>在浏览器中安全连接你的服务器</p>
+        </div>
+      </div>
+
+      <form id="form-setup" class="auth-form" hidden autocomplete="off">
+        <p class="eyebrow">FIRST RUN</p>
+        <h2>初始化管理员</h2>
+        <p class="hint">设置访问本工具的账号与密码，凭据只保存在你自己的 R2 存储里。</p>
+        <label>用户名
+          <span class="field">
+            <span class="f-ic">${icon('user', 15)}</span>
+            <input name="username" type="text" placeholder="admin" autocomplete="username" required minlength="3" maxlength="32">
+          </span>
+        </label>
+        <label id="setup-token-field">初始化口令
+          <span class="field">
+            <span class="f-ic">${icon('key', 15)}</span>
+            <input name="token" type="password" placeholder="部署时设置的 WEBSSH_SETUP_TOKEN" autocomplete="off" required>
+          </span>
+        </label>
+        <p class="form-hint" id="setup-token-hint" hidden>还没配置 <code>WEBSSH_SETUP_TOKEN</code>：先到 Worker 的变量里设置它，否则无法初始化（未设置时任何人都能抢先成为管理员）。</p>
+        <label>密码
+          <span class="field">
+            <span class="f-ic">${icon('lock', 15)}</span>
+            <input name="password" type="password" placeholder="至少 10 位" autocomplete="new-password" required minlength="10" maxlength="200">
+            <button type="button" class="pw-toggle" aria-label="显示密码" tabindex="-1">${icon('eye', 15)}${icon('eyeoff', 15)}</button>
+          </span>
+        </label>
+        <label>确认密码
+          <span class="field">
+            <span class="f-ic">${icon('lock', 15)}</span>
+            <input name="password2" type="password" placeholder="再次输入" autocomplete="new-password" required minlength="10" maxlength="200">
+            <button type="button" class="pw-toggle" aria-label="显示密码" tabindex="-1">${icon('eye', 15)}${icon('eyeoff', 15)}</button>
+          </span>
+        </label>
+        <button type="submit" class="btn primary block">创建并进入</button>
+        <p class="form-error" id="setup-error"></p>
+      </form>
+
+      <form id="form-login" class="auth-form" hidden autocomplete="off">
+        <p class="eyebrow">SIGN IN</p>
+        <h2>欢迎回来</h2>
+        <label>用户名
+          <span class="field">
+            <span class="f-ic">${icon('user', 15)}</span>
+            <input name="username" type="text" autocomplete="username" required>
+          </span>
+        </label>
+        <label>密码
+          <span class="field">
+            <span class="f-ic">${icon('lock', 15)}</span>
+            <input name="password" type="password" autocomplete="current-password" required>
+            <button type="button" class="pw-toggle" aria-label="显示密码" tabindex="-1">${icon('eye', 15)}${icon('eyeoff', 15)}</button>
+          </span>
+        </label>
+        <button type="submit" class="btn primary block">登 录</button>
+        <p class="form-error" id="login-error"></p>
+      </form>
+
+      <p class="pane-foot">via Cloudflare Workers · 单管理员 · 密码错误 6 次将锁定 15 分钟</p>
+    </main>
   </div>
-  <p class="auth-foot">via Cloudflare Workers · 数据保存在你自己的 R2</p>
 </div>
 
 <!-- ================================ 总览 ================================ -->
