@@ -777,23 +777,32 @@ async function handleWebSocket(request, env) {
     let target;
     if (hostId) {
         if (!/^[a-zA-Z0-9]+$/.test(hostId)) return json({ error: 'bad_id', message: '无效的主机 ID' }, 400);
-        const rec = await getJSON(env, 'hosts/' + hostId);
+        // 主机记录和连接预算并发取：升级响应要等这两件事都完成才能返回，
+        // 串行就是白白多等一个 R2 往返
+        const [rec, budget] = await Promise.all([
+            getJSON(env, 'hosts/' + hostId),
+            connectBudget(env, session.token),
+        ]);
         if (!rec) return json({ error: 'not_found', message: '主机不存在，可能已被删除' }, 404);
+        if (!budget) {
+            return socketError(`连接建立过于频繁（每分钟最多 ${CONNECT_LIMIT} 次），请稍后再试。`);
+        }
         target = { host: normalizeHost(rec.host), port: rec.port || 22 };
     } else {
         const addr = normalizeHost(qHost);
         if (!addr) return json({ error: 'bad_host', message: '主机地址不合法' }, 400);
         if (qPort < 1 || qPort > 65535) return json({ error: 'bad_port', message: '端口不合法' }, 400);
-        const budget = await quickConnectBudget(env, session.token);
-        if (!budget) {
+        const [quick, budget] = await Promise.all([
+            quickConnectBudget(env, session.token),
+            connectBudget(env, session.token),
+        ]);
+        if (!quick) {
             return socketError(`临时连接过于频繁（${QUICK_WINDOW / 60000} 分钟内最多 ${QUICK_LIMIT} 个目标）。请先把常用主机保存下来再连接。`);
         }
+        if (!budget) {
+            return socketError(`连接建立过于频繁（每分钟最多 ${CONNECT_LIMIT} 次），请稍后再试。`);
+        }
         target = { host: addr, port: qPort };
-    }
-
-    // 两条分支都要过：保存过的主机也不能被当成免费代理刷
-    if (!(await connectBudget(env, session.token))) {
-        return socketError(`连接建立过于频繁（每分钟最多 ${CONNECT_LIMIT} 次），请稍后再试。`);
     }
 
     let socket;

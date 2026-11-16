@@ -593,17 +593,22 @@ export class SSHClient {
         const n = this.neg;
         const keyLenC2S = CIPHER_KEYLEN[n.encC2S];
         const keyLenS2C = CIPHER_KEYLEN[n.encS2C];
-        const ivC2S = await C.deriveKey(C.sha256, kMpint, H, 'A', this.sessionId, 16);
-        const ivS2C = await C.deriveKey(C.sha256, kMpint, H, 'B', this.sessionId, 16);
-        const keyC2S = await C.deriveKey(C.sha256, kMpint, H, 'C', this.sessionId, keyLenC2S);
-        const keyS2C = await C.deriveKey(C.sha256, kMpint, H, 'D', this.sessionId, keyLenS2C);
-        const macKeyC2S = await C.deriveKey(C.sha256, kMpint, H, 'E', this.sessionId, MAC_LEN[n.macC2S]);
-        const macKeyS2C = await C.deriveKey(C.sha256, kMpint, H, 'F', this.sessionId, MAC_LEN[n.macS2C]);
+        // 六个派生键互相独立，并行算而不是逐个 await：少 5 次串行的 WebCrypto 往返
+        const [ivC2S, ivS2C, keyC2S, keyS2C, macKeyC2S, macKeyS2C] = await Promise.all([
+            C.deriveKey(C.sha256, kMpint, H, 'A', this.sessionId, 16),
+            C.deriveKey(C.sha256, kMpint, H, 'B', this.sessionId, 16),
+            C.deriveKey(C.sha256, kMpint, H, 'C', this.sessionId, keyLenC2S),
+            C.deriveKey(C.sha256, kMpint, H, 'D', this.sessionId, keyLenS2C),
+            C.deriveKey(C.sha256, kMpint, H, 'E', this.sessionId, MAC_LEN[n.macC2S]),
+            C.deriveKey(C.sha256, kMpint, H, 'F', this.sessionId, MAC_LEN[n.macS2C]),
+        ]);
 
-        const encOut = await new C.CtrCipher(keyC2S, ivC2S).ready();
-        const macOut = await new C.Mac(n.macC2S, macKeyC2S).ready();
-        const encIn = await new C.CtrCipher(keyS2C, ivS2C).ready();
-        const macIn = await new C.Mac(n.macS2C, macKeyS2C).ready();
+        const [encOut, macOut, encIn, macIn] = await Promise.all([
+            new C.CtrCipher(keyC2S, ivC2S).ready(),
+            new C.Mac(n.macC2S, macKeyC2S).ready(),
+            new C.CtrCipher(keyS2C, ivS2C).ready(),
+            new C.Mac(n.macS2C, macKeyS2C).ready(),
+        ]);
 
         // outgoing keys take effect right after NEWKEYS is flushed
         await this.send(new Writer().byte(MSG.NEWKEYS).bytes(), { resetSeq: this.strictKex });
@@ -645,10 +650,10 @@ export class SSHClient {
         const user = this.opts.username;
         const service = 'ssh-connection';
 
-        // probe supported methods with a "none" request
-        const probe = await this._userauthRequest(user, service, 'none', null);
-        if (probe.ok) return;
-        let methods = probe.methods || [];
+        // 不再先发 "none" 请求探测支持的方式：明确了凭据类型就直接发起对应认证，
+        // 省掉一整个网络来回。探测唯一的价值是提前知道服务器支持哪些方式，
+        // 而认证失败的响应里同样带着这个列表，回退逻辑完全一致。
+        let methods = [];
         const tried = new Set();
 
         const order = [];
@@ -714,27 +719,9 @@ export class SSHClient {
         const key = await loadPrivateKey(auth.privateKey);
         const blob = key.publicBlob;
         const alg = key.alg;
-        // 1) query whether the key is acceptable
-        this.pkWaiter = deferred();
-        const probeW = new Writer()
-            .byte(MSG.USERAUTH_REQUEST)
-            .str(user)
-            .str(service)
-            .str('publickey')
-            .bool(false)
-            .str(alg)
-            .str(blob);
-        this.authWaiter = deferred();
-        await this.send(probeW.bytes());
-        const first = await Promise.race([
-            this.authWaiter.promise,
-            this.pkWaiter.promise.then(() => ({ pkOk: true })),
-        ]);
-        this.authWaiter = null;
-        this.pkWaiter = null;
-        if (first.ok) return first; // some servers accept straight away
-
-        // 2) sign the request
+        // 直接带签名发起认证，不再走「先发 bool(false) 问服务器接不接受这把钥匙、
+        // 等到 PK_OK 再签」的两步流程 —— 省掉一整个网络来回。签名被拒时服务器
+        // 回的 USERAUTH_FAILURE 带着支持方式列表，与探测失败完全等价，回退逻辑不变。
         const data = new Writer()
             .str(this.sessionId)
             .byte(MSG.USERAUTH_REQUEST)
