@@ -787,7 +787,7 @@ async function handleWebSocket(request, env) {
         if (!budget) {
             return socketError(`连接建立过于频繁（每分钟最多 ${CONNECT_LIMIT} 次），请稍后再试。`);
         }
-        target = { host: normalizeHost(rec.host), port: rec.port || 22 };
+        target = { host: normalizeHost(rec.host), port: rec.port || 22, hostId };
     } else {
         const addr = normalizeHost(qHost);
         if (!addr) return json({ error: 'bad_host', message: '主机地址不合法' }, 400);
@@ -818,6 +818,9 @@ async function handleWebSocket(request, env) {
     server.accept();
 
     const term = new Terminal(server, env, session.u, socket, target);
+    // 立刻开始 SSH 传输层（版本 + KEX），不等浏览器发来 init：
+    // 那条消息本身要占一个浏览器↔边缘的往返，正好用握手把它填满。
+    term.warm().catch(() => {});
     server.addEventListener('message', (ev) => {
         try {
             term.handleMessage(ev.data);

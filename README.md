@@ -22,6 +22,23 @@
 | **🌐 仪表盘** | **🗝️ 凭据库** | **🛡️ 安全** |
 | 分组筛选 · 点阵地球<br><sub>可拖拽旋转 · 主机定位</sub> | 账号与私钥复用<br><sub>AES-GCM 加密存储</sub> | 主机密钥强校验<br><sub>同源防护 · 会话录制</sub> |
 
+## ⚡ 连接速度
+
+握手路径按「少等往返」重排过，对 OpenSSH / Dropbear / ssh2 等服务端兼容：
+
+- **提前开始**：TCP 一连上就发版本串、KEXINIT 与 ECDH_INIT，不等服务器 banner；
+- **凭据并行**：密钥交换与 R2 读取、前端 `init` 消息同时进行，KEX 完成时密码通常已就绪；
+- **服务请求前置**：NEWKEYS 写出后立即发 `ssh-userauth`，把「等 NEWKEYS + 等服务接受」压成一个往返；
+- **已知主机预取**：主机指纹在 TCP 建连时就开始读，验签不再等 R2。
+
+在 100ms RTT 的链路上，`TCP 已连接 → shell ready` 从约 700ms 降到约 540ms；
+浏览器到边缘的一整个往返也被 `warm()` 与握手重叠。可自行复测：
+
+```bash
+npm install
+node tools/bench-handshake.mjs --delay=50 --rounds=5
+```
+
 ## 🚀 部署
 
 **最快路径**：点上面的部署按钮，连接 GitHub，完成后打开 Worker 域名。

@@ -14,6 +14,15 @@ const EDIT_MAX = 512 * 1024;
 const SFTP_CONCURRENCY = 4;
 const MAX_HANDLES = 64;
 
+function deferred() {
+    let resolve, reject;
+    const promise = new Promise((res, rej) => {
+        resolve = res;
+        reject = rej;
+    });
+    return { promise, resolve, reject };
+}
+
 export function knownKey(host, port) {
     return 'known/' + String(host).toLowerCase().replace(/[^a-z0-9.\-:\[\]]/g, '_') + '_' + port;
 }
@@ -105,6 +114,19 @@ export class Terminal {
         this.handles = new Map();
         this.handleSeq = 0;
         this.started = false;
+        // 传输层可以先于「浏览器发来 init」开始：版本交换和密钥交换不需要用户名/密码，
+        // 把这段网络往返与 R2 读凭据、前端首条消息并行起来。
+        this._authDeferred = deferred();
+        // 没人等凭据时（例如 warm 失败后直接 cleanup）也不产生 unhandled rejection
+        this._authDeferred.promise.catch(() => {});
+        this._authSettled = false;
+        this.warmPromise = null;
+        this.tcpReady = false;
+        this.hostRec = null;
+        this.hostRecPromise = null;
+        this.knownPrefetch = null;
+        this.authUser = '';
+        this.authPass = '';
     }
 
     /* ------------------------------------------------------------- plumbing */
@@ -167,7 +189,69 @@ export class Terminal {
 
     /* ----------------------------------------------------------------- init */
 
+    /**
+     * 尽早把 TCP 之后的 SSH 传输层跑起来（版本交换 + KEX），**不等凭据**。
+     * worker 在返回 101 之前调用；浏览器的那一个「WS 建立 → 发 init」往返
+     * 就与服务器的 KEX 重叠了。
+     */
+    warm() {
+        if (this.warmPromise) return this.warmPromise;
+        this.warmPromise = this._warm().catch((e) => {
+            this.warmError = e;
+            // 凭据还没交出去时，让等凭据的一方立刻失败，而不是挂到 40 秒超时
+            if (!this._authSettled) {
+                this._authSettled = true;
+                this._authDeferred.reject(e);
+            }
+            throw e;
+        });
+        return this.warmPromise;
+    }
+
+    async _warm() {
+        if (!this.socket) return;
+        // 主机记录也在这里就开始读：它和 TCP 建连、KEX 是并行的
+        if (this.target && this.target.hostId) {
+            this.hostRecPromise = getJSON(this.env, 'hosts/' + String(this.target.hostId));
+        }
+        await this.socket.opened;
+        this.tcpReady = true;
+        this.writer = this.socket.writable.getWriter();
+
+        const host = this.target ? this.target.host : '';
+        const port = this.target ? this.target.port || 22 : 22;
+        this.meta = { host, port, user: '' };
+        // 已知主机指纹：_hostKeyPolicy 在 KEX 验签后就要用，提前取好，
+        // 免得整条握手在「等 R2」上停顿一个往返。
+        if (host) this.knownPrefetch = getJSON(this.env, knownKey(host, port));
+
+        this.client = new SSHClient({
+            username: '',
+            auth: this._authDeferred.promise,
+            cols: 80,
+            rows: 24,
+            term: 'xterm-256color',
+            write: (b) => this.write(b),
+            onData: (data) => {
+                this.sendData(data);
+                this._record(data);
+            },
+            onEvent: (ev) => this._onEvent(ev),
+            onBanner: (text) => this.send({ t: 'banner', message: text }),
+            onHostKey: (info) => this._hostKeyPolicy(host, port, info),
+            onKeyboardInteractive: (req) => this._kbd(this.authUser, this.authPass, req),
+        });
+
+        this._readLoop();
+        // 不等凭据：版本串、KEXINIT、ECDH_INIT 立刻发出。
+        // 失败由 _connect 里的 await 负责上报；这里兜住，避免 init 还没到就
+        // 变成 unhandled rejection。
+        this.client.connect().catch(() => {});
+    }
+
     async start(cfg) {
+        // 正常情况下 worker 已经调用过 warm()；这里兜底（测试/嵌入式调用）。
+        this.warm().catch(() => {});
         try {
             await this._connect(cfg);
         } catch (e) {
@@ -191,7 +275,13 @@ export class Terminal {
         let record = !!cfg.record;
 
         if (cfg.hostId) {
-            const saved = await getJSON(this.env, 'hosts/' + String(cfg.hostId));
+            // warm() 里已经并行开始读这条记录；这里只等结果，不再多一次 R2 往返
+            if (!this.hostRec) {
+                this.hostRec = this.hostRecPromise
+                    ? await this.hostRecPromise
+                    : await getJSON(this.env, 'hosts/' + String(cfg.hostId));
+            }
+            const saved = this.hostRec;
             if (!saved) throw new Error('主机配置不存在');
             // 目标一律以记录为准。TCP 已经按 URL 参数连上了，所以这里必须核对：
             // 允许「记录里的凭据 + 查询参数里的地址」混用，等于把存好的 SSH 密码
@@ -231,33 +321,26 @@ export class Terminal {
         this.recording = record;
         // 录制元数据的「开始时间」要取连接建立的时刻，而不是 cleanup 的时刻
         this.startedAt = Date.now();
-        if (this.socket) {
-            this.send({ t: 'status', phase: 'tcp', message: `TCP 已连接 ${host}:${port}，正在协商 SSH 会话 …` });
-        } else {
-            this.send({ t: 'status', phase: 'tcp', message: `正在连接 ${host}:${port} …` });
-            this.socket = connect({ hostname: host, port });
-        }
-        await this.socket.opened;
-        this.writer = this.socket.writable.getWriter();
-
-        this.client = new SSHClient({
-            username,
-            auth: { password, privateKey },
-            cols: clampInt(cfg.cols, 20, 500, 80),
-            rows: clampInt(cfg.rows, 5, 200, 24),
-            term: 'xterm-256color',
-            write: (b) => this.write(b),
-            onData: (data) => {
-                this.sendData(data);
-                this._record(data);
-            },
-            onEvent: (ev) => this._onEvent(ev),
-            onBanner: (text) => this.send({ t: 'banner', message: text }),
-            onHostKey: (info) => this._hostKeyPolicy(host, port, info),
-            onKeyboardInteractive: (req) => this._kbd(username, password, req),
+        this.send({
+            t: 'status',
+            phase: 'tcp',
+            message: this.tcpReady
+                ? `TCP 已连接 ${host}:${port}，正在协商 SSH 会话 …`
+                : `正在连接 ${host}:${port} …`,
         });
+        if (!this.socket) this.socket = connect({ hostname: host, port });
 
-        this._readLoop();
+        // 传输层（版本 + KEX）在 warm() 里已经开跑；这里等它把 socket 打开即可。
+        // 凭据解密的这几毫秒与服务器 KEX 是并行的，不占关键路径。
+        await this.warm();
+
+        // 终端尺寸来自前端的 init 消息，必须在 _openShell 之前写进去
+        this.client.opts.cols = clampInt(cfg.cols, 20, 500, 80);
+        this.client.opts.rows = clampInt(cfg.rows, 5, 200, 24);
+        this.authUser = username;
+        this.authPass = password;
+        this._authSettled = true;
+        this._authDeferred.resolve({ username, password, privateKey });
         await this.client.connect();
         this.send({ t: 'ready' });
         this.keepaliveTimer = setInterval(() => {
@@ -599,7 +682,10 @@ export class Terminal {
 
     async _hostKeyPolicy(host, port, info) {
         const key = knownKey(host, port);
-        const known = await getJSON(this.env, key);
+        // warm() 已经把这次读请求发出去了；KEX 走到这里时通常早就回来了
+        const prefetched = this.knownPrefetch;
+        this.knownPrefetch = null;
+        const known = prefetched ? await prefetched : await getJSON(this.env, key);
         if (known) {
             if (known.fingerprint === info.fingerprint) return true;
             // 仍然默认拒绝（fail-closed），但把「哪条记录、旧指纹、新指纹」一并带上，
@@ -764,6 +850,11 @@ export class Terminal {
     async cleanup(reason) {
         if (this.closed) return;
         this.closed = true;
+        // 连接在凭据交出之前就失败了：让 _authenticate 立刻结束，而不是挂到超时
+        if (!this._authSettled) {
+            this._authSettled = true;
+            this._authDeferred.reject(new Error(String(reason || '连接已关闭')));
+        }
         if (this.keepaliveTimer) clearInterval(this.keepaliveTimer);
         if (this.statsTimer) clearInterval(this.statsTimer);
         for (const w of this.waiters.values()) w.reject(new Error('连接已关闭'));

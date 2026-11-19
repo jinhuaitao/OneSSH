@@ -137,15 +137,77 @@ export class SSHClient {
         this._dropNextKexPacket = false;
         // 累计收发字节，到阈值主动重协商
         this.bytesSinceRekey = 0;
+        // 传输层可以比凭据更早开始：版本串 + KEXINIT 不依赖用户名/密码，
+        // 先把这几步发出去，R2 读凭据的几十毫秒就能和网络往返重叠。
+        this._transportStarted = false;
+        this._startPromise = null;
+        this._servicePromise = null;
     }
 
     /** resolves once the interactive shell is up */
     connect() {
+        // 可重复调用（warm() 和 start() 各调一次）：只保留一个定时器，
+        // 否则第一个 40 秒定时器没人清，会在会话正常建立后把连接打掉。
+        if (this._connectPromise) return this._connectPromise;
         // 总超时兜底：连 banner 都不发的服务器也必须能被放弃，否则连接会一直挂着
         this._watchdog = setTimeout(() => this._fail(new Error('SSH 握手超时（40 秒内未完成）')), 40000);
         const done = () => clearTimeout(this._watchdog);
         this.readyDeferred.promise.then(done, done);
-        return this.readyDeferred.promise;
+        // 不等服务器 banner：RFC 4253 §4.2 允许双方在 TCP 建立后立刻各发版本串。
+        // 这里把「版本 + KEXINIT + ECDH_INIT」一次性推出去，服务器就不用等我们
+        // 先收完它的 banner 才开始 KEX，典型 100ms RTT 下省 1～1.5 个往返。
+        this.startTransport().catch(() => {});
+        this._connectPromise = this.readyDeferred.promise;
+        return this._connectPromise;
+    }
+
+    /**
+     * 提前开始传输层握手（版本交换 + 密钥交换），不等待凭据。
+     * 可以重复调用：内部只执行一次，失败会走 _fail() 让 connect() 的 promise 拒绝。
+     */
+    startTransport() {
+        if (!this._startPromise) {
+            this._startPromise = this._startTransport().catch((e) => {
+                this._fail(e);
+                throw e;
+            });
+        }
+        return this._startPromise;
+    }
+
+    async _startTransport() {
+        if (this._transportStarted) return;
+        this._transportStarted = true;
+        // 先把 x25519 密钥对算出来：真正开始发包后，服务器可能在同一个 RTT 内
+        // 就把 KEXINIT 打回来，到那时再去生成密钥就晚了。
+        this.kex = await C.curve25519Keypair();
+        this._writeVersion();
+        // KEXINIT 与 ECDH_INIT 是两条独立报文，但都不依赖对端 KEXINIT 的内容
+        // （我们只提供 curve25519-sha256），因此可以顺序写出、合并成一次 RTT。
+        // 注意要「同步排队」两条消息：中间不能有 await，否则服务器的 KEXINIT
+        // 可能插进来，_onKexInit 会以为 ECDH_INIT 还没发而重复发一条。
+        const kexSent = this._sendKexInit();
+        const ecdhSent = this._sendEcdhInit();
+        await kexSent;
+        await ecdhSent;
+    }
+
+    _writeVersion() {
+        if (this.versionSent) return;
+        this.versionSent = true;
+        // 版本串不是 SSH 报文，没有长度头；但必须排在 KEXINIT 之前。
+        // 这里只排队、不 await：sink 本身是串行链，await 会让 KEXINIT 白等
+        // 一个写延迟（真实网络里两者本来就是同一批字节）。
+        Promise.resolve(this.opts.write(concat(new TextEncoder().encode(this.clientVersion + '\r\n')))).catch((e) => this._fail(e));
+    }
+
+    async _sendEcdhInit() {
+        if (!this.kex) throw new Error('密钥对尚未生成');
+        // 先置位再 await：服务器 KEXINIT 可能在本函数让出执行权时被处理，
+        // 那边看到 kexSent 已为 true 就不会重复发一条 ECDH_INIT。
+        this.kexSent = true;
+        const w = new Writer().byte(MSG.KEX_ECDH_INIT).str(this.kex.publicKey);
+        await this.send(w.bytes());
     }
 
     /** 外部主动放弃（例如保活超时） */
@@ -204,6 +266,8 @@ export class SSHClient {
         if (!this.ready || this.closed || this.kexActive) return;
         if (this.bytesSinceRekey < REKEY_BYTES) return;
         this.bytesSinceRekey = 0;
+        // 上一轮的 x25519 临时密钥必须丢弃，否则 _onKexInit 会误以为 ECDH_INIT 已经发过
+        this.kex = null;
         this._sendKexInit().catch((e) => this._fail(e));
     }
 
@@ -280,8 +344,9 @@ export class SSHClient {
     /* ============================================================ handshake */
 
     async _beginHandshake() {
-        await this.opts.write(concat(new TextEncoder().encode(this.clientVersion + '\r\n')));
-        await this._sendKexInit();
+        // 正常情况下 connect() 已经把版本串和 KEXINIT 发出去了；这里只是等结果。
+        // 兼容没有调用 connect() 就直接喂数据的调用方（测试、嵌入式用法）。
+        await this.startTransport();
         await withTimeout(this.kexDone.promise, 20000, '密钥交换超时：服务器 20 秒内没有完成 KEX');
         await withTimeout(this._authenticate(), 45000, '认证超时：服务器 45 秒内没有回应');
         await withTimeout(this._openShell(), 15000, '打开 shell 超时');
@@ -308,6 +373,8 @@ export class SSHClient {
         this.iC = payload;
         this.kexInitSent = true;
         this.kexActive = true;
+        // 新一轮 KEX 开始，KEX_ECDH_INIT 还没发（提前开始的路径会在下面紧接着发）
+        this.kexSent = false;
         this.kexDone = deferred();
         await this.send(payload);
     }
@@ -482,6 +549,12 @@ export class SSHClient {
     /* ================================================================== kex */
 
     async _onKexInit(p) {
+        // 极端情况下（数据在 connect() 的密钥对生成期间就到达）先让提前开始的
+        // 流程把版本串/KEXINIT/ECDH 发完，避免这条路径再发一遍。
+        if (this._startPromise && !this.versionSent) {
+            await this._startPromise.catch(() => {});
+            if (this.closed) return;
+        }
         const r = new Reader(p, 1);
         r.p += 16; // cookie (raw 16 bytes, not length-prefixed)
         const kexAlgs = r.nameList();
@@ -522,13 +595,20 @@ export class SSHClient {
             this.strictKex = kexAlgs.includes('kex-strict-s-v00@openssh.com');
         }
         this.kexActive = true;
-        if (!this.kexInitSent) await this._sendKexInit();
+        if (!this.kexInitSent) {
+            // 服务器主动发起重协商时，上一轮的临时密钥已经作废
+            if (this.sessionId) this.kex = null;
+            await this._sendKexInit();
+        }
 
-        const kp = await C.curve25519Keypair();
-        this.kex = { privateKey: kp.privateKey, publicKey: kp.publicKey };
+        // 提前开始的路径已经生成并发出过 ECDH_INIT（this.kex 非空），不能重发：
+        // 同一个 KEX 里连发两个 KEX_ECDH_INIT 会被严格实现当成协议错误。
+        if (!this.kex) this.kex = await C.curve25519Keypair();
         this.kexReply = deferred();
-        const w = new Writer().byte(MSG.KEX_ECDH_INIT).str(kp.publicKey);
-        await this.send(w.bytes());
+        if (!this.kexSent) {
+            this.kexSent = true;
+            await this._sendEcdhInit();
+        }
         // resolve when KEX_ECDH_REPLY arrives (handled in _onKexReply)
     }
 
@@ -617,7 +697,13 @@ export class SSHClient {
         this.blockOut = 16;
         this.macOutLen = macOut.len;
         this._pendingIn = { encIn, macIn };
-        if (!rekey) this.onEvent({ type: 'kex-done', hostKeyType: sigResult.type, fingerprint: fp });
+        if (!rekey) {
+            this.onEvent({ type: 'kex-done', hostKeyType: sigResult.type, fingerprint: fp });
+            // 我们的 NEWKEYS 已经写出、出站密钥已生效，SERVICE_REQUEST 属于
+            // NEWKEYS 之后允许发送的报文；抢在服务器 NEWKEYS 到达前发出，
+            // 可以把「等 NEWKEYS + 再等服务接受」压成一个往返。
+            this._prefetchService('ssh-userauth');
+        }
     }
 
     _onNewKeys() {
@@ -636,18 +722,27 @@ export class SSHClient {
 
     /* ================================================================= auth */
 
-    async _requestService(name) {
+    _prefetchService(name) {
+        if (this._servicePromise) return;
         this.serviceWaiter = deferred();
+        this._servicePromise = this.serviceWaiter.promise;
         const w = new Writer().byte(MSG.SERVICE_REQUEST).str(name);
-        await this.send(w.bytes());
-        await this.serviceWaiter.promise;
+        this.send(w.bytes()).catch((e) => this._fail(e));
+    }
+
+    async _requestService(name) {
+        this._prefetchService(name);
+        await this._servicePromise;
         this.serviceWaiter = null;
     }
 
     async _authenticate() {
+        // 凭据可以是 Promise：调用方可以在 TCP/密钥交换跑起来之后再解密、
+        // 从界面收密码，把这段等待与网络往返重叠掉。
+        const auth = await withTimeout(Promise.resolve(this.opts.auth || {}), 30000, '等待登录凭据超时');
+        const user = auth.username || this.opts.username;
+        if (!user) throw new Error('缺少用户名');
         await this._requestService('ssh-userauth');
-        const auth = this.opts.auth || {};
-        const user = this.opts.username;
         const service = 'ssh-connection';
 
         // 不再先发 "none" 请求探测支持的方式：明确了凭据类型就直接发起对应认证，
@@ -794,7 +889,7 @@ export class SSHClient {
     writeChannel(ch, data) {
         if (!ch || ch.closed || this.closed) return;
         const u8 = typeof data === 'string' ? new TextEncoder().encode(data) : data;
-        const max = Math.min(ch.maxPacket || MAX_PACKET, 16384);
+        const max = Math.min(ch.maxPacket || MAX_PACKET, 32768);
         for (let i = 0; i < u8.length; i += max) {
             const chunk = u8.subarray(i, i + max);
             ch.window -= chunk.length;
@@ -832,7 +927,7 @@ export class SSHClient {
     async writeChannelFlow(ch, data) {
         if (!ch || ch.closed || this.closed) throw new Error('通道已关闭');
         const u8 = typeof data === 'string' ? new TextEncoder().encode(data) : data;
-        const max = Math.min(ch.maxPacket || MAX_PACKET, 16384);
+        const max = Math.min(ch.maxPacket || MAX_PACKET, 32768);
         for (let i = 0; i < u8.length; i += max) {
             const chunk = u8.subarray(i, i + max);
             await this._waitWindow(ch, chunk.length);
