@@ -11,7 +11,7 @@
         "icons": "node tools/make-icons.mjs",
         "test": "node --import ./tests/register.mjs --test \"tests/*.test.mjs\"",
         "test:watch": "node --import ./tests/register.mjs --test --watch \"tests/*.test.mjs\"",
-        "test:e2e": "node --test tests/e2e-ssh.test.mjs"
+        "test:e2e": "node --test tests/e2e-ssh.test.mjs tests/sftp-chmod-e2e.test.mjs"
     },
     "devDependencies": {
         "playwright-core": "^1.64.1",

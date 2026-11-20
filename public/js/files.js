@@ -78,6 +78,11 @@ export function openFiles(cfg) {
             });
             acts.appendChild(dl);
         }
+        const chmodBtn = el('button', { class: 'act icon-only', type: 'button', title: '修改权限', html: icon('lock', 14) });
+        chmodBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            chmodEntry(entry);
+        });
         const ren = el('button', { class: 'act icon-only', type: 'button', title: '重命名', html: icon('edit', 14) });
         ren.addEventListener('click', (ev) => {
             ev.stopPropagation();
@@ -88,6 +93,7 @@ export function openFiles(cfg) {
             ev.stopPropagation();
             removeEntry(entry);
         });
+        acts.appendChild(chmodBtn);
         acts.appendChild(ren);
         acts.appendChild(del);
 
@@ -275,6 +281,104 @@ export function openFiles(cfg) {
             request({ op: 'rename', from: full, to: joinPath(path, v) })
                 .then(() => {
                     toast('已重命名');
+                    navigate(path);
+                })
+                .catch((e) => toast(e.message, 'err'));
+        };
+    }
+
+    function chmodEntry(entry) {
+        const full = joinPath(path, entry.name);
+        // 列表没给数值 mode（旧服务端）时按类型给个合理初值，不影响已返回的真实值
+        let mode = entry.mode != null ? entry.mode : entry.isDir ? 0o755 : 0o644;
+        const oct = (m) => {
+            const s = m.toString(8);
+            return m >= 0o1000 ? s.padStart(4, '0') : s.padStart(3, '0');
+        };
+        const octIn = el('input', { type: 'text', value: oct(mode), style: 'width:90px;font-family:monospace', spellcheck: 'false' });
+
+        // 9 个 rwx 复选框 + 3 个特殊位，key 为权限位数值
+        const boxes = {};
+        function bitBox(label, bit) {
+            const cb = el('input', { type: 'checkbox', checked: !!(mode & bit) });
+            cb.addEventListener('change', syncFromBoxes);
+            boxes[bit] = cb;
+            return el('label', { style: 'display:flex;gap:4px;align-items:center' }, [cb, el('span', { text: label })]);
+        }
+        function syncBoxes(m) {
+            for (const bit of Object.keys(boxes)) boxes[bit].checked = !!(m & Number(bit));
+        }
+        function syncFromBoxes() {
+            let m = 0;
+            for (const bit of Object.keys(boxes)) if (boxes[bit].checked) m |= Number(bit);
+            mode = m;
+            octIn.value = oct(m);
+        }
+        function syncFromMode(m) {
+            mode = m;
+            syncBoxes(m);
+            octIn.value = oct(m);
+        }
+        octIn.addEventListener('input', () => {
+            const v = octIn.value.trim();
+            if (!/^[0-7]{1,4}$/.test(v)) return; // 非法时不更新复选框，提交时再报错
+            mode = parseInt(v, 8);
+            syncBoxes(mode); // 只同步复选框，不改输入框内容，避免打字时光标跳动
+        });
+
+        const permRow = (label, shift) =>
+            el('div', { style: 'display:flex;gap:14px;align-items:center;margin:6px 0' }, [
+                el('span', { style: 'width:52px', text: label }),
+                bitBox('读', 0o400 >> shift),
+                bitBox('写', 0o200 >> shift),
+                bitBox('执行', 0o100 >> shift),
+            ]);
+        const presets = [0o644, 0o755, 0o600, 0o700, 0o777].map((p) =>
+            el('button', { class: 'btn sm', type: 'button', text: oct(p), onclick: () => syncFromMode(p) })
+        );
+        const body = el('div', { style: 'display:flex;flex-direction:column;gap:4px' }, [
+            el('p', { style: 'margin:0', text: entry.name + (entry.isLink ? '（符号链接：改的是链接目标的权限，不是链接本身）' : '') }),
+            el('p', { style: 'margin:0', class: 'muted-sm', text: '当前权限：' + oct(mode) + (entry.modeText ? '（' + entry.modeText + '）' : '') }),
+            el('div', { style: 'display:flex;gap:8px;align-items:center;margin-top:6px' }, [
+                el('span', { text: '八进制' }),
+                octIn,
+                el('span', { class: 'muted-sm', text: '0-7777，只允许 0-7' }),
+            ]),
+            permRow('所有者', 0),
+            permRow('群组', 3),
+            permRow('其他', 6),
+            el('div', { style: 'display:flex;gap:14px;align-items:center;margin:6px 0' }, [
+                el('span', { style: 'width:52px', text: '特殊位' }),
+                bitBox('setuid', 0o4000),
+                bitBox('setgid', 0o2000),
+                bitBox('sticky', 0o1000),
+            ]),
+            el('div', { style: 'display:flex;gap:8px;align-items:center' }, [el('span', { text: '常用' }), ...presets]),
+        ]);
+
+        let finish;
+        let done = false;
+        const submit = () => {
+            const v = octIn.value.trim();
+            if (!/^[0-7]{1,4}$/.test(v)) {
+                toast('权限必须是 0-7777 的八进制数', 'err');
+                return;
+            }
+            finish(parseInt(v, 8));
+        };
+        const foot = el('div', { style: 'display:flex;gap:8px' }, [
+            el('button', { class: 'btn', type: 'button', text: '取消', onclick: () => finish(null) }),
+            el('button', { class: 'btn primary', type: 'button', text: '确定', onclick: submit }),
+        ]);
+        const sub = modal({ title: '修改权限', body, footer: foot, onClose: () => finish(null) });
+        finish = (v) => {
+            if (done) return;
+            done = true;
+            sub.close();
+            if (v == null) return;
+            request({ op: 'chmod', path: full, mode: v })
+                .then((res) => {
+                    toast('已修改权限为 ' + oct(res && res.mode != null ? res.mode : v));
                     navigate(path);
                 })
                 .catch((e) => toast(e.message, 'err'));

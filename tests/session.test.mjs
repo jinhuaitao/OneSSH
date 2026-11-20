@@ -29,6 +29,7 @@ class FakeWs {
 function makeSftp(opts) {
     const o = opts || {};
     const calls = [];
+    let perms = o.perms == null ? 0o100600 : o.perms;
     return {
         calls,
         async open(path, flags) {
@@ -42,10 +43,15 @@ function makeSftp(opts) {
         async fchmod(h, mode) {
             calls.push(['fchmod', h, mode]);
         },
+        async chmod(path, mode) {
+            calls.push(['chmod', path, mode]);
+            if (o.chmodError) throw new Error(o.chmodError);
+            perms = 0o100000 | (mode & 0o7777);
+        },
         async stat(path) {
             calls.push(['stat', path]);
             if (o.statMissing) throw new Error('no such file');
-            return { perms: o.perms == null ? 0o100600 : o.perms, size: 12 };
+            return { perms, size: 12 };
         },
         async renameOverwrite(from, to) {
             calls.push(['renameOverwrite', from, to]);
@@ -57,8 +63,9 @@ function makeSftp(opts) {
         async write(h, offset, data) {
             calls.push(['write', offset, data.length]);
         },
-        async list() {
-            return [];
+        async list(path) {
+            calls.push(['list', path]);
+            return o.entries || [];
         },
         async realpath(p) {
             return p;
@@ -172,6 +179,83 @@ test('SFTP 路径校验：空字节与超长路径被拒', async () => {
     reply = await call(term, ws, { op: 'list', path: '/' + 'a'.repeat(5000) });
     assert.equal(reply.ok, false);
     assert.match(reply.error, /路径不合法/);
+});
+
+test('SFTP chmod：数字 mode 成功，stat 回读新权限', async () => {
+    const sftp = makeSftp({ perms: 0o100644 });
+    const { ws, term } = makeTerm(sftp);
+    const reply = await call(term, ws, { op: 'chmod', path: '/tmp/x.txt', mode: 0o755 });
+    assert.equal(reply.ok, true);
+    assert.deepEqual(
+        sftp.calls.filter((c) => c[0] === 'chmod'),
+        [['chmod', '/tmp/x.txt', 0o755]],
+        '只发一次 chmod，mode 按数值传'
+    );
+    assert.equal(reply.mode, 0o755, '回包 mode 是 stat 读回的新权限');
+    assert.equal(reply.modeText, 'rwxr-xr-x');
+});
+
+test('SFTP chmod：modeText 八进制字符串也接受，0 也合法', async () => {
+    const sftp = makeSftp({ perms: 0o100644 });
+    const { ws, term } = makeTerm(sftp);
+    let reply = await call(term, ws, { op: 'chmod', path: '/tmp/x.txt', modeText: '600' });
+    assert.equal(reply.ok, true);
+    assert.equal(reply.mode, 0o600);
+    reply = await call(term, ws, { op: 'chmod', path: '/tmp/x.txt', mode: 0 });
+    assert.equal(reply.ok, true);
+    assert.equal(reply.mode, 0, 'mode 0（---------）是合法值，不能按 falsy 判空');
+    assert.equal(reply.modeText, '---------');
+});
+
+test('SFTP chmod：非法 mode 报错且不调 sftp.chmod', async () => {
+    const sftp = makeSftp();
+    const { ws, term } = makeTerm(sftp);
+    for (const payload of [
+        { op: 'chmod', path: '/tmp/x.txt', mode: -1 },
+        { op: 'chmod', path: '/tmp/x.txt', mode: 0o10000 },
+        { op: 'chmod', path: '/tmp/x.txt', mode: 1.5 },
+        { op: 'chmod', path: '/tmp/x.txt', modeText: '888' },
+        { op: 'chmod', path: '/tmp/x.txt', modeText: 'abc' },
+        { op: 'chmod', path: '/tmp/x.txt' },
+    ]) {
+        const reply = await call(term, ws, payload);
+        assert.equal(reply.ok, false, JSON.stringify(payload) + ' 应该报错');
+        assert.match(reply.error, /0-7777/);
+    }
+    assert.equal(
+        sftp.calls.some((c) => c[0] === 'chmod'),
+        false,
+        '非法 mode 一个 chmod 都不该发到服务端'
+    );
+});
+
+test('SFTP chmod：服务端失败时回包 ok:false', async () => {
+    const sftp = makeSftp({ chmodError: '没有权限' });
+    const { ws, term } = makeTerm(sftp);
+    const reply = await call(term, ws, { op: 'chmod', path: '/tmp/x.txt', mode: 0o600 });
+    assert.equal(reply.ok, false);
+    assert.match(reply.error, /没有权限/);
+});
+
+test('SFTP list：回包带数值 mode，无权限时为 null', async () => {
+    const sftp = makeSftp({
+        entries: [
+            { name: 'a.txt', attrs: { size: 10, perms: 0o100644, mtime: 1700000000 } },
+            { name: 'sub', attrs: { perms: 0o040755 } },
+            { name: 'plain', attrs: {} },
+        ],
+    });
+    const { ws, term } = makeTerm(sftp);
+    const reply = await call(term, ws, { op: 'list', path: '/tmp' });
+    assert.equal(reply.ok, true);
+    assert.deepEqual(
+        reply.entries.map((e) => [e.name, e.mode, e.modeText, e.isDir]),
+        [
+            ['a.txt', 0o644, 'rw-r--r--', false],
+            ['sub', 0o755, 'rwxr-xr-x', true],
+            ['plain', null, '', false],
+        ]
+    );
 });
 
 test('SFTP 未知操作返回错误而不是挂住', async () => {

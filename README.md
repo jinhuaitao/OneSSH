@@ -76,7 +76,7 @@ npx wrangler secret put WEBSSH_SETUP_TOKEN   # 必须设置，否则拒绝初始
 
 - **连接**：点主机行直连；未存凭据则弹窗临时输入。左侧闪电图标可临时连任意公网地址
 - **搜索**：顶部搜索框按名称/地址/用户名/分组/城市/备注过滤，`⌘K` 或 `/` 聚焦
-- **文件**：终端顶部「文件」走 SFTP，单文件上限 64 MB，上传先写临时文件再覆盖，中断不毁原文件
+- **文件**：终端顶部「文件」走 SFTP，单文件上限 64 MB，上传先写临时文件再覆盖，中断不毁原文件；文件列表里可改权限（chmod，0-7777，支持 setuid/setgid/sticky），符号链接改的是链接目标；不支持 chown / 改时间
 - **快捷键**：`Ctrl/⌘+Shift+C/V` 复制粘贴（多行先确认）· `+F` 全屏 · `+R` 重连 · `+W` 关标签 · `Alt+1…9` 切标签
 - **PWA**：Chrome「安装」或 Safari「添加到主屏幕」，可当独立应用打开
 
@@ -125,12 +125,12 @@ SSH 协议栈自研（`src/ssh/`），只用 WebCrypto：`curve25519-sha256` 与
 ```bash
 npm install
 npx wrangler dev        # http://127.0.0.1:8787
-npm test                # 157 个用例，无需 Cloudflare / sshd / 浏览器
-npm run test:e2e        # 2 个用例，ssh2 起真实本地 sshd（与 npm test 里的同款用例单独跑）
+npm test                # 167 个用例，无需 Cloudflare / sshd / 浏览器
+npm run test:e2e        # 6 个用例，ssh2 起真实本地 sshd（与 npm test 里的同款用例单独跑）
 npx wrangler deploy     # 需先 wrangler login
 ```
 
-`npm test` 用 Node 内置 `node:test`：内存 R2（含条件写与分页）+ `cloudflare:sockets` 桩，覆盖加解密、SFTP、API 鉴权、限流、安全加固等；E2E 用例用 `ssh2` 起真实本地服务器验证握手、认证与 exec，无 `ssh-keygen` 的环境会自动跳过。
+`npm test` 用 Node 内置 `node:test`：内存 R2（含条件写与分页）+ `cloudflare:sockets` 桩，覆盖加解密、SFTP、API 鉴权、限流、安全加固等；E2E 用例用 `ssh2` 起真实本地服务器验证握手、认证、exec 与 SFTP chmod，无 `ssh-keygen` 的环境会自动跳过。
 
 ---
 

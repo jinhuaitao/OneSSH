@@ -10,6 +10,7 @@ const T = {
     WRITE: 6,
     LSTAT: 7,
     FSTAT: 8,
+    SETSTAT: 9,
     FSETSTAT: 10,
     OPENDIR: 11,
     READDIR: 12,
@@ -100,6 +101,29 @@ export function modeString(perms) {
         s += b & 1 ? 'x' : '-';
     }
     return s;
+}
+
+/** 权限位必须是 0..0o7777 的整数（含 setuid/setgid/sticky）。非法时抛错且不发包。 */
+export function validateMode(mode) {
+    if (!Number.isInteger(mode) || mode < 0 || mode > 0o7777) {
+        throw new Error('权限必须是 0-7777 的八进制数');
+    }
+    return mode;
+}
+
+/** 把 attrs 对象写成 SFTP v3 的 flags + 对应字段（只写给出的字段）。 */
+function writeAttrs(w, attrs) {
+    const a = attrs || {};
+    let flags = 0;
+    if (a.size != null) flags |= 1;
+    if (a.uid != null) flags |= 2;
+    if (a.perms != null) flags |= 4;
+    if (a.atime != null || a.mtime != null) flags |= 8;
+    w.u32(flags);
+    if (flags & 1) w.u64(a.size);
+    if (flags & 2) w.u32(a.uid).u32(a.gid || 0);
+    if (flags & 4) w.u32(a.perms >>> 0);
+    if (flags & 8) w.u32(a.atime || a.mtime).u32(a.mtime || a.atime || 0);
 }
 
 function readAttrs(r) {
@@ -424,6 +448,7 @@ export class SFTPClient {
 
     /** 按句柄改权限位（原子保存后还原原文件 mode 用） */
     async fchmod(handle, mode) {
+        validateMode(mode);
         await this._request(
             T.FSETSTAT,
             (w) => {
@@ -434,6 +459,28 @@ export class SFTPClient {
             15000,
             '设置文件权限'
         );
+    }
+
+    /**
+     * 按路径改任意属性（通用 SETSTAT）。本项目目前只用它改权限位。
+     * 注意：SFTP v3 的 SETSTAT 跟随符号链接，chmod 链接改的是目标，不是链接本身。
+     */
+    async setstat(path, attrs) {
+        await this._request(
+            T.SETSTAT,
+            (w) => {
+                w.str(path);
+                writeAttrs(w, attrs);
+            },
+            15000,
+            '设置文件属性'
+        );
+    }
+
+    /** 按路径改权限位（chmod，0..0o7777）。只发 PERMISSIONS 一个属性。 */
+    async chmod(path, mode) {
+        validateMode(mode);
+        await this.setstat(path, { perms: mode });
     }
 
     async _closeHandleQuiet(handle) {

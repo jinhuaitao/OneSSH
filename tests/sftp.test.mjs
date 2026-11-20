@@ -6,7 +6,7 @@ import { SFTPClient, OPEN, SFTPError, modeString, isDirMode, isLinkMode, tempNam
 
 /* --------------------------------------------------------------- 报文构造 */
 
-const T = { INIT: 1, VERSION: 2, CLOSE: 4, READ: 5, WRITE: 6, FSTAT: 8, OPENDIR: 11, READDIR: 12, REMOVE: 13, MKDIR: 14, RMDIR: 15, REALPATH: 16, STAT: 17, RENAME: 18, EXTENDED: 200, STATUS: 101, HANDLE: 102, DATA: 103, NAME: 104, ATTRS: 105 };
+const T = { INIT: 1, VERSION: 2, CLOSE: 4, READ: 5, WRITE: 6, FSTAT: 8, SETSTAT: 9, OPENDIR: 11, READDIR: 12, REMOVE: 13, MKDIR: 14, RMDIR: 15, REALPATH: 16, STAT: 17, RENAME: 18, EXTENDED: 200, STATUS: 101, HANDLE: 102, DATA: 103, NAME: 104, ATTRS: 105 };
 const S = { OK: 0, EOF: 1, NO_SUCH_FILE: 2, FAILURE: 4, OP_UNSUPPORTED: 8 };
 
 function frame(type, id, fill) {
@@ -173,6 +173,61 @@ test('stat：属性按位解析', async () => {
     assert.equal(st.size, 12345);
     assert.equal(st.perms, 0o100600);
     assert.equal(st.mtime, 1700000123);
+});
+
+test('chmod：SETSTAT 报文 type=9、flags=4、perms 正确', async () => {
+    let seen = null;
+    const ssh = new FakeSSH((req) => {
+        if (req.type === T.INIT) return withExtensions(req, ssh);
+        if (req.type === T.SETSTAT) {
+            // 报文体：str(path) u32(flags) u32(perms)，从 id 后面开始读
+            const r = new Reader(req.payload, 1 + 4);
+            seen = { path: r.text(), flags: r.u32(), perms: r.u32() };
+            return status(req.id, S.OK);
+        }
+        return null;
+    });
+    const sftp = new SFTPClient(ssh);
+    await sftp.ready();
+    await sftp.chmod('/tmp/a.txt', 0o600);
+    assert.deepEqual(seen, { path: '/tmp/a.txt', flags: 4, perms: 0o600 });
+    assert.ok(ssh.types().includes(T.SETSTAT), '必须发 SETSTAT(9)，不是 FSETSTAT');
+});
+
+test('chmod：非法 mode 抛错且不发包', async () => {
+    const ssh = new FakeSSH((req) => (req.type === T.INIT ? withExtensions(req, ssh) : null));
+    const sftp = new SFTPClient(ssh);
+    await sftp.ready();
+    for (const bad of [-1, 0o10000, NaN, 1.5, '644', '888', null, undefined]) {
+        await assert.rejects(() => sftp.chmod('/tmp/a.txt', bad), /0-7777/);
+    }
+    assert.equal(ssh.types().includes(T.SETSTAT), false, '非法 mode 一个包都不该发');
+});
+
+test('setstat：通用接口只发给出的属性；fchmod 仍按句柄改权限', async () => {
+    let setstat = null;
+    let fsetstat = null;
+    const ssh = new FakeSSH((req) => {
+        if (req.type === T.INIT) return withExtensions(req, ssh);
+        if (req.type === T.SETSTAT) {
+            const r = new Reader(req.payload, 1 + 4);
+            setstat = { path: r.text(), flags: r.u32(), perms: r.u32() };
+            return status(req.id, S.OK);
+        }
+        if (req.type === 10) {
+            const r = new Reader(req.payload, 1 + 4);
+            fsetstat = { handle: r.text(), flags: r.u32(), perms: r.u32() };
+            return status(req.id, S.OK);
+        }
+        return null;
+    });
+    const sftp = new SFTPClient(ssh);
+    await sftp.ready();
+    await sftp.setstat('/tmp/b.txt', { perms: 0o755 });
+    assert.deepEqual(setstat, { path: '/tmp/b.txt', flags: 4, perms: 0o755 });
+    await sftp.fchmod('H9', 0o600);
+    assert.deepEqual(fsetstat, { handle: 'H9', flags: 4, perms: 0o600 });
+    await assert.rejects(() => sftp.fchmod('H9', 0o10000), /0-7777/);
 });
 
 test('read：DATA 后遇到 EOF 停止', async () => {

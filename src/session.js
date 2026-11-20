@@ -520,6 +520,7 @@ export class Terminal {
                     entries.push({
                         name: e.name,
                         size: attrs.size == null ? null : attrs.size,
+                        mode: attrs.perms == null ? null : attrs.perms & 0o7777,
                         modeText: modeString(attrs.perms),
                         mtime: attrs.mtime ? attrs.mtime * 1000 : null,
                         isDir: dir,
@@ -532,6 +533,32 @@ export class Terminal {
             case 'mkdir': {
                 await sftp.mkdir(cleanPath(msg.path));
                 reply({});
+                return;
+            }
+            case 'chmod': {
+                const p = cleanPath(msg.path);
+                // mode 优先接受整数；modeText 接受 0-7777 的八进制字符串。
+                // 注意 mode === 0 是合法值（---------），不能按 falsy 判空。
+                let mode = null;
+                if (typeof msg.mode === 'number') {
+                    mode = msg.mode;
+                } else if (typeof msg.mode === 'string' && msg.mode.trim() !== '') {
+                    const t = msg.mode.trim();
+                    if (!/^[0-7]{1,4}$/.test(t)) throw new Error('权限必须是 0-7777 的八进制数');
+                    mode = parseInt(t, 8);
+                } else if (typeof msg.modeText === 'string' && msg.modeText.trim() !== '') {
+                    const t = msg.modeText.trim();
+                    if (!/^[0-7]{1,4}$/.test(t)) throw new Error('权限必须是 0-7777 的八进制数');
+                    mode = parseInt(t, 8);
+                }
+                if (mode == null || !Number.isInteger(mode) || mode < 0 || mode > 0o7777) {
+                    throw new Error('权限必须是 0-7777 的八进制数');
+                }
+                await sftp.chmod(p, mode);
+                // SETSTAT 跟随符号链接，stat 同样跟随，读回的是目标的新权限
+                const st = await sftp.stat(p);
+                const newMode = st.perms == null ? mode : st.perms & 0o7777;
+                reply({ mode: newMode, modeText: modeString(newMode) });
                 return;
             }
             case 'remove': {
