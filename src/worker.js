@@ -3,7 +3,7 @@ import { Terminal } from './session.js';
 import { normalizeHost } from './hostaddr.js';
 import { connect } from 'cloudflare:sockets';
 import * as auth from './auth.js';
-import { getJSON, putJSON, del, list, getBytes, listJSON, putJSONAll } from './store.js';
+import { getJSON, putJSON, del, delAll, list, getBytes, listJSON, putJSONAll } from './store.js';
 import { renderShell } from './pages.js';
 import { loadPrivateKey } from './ssh/keys.js';
 import { fingerprint } from './ssh/crypto.js';
@@ -720,26 +720,28 @@ const CONNECT_WINDOW = 60 * 1000;
  * 超出窗口的顺手删掉（R2 没有 TTL，不删会一直涨）。
  * 返回 true 表示还有额度，并消耗一次。
  */
-async function slidingBudget(env, prefix, limit, windowMs) {
+async function slidingBudget(env, prefix, limit, windowMs, ctx) {
     const now = Date.now();
     let used = 0;
+    const stale = [];
     for (const o of await list(env, prefix)) {
         const ts = parseInt(o.key.slice(prefix.length), 10);
         if (!Number.isFinite(ts)) continue;
         if (now - ts < windowMs) used++;
-        else await del(env, o.key).catch(() => {});
+        else stale.push(o.key);
     }
+    if (stale.length) ctx.waitUntil(delAll(env, stale).catch(() => {}));
     if (used >= limit) return false;
     await putJSON(env, prefix + now + '-' + auth.randomHex(3), 1);
     return true;
 }
 
-async function quickConnectBudget(env, token) {
-    return slidingBudget(env, 'conn/' + String(token).slice(0, 24) + '/', QUICK_LIMIT, QUICK_WINDOW);
+async function quickConnectBudget(env, token, ctx) {
+    return slidingBudget(env, 'conn/' + String(token).slice(0, 24) + '/', QUICK_LIMIT, QUICK_WINDOW, ctx);
 }
 
-async function connectBudget(env, token) {
-    return slidingBudget(env, 'connall/' + String(token).slice(0, 24) + '/', CONNECT_LIMIT, CONNECT_WINDOW);
+async function connectBudget(env, token, ctx) {
+    return slidingBudget(env, 'connall/' + String(token).slice(0, 24) + '/', CONNECT_LIMIT, CONNECT_WINDOW, ctx);
 }
 
 /** 用一条 WebSocket 把错误送达前端（升级失败的 HTTP 响应浏览器读不到 body） */
@@ -759,7 +761,7 @@ function socketError(message) {
     return new Response(null, { status: 101, webSocket: client });
 }
 
-async function handleWebSocket(request, env) {
+async function handleWebSocket(request, env, ctx) {
     const upgrade = request.headers.get('upgrade') || '';
     if (upgrade.toLowerCase() !== 'websocket') return json({ error: 'upgrade_required' }, 426);
     assertSameOrigin(request);
@@ -781,20 +783,20 @@ async function handleWebSocket(request, env) {
         // 串行就是白白多等一个 R2 往返
         const [rec, budget] = await Promise.all([
             getJSON(env, 'hosts/' + hostId),
-            connectBudget(env, session.token),
+            connectBudget(env, session.token, ctx),
         ]);
         if (!rec) return json({ error: 'not_found', message: '主机不存在，可能已被删除' }, 404);
         if (!budget) {
             return socketError(`连接建立过于频繁（每分钟最多 ${CONNECT_LIMIT} 次），请稍后再试。`);
         }
-        target = { host: normalizeHost(rec.host), port: rec.port || 22, hostId };
+        target = { host: normalizeHost(rec.host), port: rec.port || 22, hostId, hostRec: rec };
     } else {
         const addr = normalizeHost(qHost);
         if (!addr) return json({ error: 'bad_host', message: '主机地址不合法' }, 400);
         if (qPort < 1 || qPort > 65535) return json({ error: 'bad_port', message: '端口不合法' }, 400);
         const [quick, budget] = await Promise.all([
-            quickConnectBudget(env, session.token),
-            connectBudget(env, session.token),
+            quickConnectBudget(env, session.token, ctx),
+            connectBudget(env, session.token, ctx),
         ]);
         if (!quick) {
             return socketError(`临时连接过于频繁（${QUICK_WINDOW / 60000} 分钟内最多 ${QUICK_LIMIT} 个目标）。请先把常用主机保存下来再连接。`);
@@ -855,7 +857,7 @@ export default {
                     request
                 );
             }
-            if (path === '/ws') return await handleWebSocket(request, env);
+            if (path === '/ws') return await handleWebSocket(request, env, ctx);
             if (path.startsWith('/api/')) return await handleApi(request, env, url);
             if (path === '/' || path === '/index.html') return html(renderShell(), request);
             if (env.ASSETS) {

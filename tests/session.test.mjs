@@ -91,6 +91,28 @@ test('knownKey：IPv6 与端口都进 key，且不含路径分隔符', () => {
     assert.equal(knownKey('a/b', 22), 'known/a_b_22', '斜杠必须被替换，否则会写到别的目录');
 });
 
+test('连接预热复用已读取的主机记录', async () => {
+    const env = makeEnv();
+    let hostReads = 0;
+    const get = env.BUCKET.get.bind(env.BUCKET);
+    env.BUCKET.get = async (key) => {
+        if (key === 'hosts/h1') hostReads++;
+        return get(key);
+    };
+    const hostRec = { id: 'h1', host: 'example.com', port: 22 };
+    const term = new Terminal(new FakeWs(), env, 'admin', { opened: new Promise(() => {}) }, {
+        host: 'example.com',
+        port: 22,
+        hostId: 'h1',
+        hostRec,
+    });
+
+    term.warm();
+
+    assert.equal(await term.hostRecPromise, hostRec);
+    assert.equal(hostReads, 0);
+});
+
 test('原子上传：open-upload 建同目录临时文件并返回句柄', async () => {
     const sftp = makeSftp();
     const { ws, term } = makeTerm(sftp);

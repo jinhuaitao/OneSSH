@@ -125,6 +125,10 @@ export class Terminal {
         this.hostRec = null;
         this.hostRecPromise = null;
         this.knownPrefetch = null;
+        if (target && target.host) {
+            this.knownPrefetch = getJSON(env, knownKey(target.host, target.port || 22));
+            this.knownPrefetch.catch(() => {});
+        }
         this.authUser = '';
         this.authPass = '';
     }
@@ -212,7 +216,10 @@ export class Terminal {
         if (!this.socket) return;
         // 主机记录也在这里就开始读：它和 TCP 建连、KEX 是并行的
         if (this.target && this.target.hostId) {
-            this.hostRecPromise = getJSON(this.env, 'hosts/' + String(this.target.hostId));
+            this.hostRec = this.target.hostRec || null;
+            this.hostRecPromise = this.hostRec
+                ? Promise.resolve(this.hostRec)
+                : getJSON(this.env, 'hosts/' + String(this.target.hostId));
         }
         await this.socket.opened;
         this.tcpReady = true;
@@ -221,9 +228,6 @@ export class Terminal {
         const host = this.target ? this.target.host : '';
         const port = this.target ? this.target.port || 22 : 22;
         this.meta = { host, port, user: '' };
-        // 已知主机指纹：_hostKeyPolicy 在 KEX 验签后就要用，提前取好，
-        // 免得整条握手在「等 R2」上停顿一个往返。
-        if (host) this.knownPrefetch = getJSON(this.env, knownKey(host, port));
 
         this.client = new SSHClient({
             username: '',
