@@ -86,19 +86,25 @@ npx wrangler secret put WEBSSH_SETUP_TOKEN   # 必须设置，否则拒绝初始
 ## 🔐 安全
 
 - **单管理员**：无注册入口，口令 PBKDF2-SHA256 加盐存储，可选环境变量 pepper 加固
+- **两步验证（可选）**：TOTP（RFC 6238，HMAC-SHA1，30 秒步长，±1 步容差，同一验证码防重放）+ 10 个一次性备用码（只存 SHA-256 哈希）；设置页可启用 / 停用（停用需密码 + 验证码），登录与导出都可要求验证码
 - **会话**：256 位随机 token，HttpOnly + SameSite=Lax，30 天绝对 / 7 天空闲过期，绑 UA 与 IP 网段，改密踢掉所有设备
 - **加密**：主机密码、私钥、常用账号、会话录制均 AES-GCM，v2 密文绑定字段归属（AAD），搬走解不开
 - **主机密钥**：握手先验签，指纹首次记录、变更即拒绝，无法「点继续」绕过中间人
-- **防线**：写接口 Origin 同源校验 · CSP/COOP/CORP/HSTS · 登录失败 6 次锁 15 分钟 · 连接频率预算 · 只连公网
+- **防线**：写接口 Origin 同源校验 · CSP/COOP/CORP/HSTS · 登录失败 6 次锁 15 分钟 · 连接频率预算 · 只连公网；字面私网 / 保留地址在创建与建连时都直接拒绝（`10/8、172.16/12、192.168/16、127/8、169.254/16、::1、fc00::/7、fe80::/10` 等，`2001:db8::/32` 文档段除外）；未登录时 `/api/state` 只返回 `{setup, authed}`，不暴露版本号与初始化配置
+- **数据**：主机 / 密钥库 / 常用账号 / 分组 / 片段带 `version` 乐观并发（POST 可带 `expectedVersion`，冲突返回 409）；加密导出 / 导入（导出密码 PBKDF2 10 万次 + AES-GCM，AAD `oneshh-export-v1`，主密钥一起打包，导入需 `confirm: true`，失败不覆盖现有数据）；会话录制默认保留 90 天（`WEBSSH_LOG_RETENTION_DAYS` 可改，0 为永久保留），列表与会话结束时分批清理
 
 <details>
 <summary><b>🔧 实现细节与已知限制</b></summary>
 
 浏览器 `xterm.js` ──WebSocket──▶ Worker ──TCP──▶ sshd，同一 SSH 连接内复用 shell + exec（监控）+ sftp；R2 存放账号、会话、主机、分组、凭据、已知主机密钥、录制、片段。
 
-SSH 协议栈自研（`src/ssh/`），只用 WebCrypto：`curve25519-sha256` 密钥交换、`aes*-ctr`、HMAC-SHA2、ed25519 / ECDSA P-256 / RSA-SHA2 主机密钥，密码/公钥/keyboard-interactive 认证。SHA-1 系已移除，支持 strict-kex（Terrapin 缓解）与主动重协商。
+SSH 协议栈自研（`src/ssh/`），只用 WebCrypto：`curve25519-sha256` 与 `diffie-hellman-group14-sha256` 密钥交换、`aes*-ctr`、HMAC-SHA2、ed25519 / ECDSA P-256 / RSA-SHA2 主机密钥，密码/公钥/keyboard-interactive 认证，私钥支持 ed25519 / RSA / ECDSA P-256。SHA-1 系已移除，支持 strict-kex（Terrapin 缓解）与主动重协商。
 
 **限制**：免费计划 10ms CPU，持续大输出可能中断（Paid $5/月为 30s）· 监控依赖 Linux `/proc` · 不支持端口转发、Agent 转发、带口令私钥 · 只支持较新的算法 · Workers 只能连公网地址。
+
+**私网与 DNS 重绑定**：字面私网地址在代码层直接拦截，但域名解析后指向私网的 DNS 重绑定在 Worker 内无解——`connect()` 的 DNS 解析不在代码控制内，兜底靠 Workers 运行时只连公网。不要把本工具当作内网跳板机用。
+
+**明确延期（未实现）**：ChaCha20-Poly1305（WebCrypto 无此算法，纯 JS 实现量大且易错）· 带口令 OpenSSH 私钥（需 bcrypt_pbkdf 纯 JS 实现）· AES-GCM SSH 密码套件。R2 单对象乐观并发只有 `version` 字段校验，校验与写回之间仍有竞态窗口（真 CAS 需 R2 If-Match/etag，`getJSON` 目前丢弃 etag、内存 R2 桩也不提供 etag，故未做）；`version` 至少让基于旧列表的编辑能被发现，而不是静默丢数据。
 
 </details>
 
@@ -107,11 +113,12 @@ SSH 协议栈自研（`src/ssh/`），只用 WebCrypto：`curve25519-sha256` 密
 ```bash
 npm install
 npx wrangler dev        # http://127.0.0.1:8787
-npm test                # 115 个用例，无需 Cloudflare / sshd / 浏览器
+npm test                # 146 个用例，无需 Cloudflare / sshd / 浏览器
+npm run test:e2e        # 2 个用例，ssh2 起真实本地 sshd（与 npm test 里的同款用例单独跑）
 npx wrangler deploy     # 需先 wrangler login
 ```
 
-`npm test` 用 Node 内置 `node:test`：内存 R2（含条件写与分页）+ `cloudflare:sockets` 桩，覆盖加解密、SFTP、API 鉴权、限流、安全加固等。
+`npm test` 用 Node 内置 `node:test`：内存 R2（含条件写与分页）+ `cloudflare:sockets` 桩，覆盖加解密、SFTP、API 鉴权、限流、安全加固等；E2E 用例用 `ssh2` 起真实本地服务器验证握手、认证与 exec，无 `ssh-keygen` 的环境会自动跳过。
 
 ---
 

@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { Reader, Writer, concat, toBase64, fromBase64, bytesToHex, equalBytes } from '../src/ssh/buf.js';
 import * as C from '../src/ssh/crypto.js';
 import { loadPrivateKey } from '../src/ssh/keys.js';
-import { normalizeHost } from '../src/hostaddr.js';
+import { normalizeHost, isPrivateIP, isPublicHost } from '../src/hostaddr.js';
 import * as auth from '../src/auth.js';
 import { makeEnv } from './helpers.mjs';
 
@@ -26,6 +26,33 @@ test('normalizeHost：域名 / IPv4 / IPv6 与非法输入', () => {
 
     const bad = ['', '   ', 'not a host', '-bad.example', 'bad-.example', 'a..b', '[not-ipv6]', '[2001:db8::1', 'http://x.com', 'a/b', 'a'.repeat(254)];
     for (const input of bad) assert.equal(normalizeHost(input), '', JSON.stringify(input));
+});
+
+test('isPrivateIP：私网 / 环回 / 链路本地 / 保留地址，文档段不拦', () => {
+    for (const ip of [
+        '10.0.0.1', '10.255.255.255', '172.16.0.1', '172.31.255.255', '192.168.0.1',
+        '127.0.0.1', '0.0.0.0', '169.254.1.1', '::1', '[::1]', '::', 'fc00::1', 'fd12:3456::1',
+        'fe80::1', '[fe80::1]', '::ffff:10.0.0.1', '[::ffff:192.168.1.1]',
+    ]) {
+        assert.equal(isPrivateIP(ip), true, ip);
+    }
+    for (const ip of [
+        '192.0.2.10', '203.0.113.5', '8.8.8.8', '2001:db8::1', '[2001:db8::1]',
+        '2001:4860:4860::8888', 'example.com', 'not-an-ip',
+    ]) {
+        assert.equal(isPrivateIP(ip), false, ip);
+    }
+    // 172.32.0.1 不在 172.16/12 里，是公网
+    assert.equal(isPrivateIP('172.32.0.1'), false);
+});
+
+test('isPublicHost：域名放行（DNS 重绑定靠 Workers connect 兜底），字面私网拒绝', () => {
+    assert.equal(isPublicHost('example.com'), true);
+    assert.equal(isPublicHost('203.0.113.5'), true);
+    assert.equal(isPublicHost('2001:db8::1'), true);
+    assert.equal(isPublicHost('10.0.0.1'), false);
+    assert.equal(isPublicHost('[::1]'), false);
+    assert.equal(isPublicHost('not a host'), false);
 });
 
 /* --------------------------------------------------------------- 二进制缓冲 */

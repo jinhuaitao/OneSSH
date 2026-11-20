@@ -32,10 +32,11 @@ test('初始状态：未初始化、未登录、初始化口令必填', async ()
     assert.equal(res.status, 200);
     assert.equal(res.json.setup, false);
     assert.equal(res.json.authed, false);
-    // 口令输入框永远显示：没配口令时 setup 会被拒绝（fail-closed）
-    assert.equal(res.json.needsSetupToken, true);
-    assert.equal(res.json.setupTokenConfigured, true);
-    assert.match(res.json.version, /^\d+\.\d+\.\d+$/);
+    // 未登录只返回最少字段：版本号 / 初始化配置不对陌生人暴露（去指纹）。
+    // 口令输入框永远显示：没配口令时 setup 会被拒绝（fail-closed），前端无需靠字段判断。
+    assert.equal(res.json.version, undefined);
+    assert.equal(res.json.setupTokenConfigured, undefined);
+    assert.equal(res.json.needsSetupToken, undefined);
 });
 
 test('初始化：弱口令被拒，合法口令拿到会话 Cookie', async () => {
@@ -72,10 +73,7 @@ test('初始化：只能成功一次', async () => {
 test('初始化口令：设置后必须先通过校验', async () => {
     const env = makeEnv({ __worker: worker, WEBSSH_SETUP_TOKEN: 's3cret-setup-token' });
 
-    let res = await call(env, '/api/state');
-    assert.equal(res.json.needsSetupToken, true);
-
-    res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: PW } });
+    let res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: PW } });
     assert.equal(res.status, 403);
     assert.equal(res.json.error, 'bad_token');
 
@@ -273,6 +271,17 @@ test('主机：地址与端口校验', async () => {
     // IPv6 统一补方括号
     const ok = await call(env, '/api/hosts', { method: 'POST', cookie, body: { host: '2001:db8::1', username: 'root', password: 'x' } });
     assert.equal(ok.json.host.host, '[2001:db8::1]');
+});
+
+test('主机：私网 / 保留地址拒绝创建，公网地址放行', async () => {
+    const { env, cookie } = await setupApp();
+    for (const host of ['10.0.0.1', '192.168.1.1', '172.16.0.5', '127.0.0.1', '169.254.1.1', '[::1]', 'fc00::1', 'fe80::1']) {
+        const res = await call(env, '/api/hosts', { method: 'POST', cookie, body: { host, username: 'root', password: 'x' } });
+        assert.equal(res.status, 400, host + ' → ' + res.text);
+    }
+    // 文档段 2001:db8::/32 故意不拦（测试与示例都用它）
+    const doc = await call(env, '/api/hosts', { method: 'POST', cookie, body: { host: '2001:db8::1', username: 'root', password: 'x' } });
+    assert.equal(doc.status, 200, doc.text);
 });
 
 test('主机：删除不存在的记录返回 404', async () => {

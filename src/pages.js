@@ -161,6 +161,13 @@ export function renderShell() {
             <button type="button" class="pw-toggle" aria-label="显示密码" tabindex="-1">${icon('eye', 15)}${icon('eyeoff', 15)}</button>
           </span>
         </label>
+        <label id="login-totp-field" hidden>两步验证码
+          <span class="field">
+            <span class="f-ic">${icon('key', 15)}</span>
+            <input name="totpCode" type="text" inputmode="numeric" autocomplete="one-time-code" placeholder="6 位验证码或 8 位备用码" maxlength="8">
+          </span>
+        </label>
+        <p class="form-hint" id="login-totp-hint" hidden>已启用两步验证，请输入认证器 App 里的 6 位验证码（备用码为 8 位数字）。</p>
         <button type="submit" class="btn primary block">登 录</button>
         <p class="form-error" id="login-error"></p>
       </form>

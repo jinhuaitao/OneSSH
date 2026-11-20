@@ -4,7 +4,7 @@ import { SSHClient } from './ssh/client.js';
 import { SFTPClient, OPEN, b64encode, b64decode, isDirMode, isLinkMode, modeString, tempName } from './ssh/sftp.js';
 import { getJSON, putJSON, putBytes, list, del } from './store.js';
 import { decryptSecret, randomHex, encryptBytes } from './auth.js';
-import { normalizeHost } from './hostaddr.js';
+import { normalizeHost, isPublicHost } from './hostaddr.js';
 
 const MAX_FILE = 64 * 1024 * 1024;
 const READ_CHUNK = 128 * 1024;
@@ -318,6 +318,7 @@ export class Terminal {
 
         host = normalizeHost(host);
         if (!host) throw new Error('主机地址不合法（支持域名、IPv4、IPv6）');
+        if (!isPublicHost(host)) throw new Error('主机地址为私网或保留地址，不允许连接（只支持公网地址）');
         if (!username) throw new Error('缺少用户名');
         if (port < 1 || port > 65535) throw new Error('端口不合法');
 
@@ -918,7 +919,7 @@ function clampInt(v, min, max, dflt) {
 // 不清理的话，一年后桶里全是没人再看的终端日志（还都是加密的，删了也不心疼）。
 function logRetentionDays(env) {
     const raw = env && env.WEBSSH_LOG_RETENTION_DAYS;
-    if (raw == null || raw === '') return 30;
+    if (raw == null || raw === '') return 90;
     const n = parseInt(String(raw), 10);
     return Number.isFinite(n) && n >= 0 ? n : 30;
 }

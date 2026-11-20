@@ -130,6 +130,93 @@ export async function curve25519Shared(privateKey, serverPubRaw) {
     return new Uint8Array(bits);
 }
 
+/* ------------------------------------------- diffie-hellman group14-sha256 */
+
+// RFC 3526 §3：2048-bit MODP 群（group 14），生成元 g = 2。
+// 素数 p 的 16 进制值即 RFC 3526 给出的 group 14 素数（与 Node
+// crypto.createDiffieHellman('modp14') 的素数一致，见测试）。
+export const DH_GROUP14_PRIME_HEX =
+    'FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74020BBEA63B139B22514A08798E3404DD' +
+    'EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED' +
+    'EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF0598DA48361C55D39A69163FA8FD24CF5F' +
+    '83655D23DCA3AD961C62F356208552BB9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B' +
+    'E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF6955817183995497CEA956AE515D2261898FA0510' +
+    '15728E5A8AACAA68FFFFFFFFFFFFFFFF';
+export const DH_GROUP14_PRIME = BigInt('0x' + DH_GROUP14_PRIME_HEX);
+const DH_GROUP14_G = 2n;
+
+function modPow(base, exp, mod) {
+    let result = 1n;
+    let b = base % mod;
+    let e = exp;
+    while (e > 0n) {
+        if (e & 1n) result = (result * b) % mod;
+        e >>= 1n;
+        if (e) b = (b * b) % mod;
+    }
+    return result;
+}
+
+function bigIntToBytes(v) {
+    if (v === 0n) return new Uint8Array([0]);
+    let hex = v.toString(16);
+    if (hex.length % 2) hex = '0' + hex;
+    const out = new Uint8Array(hex.length / 2);
+    for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.substr(i * 2, 2), 16);
+    return out;
+}
+
+function bytesToBigInt(u8) {
+    if (!u8.length) return 0n;
+    let hex = '';
+    for (const b of u8) hex += b.toString(16).padStart(2, '0');
+    return BigInt('0x' + hex);
+}
+
+/**
+ * mpint 的值字节：最小大端表示，最高位为 1 时前补一个 0x00（RFC 4251 §5）。
+ * 按此规范化后，Writer().mpint() 不会再改动它，包里发的 e 与交换哈希里的 e
+ * 就是同一串字节。
+ */
+function mpintValueBytes(v) {
+    const b = bigIntToBytes(v);
+    if (b[0] & 0x80) {
+        const out = new Uint8Array(b.length + 1);
+        out.set(b, 1);
+        return out;
+    }
+    return b;
+}
+
+/**
+ * 生成 group14 密钥对。私钥 x 为 256-bit 随机数（范围 2..p-2），公钥为
+ * g^x mod p（mpint 值字节形式）。
+ * @returns {{ privateKey: bigint, publicKey: Uint8Array }}
+ */
+export function dhGroup14Keypair() {
+    const p = DH_GROUP14_PRIME;
+    let x;
+    do {
+        x = bytesToBigInt(globalThis.crypto.getRandomValues(new Uint8Array(32)));
+    } while (x < 2n || x > p - 2n);
+    return { privateKey: x, publicKey: mpintValueBytes(modPow(DH_GROUP14_G, x, p)) };
+}
+
+/**
+ * 计算 group14 共享密钥。serverPubBytes 为对端公钥 f 的 mpint 值字节
+ * （KEXDH_REPLY 里 str() 读出的内容）；返回原始大端字节，调用方再按
+ * 现有用法包一层 Writer().mpint()（与 curve25519Shared 的约定一致）。
+ * f 不在 (1, p-1) 范围内直接拒绝：那是无效/恶意的 DH 公钥。
+ */
+export function dhGroup14Shared(privateKey, serverPubBytes) {
+    const p = DH_GROUP14_PRIME;
+    const f = bytesToBigInt(serverPubBytes);
+    if (f <= 1n || f >= p - 1n) {
+        throw new Error('DH group14: 对端公钥不在有效范围 (1 < f < p-1)，已中止连接');
+    }
+    return bigIntToBytes(modPow(f, privateKey, p));
+}
+
 /* --------------------------------------------------------------- der/x509 */
 
 function derTLV(tag, content) {

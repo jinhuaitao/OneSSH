@@ -33,8 +33,10 @@ test('初始化口令：未配置 WEBSSH_SETUP_TOKEN 时直接拒绝，而不是
     const env = makeEnv({ __worker: worker, WEBSSH_SETUP_TOKEN: undefined });
 
     const state = await call(env, '/api/state');
-    assert.equal(state.json.needsSetupToken, true, '界面应当始终展示口令输入框');
-    assert.equal(state.json.setupTokenConfigured, false);
+    // 未登录不暴露是否配了初始化口令（去指纹）：界面永远展示口令输入框，
+    // 没配时由 setup 的 503 告知，不靠 /api/state 泄露。
+    assert.equal(state.json.needsSetupToken, undefined);
+    assert.equal(state.json.setupTokenConfigured, undefined);
 
     const res = await call(env, '/api/setup', { method: 'POST', body: { username: 'admin', password: PW, token: 'whatever' } });
     assert.equal(res.status, 503);
@@ -427,12 +429,13 @@ test('/api/state：已初始化但未登录时不暴露版本号与初始化配�
     assert.equal(res.json.version, undefined, '陌生人不需要知道部署的是哪个版本');
     assert.equal(res.json.setupTokenConfigured, undefined, '不该透露初始化口令配没配');
 
-    // 未初始化时前端要靠这些字段决定显示初始化表单，必须保留
+    // 未初始化时同样只返回最少字段：前端永远显示初始化表单 + 口令输入框，
+    // 是否配了初始化口令由 setup 失败的 503 告知，不靠 /api/state 泄露。
     const fresh = makeEnv({ __worker: worker });
     const s2 = await call(fresh, '/api/state');
     assert.equal(s2.json.setup, false);
-    assert.equal(typeof s2.json.version, 'string');
-    assert.equal(s2.json.setupTokenConfigured, true);
+    assert.equal(s2.json.version, undefined);
+    assert.equal(s2.json.setupTokenConfigured, undefined);
 
     // 登录之后照常返回版本号（设置页要显示）
     const { env: env2, cookie } = await boot();
@@ -449,14 +452,14 @@ test('主机数量上限：到顶之后新建返回 409，而不是无限膨胀'
     for (let i = 0; i < 200; i++) {
         await env.BUCKET.put(
             'hosts/s' + i,
-            JSON.stringify({ id: 's' + i, name: 'h' + i, host: '10.0.0.1', port: 22, group: '', authType: 'password', createdAt: i })
+            JSON.stringify({ id: 's' + i, name: 'h' + i, host: '203.0.113.1', port: 22, group: '', authType: 'password', createdAt: i })
         );
     }
     const res = await call(env, '/api/hosts', {
         method: 'POST',
         cookie,
         headers: hdr,
-        body: { name: 'x', host: '10.0.0.2', port: 22, username: 'root', authType: 'password' },
+        body: { name: 'x', host: '203.0.113.2', port: 22, username: 'root', authType: 'password' },
     });
     assert.equal(res.status, 409);
     assert.equal(res.json.error, 'too_many');
@@ -466,7 +469,7 @@ test('主机数量上限：到顶之后新建返回 409，而不是无限膨胀'
         method: 'POST',
         cookie,
         headers: hdr,
-        body: { id: 's0', name: 'renamed', host: '10.0.0.1', port: 22, username: 'root', authType: 'password' },
+        body: { id: 's0', name: 'renamed', host: '203.0.113.1', port: 22, username: 'root', authType: 'password' },
     });
     assert.equal(upd.status, 200, upd.text);
 });
@@ -478,10 +481,10 @@ async function seedLog(env, key, daysAgo) {
     env.BUCKET.map.get(key).uploaded = new Date(Date.now() - daysAgo * 24 * 3600 * 1000);
 }
 
-test('会话录制保留期：默认清掉 30 天前的，0 表示永久保留', async () => {
+test('会话录制保留期：默认清掉 90 天前的，0 表示永久保留', async () => {
     const env = makeEnv({});
-    await seedLog(env, 'logs/old.log', 40);
-    await seedLog(env, 'logs/new.log', 1);
+    await seedLog(env, 'logs/old.log', 100);
+    await seedLog(env, 'logs/new.log', 40);
     await session.pruneOldLogs(env);
     assert.deepEqual(env.BUCKET.keys('logs/'), ['logs/new.log'], '只该删过期的那条');
 

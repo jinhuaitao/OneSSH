@@ -1,6 +1,6 @@
 // WebSSH — Cloudflare Worker entry (API + WebSocket bridge + static shell)
-import { Terminal } from './session.js';
-import { normalizeHost } from './hostaddr.js';
+import { Terminal, pruneOldLogs } from './session.js';
+import { normalizeHost, isPublicHost } from './hostaddr.js';
 import { connect } from 'cloudflare:sockets';
 import * as auth from './auth.js';
 import { getJSON, putJSON, del, delAll, list, getBytes, listJSON, putJSONAll } from './store.js';
@@ -114,6 +114,10 @@ function cleanHostInput(body) {
     if (!host) throw new HttpError(400, '主机地址不能为空');
     const addr = normalizeHost(host);
     if (!addr) throw new HttpError(400, '主机地址不合法（支持域名、IPv4、IPv6）');
+    // 字面私网 / 保留地址直接拒绝：不要等到 Workers connect() 才失败，
+    // 也不要让它以「已保存主机」的名义躺在库里。域名解析后指向私网的
+    // DNS 重绑定在这里拦不住，兜底靠 Workers connect() 只连公网（见 README）。
+    if (!isPublicHost(addr)) throw new HttpError(400, '主机地址为私网或保留地址，不允许连接（只支持公网地址）');
     if (!username) throw new HttpError(400, '用户名不能为空');
     if (port < 1 || port > 65535) throw new HttpError(400, '端口范围应为 1-65535');
     if (name.length > 60) throw new HttpError(400, '名称过长');
@@ -154,7 +158,23 @@ async function storedGroups(env) {
 }
 
 async function saveGroups(env, groups) {
-    await putJSON(env, 'sys/groups', { groups, updatedAt: Date.now() });
+    const rec = await getJSON(env, 'sys/groups');
+    await putJSON(env, 'sys/groups', bumped(rec, { groups }));
+}
+
+async function saveKeys(env, keys) {
+    const rec = await getJSON(env, 'sys/keys');
+    await putJSON(env, 'sys/keys', bumped(rec, { keys }));
+}
+
+async function saveCreds(env, creds) {
+    const rec = await getJSON(env, 'sys/creds');
+    await putJSON(env, 'sys/creds', bumped(rec, { creds }));
+}
+
+async function saveSnippets(env, snippets) {
+    const rec = await getJSON(env, 'sys/snippets');
+    await putJSON(env, 'sys/snippets', bumped(rec, { snippets }));
 }
 
 async function listGroups(env) {
@@ -236,6 +256,91 @@ function publicCredMeta(c) {
     return { id: c.id, name: c.name, username: c.username, createdAt: c.createdAt || 0 };
 }
 
+/* ------------------------------------------------------- 乐观并发（版本） */
+
+// R2 单对象没有 CAS：sys/keys 等都是「读出来 → 改 → 整个写回」，并发写会
+// 互相覆盖。补一层 version 字段：POST 可带 expectedVersion，不符返回 409。
+// 残余竞态：version 校验与写回之间仍有窗口，两个带同一 expectedVersion 的
+// 并发请求可能都通过、后写者覆盖前写者。真 CAS 需要 R2 的 If-Match/etag，
+// getJSON 目前丢弃 etag、内存 R2 桩也不提供 etag， plumbing 改动过大，
+// 本轮不做（见 SUMMARY）。version 至少让「基于旧列表的编辑」能被发现，
+// 而不是静默丢数据。
+function versionOf(rec) {
+    return rec && Number.isInteger(rec.version) ? rec.version : 0;
+}
+
+function checkExpectedVersion(body, rec) {
+    const want = body && body.expectedVersion;
+    if (want == null || want === '') return null;
+    const n = parseInt(want, 10);
+    if (!Number.isInteger(n)) return json({ error: 'bad_version', message: 'expectedVersion 必须是整数' }, 400);
+    if (n !== versionOf(rec)) {
+        return json({ error: 'version_conflict', message: '数据已被其他会话修改，请刷新后重试', currentVersion: versionOf(rec) }, 409);
+    }
+    return null;
+}
+
+function bumped(rec, extra) {
+    return { ...(rec || {}), ...extra, version: versionOf(rec) + 1, updatedAt: Date.now() };
+}
+
+/* ------------------------------------------------------------- 导出加解密 */
+
+function b64encodeBytes(u8) {
+    let s = '';
+    for (const b of u8) s += String.fromCharCode(b);
+    return btoa(s);
+}
+
+function b64decodeToBytes(str) {
+    const s = atob(String(str || ''));
+    const out = new Uint8Array(s.length);
+    for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
+    return out;
+}
+
+async function exportEncrypt(password, plaintextObj) {
+    const salt = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+    const key = await crypto.subtle.deriveKey(
+        { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+        base,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+    );
+    const ct = new Uint8Array(
+        await crypto.subtle.encrypt(
+            { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode('oneshh-export-v1') },
+            key,
+            new TextEncoder().encode(JSON.stringify(plaintextObj))
+        )
+    );
+    return { salt: b64encodeBytes(salt), iv: b64encodeBytes(iv), ciphertext: b64encodeBytes(ct) };
+}
+
+async function exportDecrypt(password, data) {
+    const salt = b64decodeToBytes(data.salt);
+    const iv = b64decodeToBytes(data.iv);
+    const ct = b64decodeToBytes(data.ciphertext);
+    if (salt.length !== 16 || iv.length !== 12 || !ct.length) throw new Error('导出文件格式不正确');
+    const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveKey']);
+    const key = await crypto.subtle.deriveKey(
+        { name: 'PBKDF2', salt, iterations: 100000, hash: 'SHA-256' },
+        base,
+        { name: 'AES-GCM', length: 256 },
+        false,
+        ['encrypt', 'decrypt']
+    );
+    const pt = await crypto.subtle.decrypt(
+        { name: 'AES-GCM', iv, additionalData: new TextEncoder().encode('oneshh-export-v1') },
+        key,
+        ct
+    );
+    return JSON.parse(new TextDecoder().decode(pt));
+}
+
 /* -------------------------------------------------------------------- api */
 
 async function handleApi(request, env, url) {
@@ -246,16 +351,16 @@ async function handleApi(request, env, url) {
     if (path === '/api/state' && method === 'GET') {
         const admin = await auth.getAdmin(env);
         const session = admin ? await auth.getSession(env, request) : null;
-        // 已经初始化之后，陌生人只需要知道「去登录」。
-        // 把 version / setupTokenConfigured 无条件返回，等于给扫描器免费做指纹识别：
-        // 「这台跑着 OneSSH 1.2.3，且没配初始化口令」是很有用的情报。
-        if (admin && !session) return json({ setup: true, authed: false, user: null });
+        // 未登录只返回最少字段：把 version / setupTokenConfigured 无条件返回，
+        // 等于给扫描器免费做指纹识别（「这台跑着 OneSSH 1.2.3，且没配初始化口令」）。
+        // 初始化口令现在是无条件必需的，前端无需靠 setupTokenConfigured 判断，
+        // 永远显示口令输入框即可；未配置时 setup 直接拒绝。
+        if (!session) return json({ setup: Boolean(admin), authed: false });
         return json({
             setup: Boolean(admin),
-            authed: Boolean(session),
-            user: session ? session.u : null,
-            // 初始化口令现在是无条件必需的：任何拿到网址的人都能抢先注册成管理员，
-            // 所以界面永远显示口令输入框，未配置时 setup 直接拒绝
+            authed: true,
+            user: session.u,
+            totpEnabled: Boolean(admin && admin.totp && admin.totp.enabled),
             needsSetupToken: true,
             setupTokenConfigured: Boolean(env.WEBSSH_SETUP_TOKEN),
             version: VERSION,
@@ -323,6 +428,17 @@ async function handleApi(request, env, url) {
             await auth.recordFailure(env, ip);
             return json({ error: 'bad_credentials', message: '用户名或密码不正确' }, 401);
         }
+        // 密码对了才验 TOTP：顺序反过来会让攻击者用「是否要求 TOTP」探测账号状态。
+        // 启用后无码/错码/重放一律不创建会话；备用码同样走这里。
+        if (admin.totp && admin.totp.enabled) {
+            const totp = await auth.checkTotp(env, admin, body.totpCode);
+            if (!totp.ok) {
+                await auth.recordFailure(env, ip);
+                if (totp.error === 'totp_required') return json({ error: 'totp_required', message: '请输入两步验证码' }, 401);
+                if (totp.error === 'totp_replay') return json({ error: 'totp_invalid', message: '该验证码已被使用，请等待下一组验证码' }, 401);
+                return json({ error: 'totp_invalid', message: '两步验证码不正确' }, 401);
+            }
+        }
         await auth.clearFailures(env, ip);
         // 旧格式记录（没带 pepper / 迭代次数变了）在登录成功这一刻顺手升级。
         // 放在登录成功之后做，失败也不影响本次登录，下次再试。
@@ -342,6 +458,140 @@ async function handleApi(request, env, url) {
 
     const session = await auth.getSession(env, request);
     if (!session) return json({ error: 'unauthorized', message: '登录已过期，请重新登录' }, 401);
+
+    /* -------------------------------------------------- totp 两步验证 */
+
+    if (path === '/api/totp/setup' && method === 'POST') {
+        const admin = await auth.getAdmin(env);
+        const secret = auth.generateTotpSecret();
+        const backup = await auth.generateBackupCodes();
+        const pending = { secret, backupHashes: backup.hashes, createdAt: Date.now() };
+        const next = { ...admin, totpPending: pending };
+        // 已启用时重新 setup 只是换密钥：旧配置保留到 enable 成功那一刻。
+        // 直接写记录，不走 createAdmin（它会重算密码哈希，这里不需要改密码）。
+        await putJSON(env, 'sys/admin', next);
+        return json({ secret, otpauthUri: auth.totpOtpauthUri(secret, admin.username), backupCodes: backup.codes, enabled: Boolean(admin.totp && admin.totp.enabled) });
+    }
+
+    if (path === '/api/totp/enable' && method === 'POST') {
+        const body = await readJSON(request);
+        const admin = await auth.getAdmin(env);
+        const pending = admin && admin.totpPending;
+        if (!pending || !pending.secret) return json({ error: 'no_pending', message: '请先获取两步验证密钥' }, 400);
+        const res = await auth.verifyTotpCode(pending.secret, body.code, (admin.totp && admin.totp.lastCounter) || 0);
+        if (!res.ok) return json({ error: 'totp_invalid', message: '验证码不正确，请核对时间后重试' }, 401);
+        const next = { ...admin };
+        next.totp = { enabled: true, secret: pending.secret, lastCounter: res.counter, backupHashes: pending.backupHashes || [] };
+        delete next.totpPending;
+        await putJSON(env, 'sys/admin', next);
+        return json({ ok: true, backupRemaining: next.totp.backupHashes.length });
+    }
+
+    if (path === '/api/totp/disable' && method === 'POST') {
+        const body = await readJSON(request);
+        const admin = await auth.getAdmin(env);
+        if (!admin.totp || !admin.totp.enabled) return json({ ok: true, enabled: false });
+        // 停用要同时验密码和码：只拿到会话还不够，防止「借用已登录电脑关掉 2FA」
+        const okPass = await auth.verifyLogin(env, session.u, body.current);
+        if (!okPass) return json({ error: 'bad_credentials', message: '当前密码不正确' }, 401);
+        const totp = await auth.checkTotp(env, await auth.getAdmin(env), body.totpCode);
+        if (!totp.ok) return json({ error: 'totp_invalid', message: '两步验证码不正确' }, 401);
+        const fresh = await auth.getAdmin(env);
+        const next = { ...fresh };
+        delete next.totp;
+        delete next.totpPending;
+        await putJSON(env, 'sys/admin', next);
+        return json({ ok: true, enabled: false });
+    }
+
+    if (path === '/api/totp/status' && method === 'GET') {
+        const admin = await auth.getAdmin(env);
+        const totp = admin && admin.totp;
+        return json({ enabled: Boolean(totp && totp.enabled), backupRemaining: totp && Array.isArray(totp.backupHashes) ? totp.backupHashes.length : 0, hasPending: Boolean(admin && admin.totpPending) });
+    }
+
+    /* -------------------------------------------------- 加密导出 / 导入 */
+
+    if (path === '/api/export' && method === 'POST') {
+        const body = await readJSON(request);
+        const password = String(body.exportPassword || '');
+        if (password.length < 10) return json({ error: 'weak_password', message: '导出密码至少 10 位' }, 400);
+        const admin = await auth.getAdmin(env);
+        if (admin.totp && admin.totp.enabled) {
+            const totp = await auth.checkTotpCodeOnly(env, admin, body.totpCode);
+            if (!totp.ok) return json({ error: totp.error === 'totp_required' ? 'totp_required' : 'totp_invalid', message: '导出需要提供有效的两步验证码' }, 401);
+        }
+        const master = await getJSON(env, 'sys/master');
+        if (!master || !master.key) {
+            // 主密钥在环境变量里时，R2 没有它可包：导出包解不开凭据，宁可拒绝
+            // 也不要给用户一个「看着成功、导入后全是乱码」的包。
+            return json({ error: 'master_key_in_env', message: '主密钥由 WEBSSH_MASTER_KEY 环境变量提供，无法打包进导出文件；请妥善保管该环境变量的值' }, 400);
+        }
+        const hosts = (await listJSON(env, 'hosts/')).map((p) => p.rec);
+        const keysRec = await getJSON(env, 'sys/keys');
+        const credsRec = await getJSON(env, 'sys/creds');
+        const groupsRec = await getJSON(env, 'sys/groups');
+        const snipRec = await getJSON(env, 'sys/snippets');
+        const payload = {
+            v: 1,
+            exportedAt: Date.now(),
+            masterKey: master.key,
+            hosts,
+            keys: (keysRec && keysRec.keys) || [],
+            creds: (credsRec && credsRec.creds) || [],
+            groups: (groupsRec && groupsRec.groups) || [],
+            snippets: (snipRec && snipRec.snippets) || [],
+        };
+        return json(await exportEncrypt(password, payload));
+    }
+
+    if (path === '/api/import' && method === 'POST') {
+        const body = await readJSON(request);
+        if (body.confirm !== true) return json({ error: 'confirm_required', message: '导入会覆盖现有主机、密钥库、常用账号、分组与片段，请确认（confirm: true）' }, 400);
+        const password = String(body.exportPassword || '');
+        if (!password) return json({ error: 'bad_export', message: '请提供导出密码' }, 400);
+        if (!body.data || typeof body.data !== 'object') return json({ error: 'bad_export', message: '导出文件格式不正确' }, 400);
+        let payload;
+        try {
+            payload = await exportDecrypt(password, body.data);
+        } catch (_) {
+            return json({ error: 'bad_export', message: '导出密码不正确或文件已损坏' }, 400);
+        }
+        if (!payload || payload.v !== 1 || !Array.isArray(payload.hosts) || !Array.isArray(payload.keys) || !Array.isArray(payload.creds)) {
+            return json({ error: 'bad_export', message: '导出文件内容不完整' }, 400);
+        }
+        if (env.WEBSSH_MASTER_KEY) {
+            return json({ error: 'master_key_in_env', message: '当前部署的主密钥由 WEBSSH_MASTER_KEY 提供，导入包里的主密钥无法生效；请先移除该环境变量再导入' }, 400);
+        }
+        // 先全部校验完再写任何东西：密码错、格式错都不会动现有数据。
+        if (!payload.masterKey || typeof payload.masterKey !== 'string') {
+            return json({ error: 'bad_export', message: '导出文件里没有主密钥，无法恢复凭据' }, 400);
+        }
+        for (const h of payload.hosts) {
+            if (!h || typeof h.id !== 'string' || !/^[a-zA-Z0-9]+$/.test(h.id) || !normalizeHost(h.host || '')) {
+                return json({ error: 'bad_export', message: '导出文件里有非法的主机记录' }, 400);
+            }
+            if (!isPublicHost(h.host)) return json({ error: 'bad_export', message: '导出文件里包含私网地址主机，已拒绝导入' }, 400);
+        }
+        await putJSON(env, 'sys/master', { key: payload.masterKey, createdAt: Date.now() });
+        const oldHosts = await list(env, 'hosts/');
+        await delAll(env, oldHosts.map((o) => o.key));
+        await putJSONAll(env, payload.hosts.map((h) => ({ key: 'hosts/' + h.id, rec: h })));
+        await saveKeys(env, payload.keys);
+        await saveCreds(env, payload.creds);
+        await saveGroups(env, Array.isArray(payload.groups) ? payload.groups : []);
+        await saveSnippets(env, Array.isArray(payload.snippets) ? payload.snippets : []);
+        return json({
+            ok: true,
+            imported: {
+                hosts: payload.hosts.length,
+                keys: payload.keys.length,
+                creds: payload.creds.length,
+                groups: (payload.groups || []).length,
+                snippets: (payload.snippets || []).length,
+            },
+        });
+    }
 
     if (path === '/api/logout' && method === 'POST') {
         await auth.destroySession(env, session.token);
@@ -377,10 +627,13 @@ async function handleApi(request, env, url) {
 
     if (path === '/api/groups') {
         if (method === 'GET') {
-            return json({ groups: await listGroups(env) });
+            return json({ groups: await listGroups(env), version: versionOf(await getJSON(env, 'sys/groups')) });
         }
         if (method === 'POST') {
             const body = await readJSON(request);
+            const groupRec = await getJSON(env, 'sys/groups');
+            const conflict = checkExpectedVersion(body, groupRec);
+            if (conflict) return conflict;
             const stored = await storedGroups(env);
             const groups = await listGroups(env);
             const op = String(body.op || '');
@@ -418,10 +671,13 @@ async function handleApi(request, env, url) {
 
     if (path === '/api/keys') {
         if (method === 'GET') {
-            return json({ keys: (await storedKeys(env)).map(publicKeyMeta) });
+            return json({ keys: (await storedKeys(env)).map(publicKeyMeta), version: versionOf(await getJSON(env, 'sys/keys')) });
         }
         if (method === 'POST') {
             const body = await readJSON(request);
+            const keysRec = await getJSON(env, 'sys/keys');
+            const conflict = checkExpectedVersion(body, keysRec);
+            if (conflict) return conflict;
             const keys = await storedKeys(env);
             const id = String(body.id || '').trim();
             const name = cleanKeyName(body.name);
@@ -452,7 +708,7 @@ async function handleApi(request, env, url) {
                 updatedAt: Date.now(),
             };
             const next = entry ? keys.map((k) => (k.id === rec.id ? rec : k)) : keys.concat(rec);
-            await putJSON(env, 'sys/keys', { keys: next, updatedAt: Date.now() });
+            await saveKeys(env, next);
             return json({ key: publicKeyMeta(rec) });
         }
     }
@@ -465,16 +721,19 @@ async function handleApi(request, env, url) {
         const pairs = await listJSON(env, 'hosts/');
         const used = pairs.filter((p) => p.rec.keyId === id).length;
         if (used) return json({ error: 'in_use', message: `该密钥正被 ${used} 台主机使用，请先改用其他凭据` }, 409);
-        await putJSON(env, 'sys/keys', { keys: keys.filter((k) => k.id !== id), updatedAt: Date.now() });
+        await saveKeys(env, keys.filter((k) => k.id !== id));
         return json({ ok: true });
     }
 
     if (path === '/api/creds') {
         if (method === 'GET') {
-            return json({ creds: (await storedCreds(env)).map(publicCredMeta) });
+            return json({ creds: (await storedCreds(env)).map(publicCredMeta), version: versionOf(await getJSON(env, 'sys/creds')) });
         }
         if (method === 'POST') {
             const body = await readJSON(request);
+            const credsRec = await getJSON(env, 'sys/creds');
+            const conflict = checkExpectedVersion(body, credsRec);
+            if (conflict) return conflict;
             const creds = await storedCreds(env);
             const id = String(body.id || '').trim();
             const name = cleanCredName(body.name);
@@ -496,7 +755,7 @@ async function handleApi(request, env, url) {
                 updatedAt: Date.now(),
             };
             const next = entry ? creds.map((c) => (c.id === rec.id ? rec : c)) : creds.concat(rec);
-            await putJSON(env, 'sys/creds', { creds: next, updatedAt: Date.now() });
+            await saveCreds(env, next);
             // hosts keep a denormalised username for list rendering
             if (entry && entry.username !== username) {
                 const pairs = await listJSON(env, 'hosts/');
@@ -522,7 +781,7 @@ async function handleApi(request, env, url) {
         const pairs = await listJSON(env, 'hosts/');
         const used = pairs.filter((p) => p.rec.credId === id).length;
         if (used) return json({ error: 'in_use', message: `该账号正被 ${used} 台主机使用，请先改用其他凭据` }, 409);
-        await putJSON(env, 'sys/creds', { creds: creds.filter((c) => c.id !== id), updatedAt: Date.now() });
+        await saveCreds(env, creds.filter((c) => c.id !== id));
         return json({ ok: true });
     }
 
@@ -607,10 +866,13 @@ async function handleApi(request, env, url) {
     if (path === '/api/snippets') {
         if (method === 'GET') {
             const rec = await getJSON(env, 'sys/snippets');
-            return json({ snippets: (rec && rec.snippets) || [] });
+            return json({ snippets: (rec && rec.snippets) || [], version: versionOf(rec) });
         }
         if (method === 'POST') {
             const body = await readJSON(request);
+            const snipRec = await getJSON(env, 'sys/snippets');
+            const conflict = checkExpectedVersion(body, snipRec);
+            if (conflict) return conflict;
             // 别叫 list：会遮住从 store.js 引入的 list()
             const incoming = Array.isArray(body.snippets) ? body.snippets.slice(0, 100) : [];
             const clean = incoming
@@ -620,7 +882,7 @@ async function handleApi(request, env, url) {
                     name: String(s.name || '').slice(0, 60) || s.command.slice(0, 30),
                     command: String(s.command).slice(0, 2000),
                 }));
-            await putJSON(env, 'sys/snippets', { snippets: clean, updatedAt: Date.now() });
+            await saveSnippets(env, clean);
             return json({ snippets: clean });
         }
     }
@@ -643,6 +905,9 @@ async function handleApi(request, env, url) {
 
     if (path === '/api/logs') {
         if (method === 'GET') {
+            // 列表时顺手清一批过期录制（默认保留 90 天，每次最多删 50 条，
+            // 避免一次请求吃光 CPU 预算）；会话结束时 cleanup 里也会清。
+            await pruneOldLogs(env).catch(() => {});
             const objs = await list(env, 'logs/', true);
             const logs = objs
                 .map((o) => ({
@@ -789,10 +1054,14 @@ async function handleWebSocket(request, env, ctx) {
         if (!budget) {
             return socketError(`连接建立过于频繁（每分钟最多 ${CONNECT_LIMIT} 次），请稍后再试。`);
         }
+        // 旧部署里可能存着私网地址（拦截上线之前写入的）：建连时同样拒绝，
+        // 不要只在创建时拦、连接时放行。
+        if (!isPublicHost(rec.host)) return json({ error: 'private_host', message: '该主机为私网或保留地址，不允许连接，请改为公网地址' }, 400);
         target = { host: normalizeHost(rec.host), port: rec.port || 22, hostId, hostRec: rec };
     } else {
         const addr = normalizeHost(qHost);
         if (!addr) return json({ error: 'bad_host', message: '主机地址不合法' }, 400);
+        if (!isPublicHost(addr)) return json({ error: 'private_host', message: '主机地址为私网或保留地址，不允许连接（只支持公网地址）' }, 400);
         if (qPort < 1 || qPort > 65535) return json({ error: 'bad_port', message: '端口不合法' }, 400);
         const [quick, budget] = await Promise.all([
             quickConnectBudget(env, session.token, ctx),

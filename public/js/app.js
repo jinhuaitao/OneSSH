@@ -213,13 +213,29 @@ function bindAuth() {
         try {
             const res = await api('/api/login', {
                 method: 'POST',
-                body: { username: String(fd.get('username') || '').trim(), password: String(fd.get('password') || '') },
+                body: {
+                    username: String(fd.get('username') || '').trim(),
+                    password: String(fd.get('password') || ''),
+                    totpCode: String(fd.get('totpCode') || '').trim(),
+                },
             });
             state.authed = true;
             state.user = (res && res.user) || '';
             enterApp();
         } catch (e) {
-            errEl.textContent = e.message;
+            // 启用了两步验证时，第一次提交（无码）会先返回 totp_required：
+            // 展开验证码输入框，让用户补码后连同密码一起重发。
+            if (e && e.data && e.data.error === 'totp_required') {
+                const field = $('#login-totp-field');
+                const hint = $('#login-totp-hint');
+                if (field) field.hidden = false;
+                if (hint) hint.hidden = false;
+                errEl.textContent = '请输入两步验证码';
+                const input = field && field.querySelector('input');
+                if (input) input.focus();
+            } else {
+                errEl.textContent = e.message;
+            }
             shakeForm(loginForm);
         } finally {
             setLoading(loginForm, false);
@@ -1534,6 +1550,110 @@ function openLogs(host) {
 
 /* --------------------------------------------------------------- settings */
 
+/* ------------------------------------------------------------ totp 设置 */
+
+function totpSettingsSection() {
+    const statusEl = el('div', { class: 'muted-sm', text: '两步验证：加载中…' });
+    const box = el('div', { style: 'display:flex;flex-direction:column;gap:8px' }, [
+        el('div', { class: 'eyebrow', style: 'margin:0', text: 'TWO-FACTOR AUTH' }),
+        statusEl,
+    ]);
+    const refresh = async () => {
+        const st = await safe(() => api('/api/totp/status'));
+        if (!st) return;
+        statusEl.textContent = st.enabled
+            ? '两步验证：已启用（剩余备用码 ' + (st.backupRemaining || 0) + ' 个）'
+            : '两步验证：未启用（登录只靠密码，一旦泄露整库凭据都会被拿到）';
+        const oldBtn = box.querySelector('[data-totp-btn]');
+        if (oldBtn) oldBtn.remove();
+        const btn = el('button', {
+            class: 'btn',
+            type: 'button',
+            text: st.enabled ? '停用两步验证' : '启用两步验证',
+            onclick: () => (st.enabled ? openTotpDisable(refresh) : openTotpSetup(refresh)),
+        });
+        btn.setAttribute('data-totp-btn', '1');
+        box.appendChild(btn);
+    };
+    refresh();
+    return box;
+}
+
+function openTotpSetup(onDone) {
+    const msg = el('p', { class: 'form-error', style: 'margin:0' });
+    const body = el('div', { style: 'display:flex;flex-direction:column;gap:12px' }, [
+        el('p', { class: 'muted-sm', style: 'margin:0', text: '正在获取密钥…' }),
+        msg,
+    ]);
+    const m = modal({ title: '启用两步验证', body, footer: el('div', {}, [el('button', { class: 'btn', type: 'button', text: '取消', onclick: () => m.close() })]) });
+    safe(() => api('/api/totp/setup', { method: 'POST' })).then((res) => {
+        if (!res) {
+            m.close();
+            return;
+        }
+        body.textContent = '';
+        const secretIn = el('input', { type: 'text', value: res.secret, readonly: true });
+        const uriIn = el('textarea', { value: res.otpauthUri, readonly: true, rows: 3, spellcheck: 'false' });
+        const codeIn = el('input', { type: 'text', inputmode: 'numeric', placeholder: '认证器 App 里的 6 位验证码', maxlength: '6' });
+        body.append(
+            el('p', { class: 'muted-sm', style: 'margin:0', text: '在认证器 App（Google Authenticator / 1Password 等）里添加账号，密钥：' }),
+            secretIn,
+            el('p', { class: 'muted-sm', style: 'margin:0', text: '或直接导入这条 URI：' }),
+            uriIn,
+            el('p', { class: 'muted-sm', style: 'margin:0', text: '备用码（只显示一次，请抄下来放好，每个只能用一次）：' }),
+            el('div', { class: 'muted-sm', style: 'font-family:monospace;word-break:break-all', text: (res.backupCodes || []).join('  ') }),
+            field('验证码', codeIn)
+        );
+        const foot = el('div', { style: 'display:flex;gap:8px' }, [
+            el('button', { class: 'btn', type: 'button', text: '取消', onclick: () => m.close() }),
+            el('button', {
+                class: 'btn primary',
+                type: 'button',
+                text: '验证并启用',
+                onclick: async () => {
+                    msg.textContent = '';
+                    const r = await safe(() => api('/api/totp/enable', { method: 'POST', body: { code: codeIn.value.trim() } }));
+                    if (!r) return;
+                    toast('两步验证已启用');
+                    m.close();
+                    if (onDone) onDone();
+                },
+            }),
+        ]);
+        // modal() 返回 { footer }：密钥拿到后再把确认按钮换上去
+        m.footer.textContent = '';
+        m.footer.appendChild(foot);
+    });
+}
+
+function openTotpDisable(onDone) {
+    const pwIn = el('input', { type: 'password', autocomplete: 'current-password' });
+    const codeIn = el('input', { type: 'text', inputmode: 'numeric', placeholder: '6 位验证码或 8 位备用码', maxlength: '8' });
+    const msg = el('p', { class: 'form-error', style: 'margin:0' });
+    const body = el('div', { style: 'display:flex;flex-direction:column;gap:12px' }, [field('当前密码', pwIn), field('两步验证码', codeIn), msg]);
+    const m = modal({
+        title: '停用两步验证',
+        body,
+        footer: el('div', { style: 'display:flex;gap:8px' }, [
+            el('button', { class: 'btn', type: 'button', text: '取消', onclick: () => m.close() }),
+            el('button', {
+                class: 'btn primary',
+                type: 'button',
+                text: '停用',
+                onclick: async () => {
+                    const r = await safe(() =>
+                        api('/api/totp/disable', { method: 'POST', body: { current: pwIn.value, totpCode: codeIn.value.trim() } })
+                    );
+                    if (!r) return;
+                    toast('两步验证已停用');
+                    m.close();
+                    if (onDone) onDone();
+                },
+            }),
+        ]),
+    });
+}
+
 function openSettings() {
     setNav('settings');
     const sizeIn = el('input', { type: 'range', min: '11', max: '20', step: '1', value: String(state.settings.fontSize), style: 'flex:1' });
@@ -1557,6 +1677,7 @@ function openSettings() {
         ]),
         el('label', { class: 'check' }, [recordIn, el('span', { text: '默认录制会话输出（加密后保存在 R2，可随时回看）' })]),
         knownFoldSection(),
+        totpSettingsSection(),
         el('hr', { style: 'border:0;border-top:1px solid #f0ebe2;margin:2px 0' }),
         el('div', { class: 'eyebrow', style: 'margin:0', text: 'CHANGE PASSWORD' }),
         field('当前密码', curIn),
@@ -1716,6 +1837,12 @@ function enterApp() {
     loadSnippets();
     loadKeys();
     loadCreds();
+    // 版本号只在登录后返回：这里补取一次，设置页才显示正确版本
+    api('/api/state')
+        .then((info) => {
+            if (info && info.version) state.version = info.version;
+        })
+        .catch(() => {});
 }
 
 async function logout() {
@@ -1867,11 +1994,12 @@ async function boot() {
     state.authed = !!info.authed;
     state.user = info.user || '';
     state.version = info.version || '';
+    // 未登录时 /api/state 不再返回 setupTokenConfigured / version（去指纹）：
+    // 初始化口令永远必填，直接显示输入框；是否配置由 setup 失败的 503 告知。
     const tokenField = $('#setup-token-field');
-    if (tokenField) tokenField.hidden = !info.needsSetupToken;
-    // 口令现在是必需项：没配置时直接提示，别让用户点了「创建」才看到 503
+    if (tokenField) tokenField.hidden = false;
     const tokenHint = $('#setup-token-hint');
-    if (tokenHint) tokenHint.hidden = info.setupTokenConfigured !== false;
+    if (tokenHint) tokenHint.hidden = true;
     if (!state.setup) showAuth('setup');
     else if (!state.authed) showAuth('login');
     else enterApp();

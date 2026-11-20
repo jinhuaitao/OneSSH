@@ -164,7 +164,7 @@ export async function loadPrivateKey(text) {
         const k = parseOpenSSH(pem);
         if (k.kind === 'ed25519') return ed25519FromSeed(k.seed);
         if (k.kind === 'rsa') return rsaFromComponents(k.n, k.e, k.d, k.p, k.q, k.iqmp);
-        if (k.kind === 'ecdsa') throw new Error('暂不支持 ECDSA 私钥，请改用 ed25519 或密码登录');
+        if (k.kind === 'ecdsa') return ecdsaP256FromScalar(k.d, k.publicRaw);
     }
     if (/BEGIN RSA PRIVATE KEY/.test(pem)) {
         assertNotEncrypted(pem);
@@ -193,11 +193,38 @@ export async function loadPrivateKey(text) {
             if (ints.length < 3) throw new Error('私钥结构异常（RSAPrivateKey 字段不足）');
             return rsaFromPkcs1(inner.value, ints[1], ints[2]);
         }
+        if (bytesToHex(oid) === bytesToHex(OID_EC)) {
+            const curveOid = algSeq.children[1] ? algSeq.children[1].value : null;
+            if (!curveOid || bytesToHex(curveOid) !== bytesToHex(OID_P256)) {
+                throw new Error('暂不支持非 P-256 的 EC 私钥');
+            }
+            const { d, publicRaw } = parseSec1EcPrivateKey(inner.value);
+            // 优先直接导入原始 PKCS#8 DER；个别实现导出的 DER 不规范时，
+            // 再从 SEC1 重建一份规范的 PKCS#8 导入。
+            try {
+                const key = await subtle().importKey(
+                    'pkcs8',
+                    der,
+                    { name: 'ECDSA', namedCurve: 'P-256' },
+                    true,
+                    ['sign']
+                );
+                return ecdsaP256Key(key, publicRaw);
+            } catch (_) {
+                return ecdsaP256FromScalar(d, publicRaw);
+            }
+        }
         throw new Error('不支持的 PKCS#8 密钥类型');
     }
     if (/BEGIN EC PRIVATE KEY/.test(pem)) {
         assertNotEncrypted(pem);
-        throw new Error('暂不支持 EC 私钥，请改用 ed25519 或密码登录');
+        const der = fromBase64(pemBody(pem));
+        const { d, publicRaw, curveOid } = parseSec1EcPrivateKey(der);
+        // SEC1 里 [0] 参数缺失时默认按 P-256 处理（标量长度不对会在下面报错）
+        if (curveOid && bytesToHex(curveOid) !== bytesToHex(OID_P256)) {
+            throw new Error('暂不支持非 P-256 的 EC 私钥');
+        }
+        return ecdsaP256FromScalar(d, publicRaw);
     }
     throw new Error('无法识别的私钥格式（支持 OpenSSH / PEM PKCS#1 / PKCS#8）');
 }
@@ -275,6 +302,80 @@ async function rsaFromComponents(n, e, d, p, q, iqmp) {
         derInt(iqmp)
     );
     return rsaFromPkcs1(pkcs1, n, e);
+}
+
+/* ------------------------------------------------------------ ecdsa p-256 */
+
+/**
+ * 解析 SEC1 ECPrivateKey：
+ *   SEQUENCE { version INTEGER, privateKey OCTET STRING,
+ *              parameters [0] EXPLICIT OID OPTIONAL,
+ *              publicKey [1] EXPLICIT BIT STRING OPTIONAL }
+ * @returns {{ d: Uint8Array, publicRaw: Uint8Array|null, curveOid: Uint8Array|null }}
+ */
+function parseSec1EcPrivateKey(der) {
+    const root = parseDer(der);
+    if (root.children.length < 2 || root.children[0].tag !== 0x02 || root.children[1].tag !== 0x04) {
+        throw new Error('私钥结构异常（SEC1 ECPrivateKey 字段缺失）');
+    }
+    const d = root.children[1].value;
+    let publicRaw = null;
+    let curveOid = null;
+    for (const child of root.children.slice(2)) {
+        if (child.tag === 0xa0 && child.children.length && child.children[0].tag === 0x06) {
+            curveOid = child.children[0].value;
+        } else if (child.tag === 0xa1 && child.children.length && child.children[0].tag === 0x03) {
+            const bits = child.children[0].value;
+            // BIT STRING 首字节为未用位数（0），后面是 65 字节未压缩点
+            if (bits.length && bits[0] === 0) publicRaw = bits.subarray(1);
+        }
+    }
+    return { d, publicRaw, curveOid };
+}
+
+function b64urlToBytes(s) {
+    const b = s.replace(/-/g, '+').replace(/_/g, '/');
+    return fromBase64(b + '='.repeat((4 - (b.length % 4)) % 4));
+}
+
+/** 由已导入的 P-256 私钥构造 userauth 用的 { alg, publicBlob, sign } */
+async function ecdsaP256Key(key, publicRaw) {
+    let pub = publicRaw;
+    if (!pub) {
+        // SEC1/OpenSSH 里没带公钥时，从 JWK 的 x/y 拼未压缩点 0x04||x||y
+        const jwk = await subtle().exportKey('jwk', key).catch(() => null);
+        if (!jwk || !jwk.x || !jwk.y) {
+            throw new Error('无法导出 ECDSA P-256 公钥，请检查运行环境是否支持 WebCrypto ECDSA');
+        }
+        pub = concat(new Uint8Array([0x04]), b64urlToBytes(jwk.x), b64urlToBytes(jwk.y));
+    }
+    if (pub.length !== 65 || pub[0] !== 0x04) {
+        throw new Error('ECDSA P-256 公钥点格式异常（应为 65 字节未压缩点）');
+    }
+    const publicBlob = new Writer().str('ecdsa-sha2-nistp256').str('nistp256').str(pub).bytes();
+    return {
+        alg: 'ecdsa-sha2-nistp256',
+        publicBlob,
+        async sign(data) {
+            // WebCrypto 给 r||s（各 32 字节大端）；SSH 要 mpint(r)||mpint(s)
+            const raw = new Uint8Array(await subtle().sign({ name: 'ECDSA', hash: 'SHA-256' }, key, data));
+            if (raw.length !== 64) throw new Error('ECDSA 签名长度异常');
+            return new Writer().mpint(raw.subarray(0, 32)).mpint(raw.subarray(32)).bytes();
+        },
+    };
+}
+
+/** 由私钥标量 d（32 字节）+ 可选公钥点构造 P-256 私钥：先拼 SEC1 再包成 PKCS#8 导入 */
+async function ecdsaP256FromScalar(d, publicRaw) {
+    if (!d || d.length !== 32) throw new Error('ECDSA P-256 私钥标量长度异常（应为 32 字节）');
+    const parts = [derInt(new Uint8Array([1])), derOctet(d), derTLV(0xa0, derOid(OID_P256))];
+    if (publicRaw) {
+        parts.push(derTLV(0xa1, derTLV(0x03, concat(new Uint8Array([0]), publicRaw))));
+    }
+    const sec1 = derSeq(...parts);
+    const pkcs8 = pkcs8Wrap(sec1, OID_EC, OID_P256);
+    const key = await subtle().importKey('pkcs8', pkcs8, { name: 'ECDSA', namedCurve: 'P-256' }, true, ['sign']);
+    return ecdsaP256Key(key, publicRaw);
 }
 
 export async function signUserauth(key, data) {

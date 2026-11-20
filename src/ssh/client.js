@@ -15,6 +15,10 @@ export const MSG = {
     NEWKEYS: 21,
     KEX_ECDH_INIT: 30,
     KEX_ECDH_REPLY: 31,
+    // 与 ECDH 同报文号：KEXDH_INIT(30) / KEXDH_REPLY(31)，内容分别为
+    // 本端 DH 公钥 mpint 与「主机密钥 + 对端公钥 f + 签名」
+    KEXDH_INIT: 30,
+    KEXDH_REPLY: 31,
     USERAUTH_REQUEST: 50,
     USERAUTH_FAILURE: 51,
     USERAUTH_SUCCESS: 52,
@@ -37,7 +41,7 @@ export const MSG = {
     CHANNEL_FAILURE: 100,
 };
 
-const KEX_ALGS = ['curve25519-sha256', 'curve25519-sha256@libssh.org'];
+const KEX_ALGS = ['curve25519-sha256', 'curve25519-sha256@libssh.org', 'diffie-hellman-group14-sha256'];
 // 只用来「通告」，不参与 pick()：这两个不是真正的密钥交换算法
 const KEX_EXTRA = ['ext-info-c', 'kex-strict-c-v00@openssh.com'];
 const CIPHERS = ['aes128-ctr', 'aes192-ctr', 'aes256-ctr'];
@@ -121,6 +125,7 @@ export class SSHClient {
         this.flowChain = Promise.resolve();
         this.closed = false;
         this.kexInitSent = false;
+        this.dh = null; // group14 协商时的本端 DH 密钥对（{ privateKey: bigint, publicKey: Uint8Array }）
         this.sessionId = null;
         this.channels = new Map();
         this.nextLocalChannel = 0;
@@ -184,9 +189,12 @@ export class SSHClient {
         this._writeVersion();
         // KEXINIT 与 ECDH_INIT 是两条独立报文，但都不依赖对端 KEXINIT 的内容
         // （我们只提供 curve25519-sha256），因此可以顺序写出、合并成一次 RTT。
+        // 这条 ECDH_INIT 是按首选算法猜的包：KEXINIT 里 first_kex_packet_follows
+        // 置 true，服务端协商出别的算法时必须按 RFC 4253 §7.1 丢弃它，之后
+        // _onKexInit 会按协商结果发正式的 KEXDH_INIT / ECDH_INIT。
         // 注意要「同步排队」两条消息：中间不能有 await，否则服务器的 KEXINIT
         // 可能插进来，_onKexInit 会以为 ECDH_INIT 还没发而重复发一条。
-        const kexSent = this._sendKexInit();
+        const kexSent = this._sendKexInit(true);
         const ecdhSent = this._sendEcdhInit();
         await kexSent;
         await ecdhSent;
@@ -207,6 +215,14 @@ export class SSHClient {
         // 那边看到 kexSent 已为 true 就不会重复发一条 ECDH_INIT。
         this.kexSent = true;
         const w = new Writer().byte(MSG.KEX_ECDH_INIT).str(this.kex.publicKey);
+        await this.send(w.bytes());
+    }
+
+    /** group14 的 KEXDH_INIT：内容为本端 DH 公钥的 mpint（与 ECDH_INIT 同为 30 号报文） */
+    async _sendDhInit() {
+        if (!this.dh) throw new Error('DH 密钥对尚未生成');
+        this.kexSent = true;
+        const w = new Writer().byte(MSG.KEXDH_INIT).mpint(this.dh.publicKey);
         await this.send(w.bytes());
     }
 
@@ -266,8 +282,9 @@ export class SSHClient {
         if (!this.ready || this.closed || this.kexActive) return;
         if (this.bytesSinceRekey < REKEY_BYTES) return;
         this.bytesSinceRekey = 0;
-        // 上一轮的 x25519 临时密钥必须丢弃，否则 _onKexInit 会误以为 ECDH_INIT 已经发过
+        // 上一轮的 x25519 / DH 临时密钥必须丢弃，否则 _onKexInit 会误以为 ECDH_INIT 已经发过
         this.kex = null;
+        this.dh = null;
         this._sendKexInit().catch((e) => this._fail(e));
     }
 
@@ -352,7 +369,13 @@ export class SSHClient {
         await withTimeout(this._openShell(), 15000, '打开 shell 超时');
     }
 
-    async _sendKexInit() {
+    /**
+     * @param {boolean} [firstFollows] 本条 KEXINIT 后是否紧跟一条按首选算法
+     * 猜的 KEX 包（仅提前开始的路径为 true：它马上就发 ECDH_INIT；重协商
+     * 路径要等服务端 KEXINIT 到了才发 init 包，猜的包并不存在，必须为 false，
+     * 否则服务端会把之后发来的正式 init 包当成猜错的包丢掉）
+     */
+    async _sendKexInit(firstFollows = false) {
         const w = new Writer();
         w.byte(MSG.KEXINIT);
         w.raw(randomBytes(16));
@@ -367,7 +390,7 @@ export class SSHClient {
         w.nameList(['none']);
         w.nameList([]);
         w.nameList([]);
-        w.bool(false);
+        w.bool(firstFollows);
         w.u32(0);
         const payload = w.bytes();
         this.iC = payload;
@@ -375,6 +398,7 @@ export class SSHClient {
         this.kexActive = true;
         // 新一轮 KEX 开始，KEX_ECDH_INIT 还没发（提前开始的路径会在下面紧接着发）
         this.kexSent = false;
+        this.dh = null;
         this.kexDone = deferred();
         await this.send(payload);
     }
@@ -601,11 +625,25 @@ export class SSHClient {
             await this._sendKexInit();
         }
 
-        // 提前开始的路径已经生成并发出过 ECDH_INIT（this.kex 非空），不能重发：
-        // 同一个 KEX 里连发两个 KEX_ECDH_INIT 会被严格实现当成协议错误。
-        if (!this.kex) this.kex = await C.curve25519Keypair();
+        // 按协商出的 kex 分支发正式的 init 包：提前发的只是“猜测”，协商确定
+        // 后必须以正式包为准，不能只看 kexSent。
+        // 原因：KEXINIT 里 first_kex_packet_follows=true 时，服务端按 RFC 4253
+        // §7.1 有权丢弃猜错的包；而实践中丢弃远比 RFC 的字面条件宽：
+        //   - ssh2：比较逻辑在覆盖 remote.kex 之后才做，恒为真，猜对了也丢
+        //     （已用原始 socket 探针验证：ff=1 时服务端只回 KEXINIT，ff=0 时
+        //     正常回 KEX_ECDH_REPLY + NEWKEYS）；
+        //   - OpenSSH：只有双方首选 kex 与首选主机密钥算法都相同时才保留
+        //     （kex.c 的 proposals_match），其余情况同样丢弃。
+        // 所以 _onKexInit 里恒发一条正式 init 包：group14 发 KEXDH_INIT，
+        // curve25519 系重发 ECDH_INIT（沿用同一密钥对，内容与猜测包完全相同）。
+        // 已知残留风险：极少数“按 RFC 字面保留了正确猜测”的服务端会收到重复
+        // 的 init 包；本环境没有真实 sshd 可验证该路径，见测试文件说明。
         this.kexReply = deferred();
-        if (!this.kexSent) {
+        if (kex === 'diffie-hellman-group14-sha256') {
+            this.dh = C.dhGroup14Keypair();
+            await this._sendDhInit();
+        } else {
+            if (!this.kex) this.kex = await C.curve25519Keypair();
             this.kexSent = true;
             await this._sendEcdhInit();
         }
@@ -621,7 +659,22 @@ export class SSHClient {
         const serverPub = r.str();
         const sigBlob = r.str();
 
-        const shared = await C.curve25519Shared(this.kex.privateKey, serverPub);
+        // KEXDH_REPLY 与 KEX_ECDH_REPLY 同为 31 号报文、格式相同，区别只在
+        // 共享密钥的算法：按协商出的 kex 分支算，不要按 kexSent 判断。
+        // H 里的 e 是本端公钥的线格式：curve25519 为原始 32 字节，
+        // group14 为 DH 公钥的 mpint 值字节（dhGroup14Keypair 已规范化，
+        // 与 KEXDH_INIT 包里 mpint() 发出的内容一致）。
+        const isDh = this.neg && this.neg.kex === 'diffie-hellman-group14-sha256';
+        let shared;
+        let ourPub;
+        if (isDh) {
+            if (!this.dh) throw new Error('DH group14: 本端密钥对缺失，无法完成密钥交换');
+            shared = C.dhGroup14Shared(this.dh.privateKey, serverPub);
+            ourPub = this.dh.publicKey;
+        } else {
+            shared = await C.curve25519Shared(this.kex.privateKey, serverPub);
+            ourPub = this.kex.publicKey;
+        }
         // RFC 8731 §3：共享密钥全零说明服务器用了低阶点，密钥协商已被降级（典型中间人）
         if (!shared.length || shared.every((b) => b === 0)) {
             throw new Error('密钥交换失败：X25519 共享密钥全零，已中止连接（可能是中间人攻击）');
@@ -635,7 +688,7 @@ export class SSHClient {
                 str(this.iC),
                 str(this.iS),
                 str(hostKeyBlob),
-                str(this.kex.publicKey),
+                str(ourPub),
                 str(serverPub),
                 kMpint
             )

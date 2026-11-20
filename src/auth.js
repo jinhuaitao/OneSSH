@@ -227,6 +227,9 @@ export async function createAdmin(env, username, password, prev) {
     await ensureMasterKey(env);
     const record = await buildAdminRecord(env, username, password);
     if (prev && prev.createdAt) record.createdAt = prev.createdAt;
+    // 改密不能把两步验证顺手关掉：TOTP 配置属于账号，不属于密码
+    if (prev && prev.totp) record.totp = prev.totp;
+    if (prev && prev.totpPending) record.totpPending = prev.totpPending;
     await putJSON(env, ADMIN_KEY, record);
     return record;
 }
@@ -240,6 +243,8 @@ export async function rehashAdmin(env, admin, password) {
     const next = await buildAdminRecord(env, admin.username, password);
     // createdAt 表示「这个账号是什么时候建的」，升级不该把它改成现在
     if (admin.createdAt) next.createdAt = admin.createdAt;
+    if (admin.totp) next.totp = admin.totp;
+    if (admin.totpPending) next.totpPending = admin.totpPending;
     await putJSON(env, ADMIN_KEY, next);
     return next;
 }
@@ -277,6 +282,178 @@ export async function verifyLogin(env, username, password) {
     if (!safeEqual(String(admin.username).toLowerCase(), String(username || '').toLowerCase())) return null;
     if (!safeEqual(hash, admin.hash)) return null;
     return admin;
+}
+
+/* ------------------------------------------------------------------- totp */
+
+// TOTP（RFC 6238，HMAC-SHA1，30 秒步长，6 位）。只用 WebCrypto，不引入新依赖。
+// admin.totp = { enabled, secret, lastCounter, backupHashes: [sha256hex...] }
+// admin.totpPending = { secret, backupHashes, createdAt }（setup 后、enable 前暂存）
+
+const TOTP_STEP_MS = 30000;
+const TOTP_DIGITS = 6;
+const BASE32_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ234567';
+
+export function generateTotpSecret() {
+    const bytes = crypto.getRandomValues(new Uint8Array(20));
+    let out = '';
+    let bits = 0;
+    let value = 0;
+    for (const b of bytes) {
+        value = (value << 8) | b;
+        bits += 8;
+        while (bits >= 5) {
+            out += BASE32_ALPHABET[(value >>> (bits - 5)) & 31];
+            bits -= 5;
+        }
+    }
+    if (bits > 0) out += BASE32_ALPHABET[(value << (5 - bits)) & 31];
+    return out;
+}
+
+export function base32Decode(secret) {
+    const s = String(secret || '').replace(/=+$/, '').toUpperCase();
+    let bits = 0;
+    let value = 0;
+    const out = [];
+    for (const ch of s) {
+        const idx = BASE32_ALPHABET.indexOf(ch);
+        if (idx < 0) throw new Error('TOTP 密钥不是合法的 base32');
+        value = (value << 5) | idx;
+        bits += 5;
+        if (bits >= 8) {
+            out.push((value >>> (bits - 8)) & 0xff);
+            bits -= 8;
+        }
+    }
+    return new Uint8Array(out);
+}
+
+export function totpOtpauthUri(secret, username) {
+    return (
+        'otpauth://totp/OneSSH:' +
+        encodeURIComponent(String(username || 'admin')) +
+        '?secret=' +
+        secret +
+        '&issuer=OneSSH&algorithm=SHA1&digits=6&period=30'
+    );
+}
+
+async function hmacSha1(keyBytes, counter) {
+    const key = await crypto.subtle.importKey('raw', keyBytes, { name: 'HMAC', hash: 'SHA-1' }, false, ['sign']);
+    const msg = new Uint8Array(8);
+    let c = BigInt(counter);
+    for (let i = 7; i >= 0; i--) {
+        msg[i] = Number(c & 0xffn);
+        c >>= 8n;
+    }
+    return new Uint8Array(await crypto.subtle.sign('HMAC', key, msg));
+}
+
+export function totpCounter(atMs = Date.now()) {
+    return Math.floor(atMs / TOTP_STEP_MS);
+}
+
+export async function totpCodeFor(secret, counter) {
+    const key = base32Decode(secret);
+    const mac = await hmacSha1(key, counter);
+    const offset = mac[mac.length - 1] & 0x0f;
+    const code =
+        (((mac[offset] & 0x7f) << 24) | ((mac[offset + 1] & 0xff) << 16) | ((mac[offset + 2] & 0xff) << 8) | (mac[offset + 3] & 0xff)) %
+        10 ** TOTP_DIGITS;
+    return String(code).padStart(TOTP_DIGITS, '0');
+}
+
+/**
+ * 校验 6 位码，±1 步容差。返回 { ok, counter }；counter <= lastCounter
+ * 说明这个码在当前步长内已被用过（重放），即使数字正确也拒绝。
+ */
+export async function verifyTotpCode(secret, code, lastCounter = 0) {
+    const clean = String(code || '').replace(/\s+/g, '');
+    if (!/^\d{6}$/.test(clean)) return { ok: false, reason: 'bad_format' };
+    const now = totpCounter();
+    for (const offset of [0, -1, 1]) {
+        const counter = now + offset;
+        if (counter <= lastCounter) continue;
+        if (safeEqual(await totpCodeFor(secret, counter), clean)) return { ok: true, counter };
+    }
+    // 数字对上但计数值不大于上次：重放
+    for (const offset of [0, -1, 1]) {
+        if (safeEqual(await totpCodeFor(secret, now + offset), clean)) return { ok: false, reason: 'replay' };
+    }
+    return { ok: false, reason: 'mismatch' };
+}
+
+export async function sha256Hex(text) {
+    const bits = await crypto.subtle.digest('SHA-256', te.encode(String(text)));
+    return toHex(new Uint8Array(bits));
+}
+
+/** 生成 10 个 8 位数字备用码；明文只返回一次，落盘只存 SHA-256 哈希。 */
+export async function generateBackupCodes() {
+    const codes = [];
+    const hashes = [];
+    for (let i = 0; i < 10; i++) {
+        const n = crypto.getRandomValues(new Uint32Array(1))[0] % 100000000;
+        const code = String(n).padStart(8, '0');
+        codes.push(code);
+        hashes.push(await sha256Hex(code));
+    }
+    return { codes, hashes };
+}
+
+async function saveAdmin(env, record) {
+    await putJSON(env, ADMIN_KEY, record);
+    return record;
+}
+
+/**
+ * 登录 / 敏感操作时的 TOTP 校验（消费型）：正确码更新 lastCounter，
+ * 备用码一次性消耗。admin 未启用时返回 { ok: true, required: false }。
+ */
+export async function checkTotp(env, admin, code) {
+    const totp = admin && admin.totp;
+    if (!totp || !totp.enabled) return { ok: true, required: false };
+    const clean = String(code || '').replace(/[\s-]/g, '');
+    if (!clean) return { ok: false, error: 'totp_required' };
+    // 备用码：8 位数字，先试它（6 位码不会撞上）
+    if (/^\d{8}$/.test(clean) && Array.isArray(totp.backupHashes)) {
+        const hash = await sha256Hex(clean);
+        const idx = totp.backupHashes.findIndex((h) => safeEqual(h, hash));
+        if (idx >= 0) {
+            const fresh = await getAdmin(env);
+            if (!fresh || !fresh.totp) return { ok: false, error: 'totp_invalid' };
+            fresh.totp.backupHashes = fresh.totp.backupHashes.filter((_, i) => i !== idx);
+            await saveAdmin(env, fresh);
+            return { ok: true, method: 'backup', remaining: fresh.totp.backupHashes.length };
+        }
+    }
+    if (!totp.secret) return { ok: false, error: 'totp_invalid' };
+    const res = await verifyTotpCode(totp.secret, clean, totp.lastCounter || 0);
+    if (!res.ok) return { ok: false, error: res.reason === 'replay' ? 'totp_replay' : 'totp_invalid' };
+    const fresh = await getAdmin(env);
+    if (!fresh || !fresh.totp) return { ok: false, error: 'totp_invalid' };
+    // 并发登录用同一码时，后写者会看到 lastCounter 已更新；这里以 fresh 为准
+    if (res.counter <= (fresh.totp.lastCounter || 0)) return { ok: false, error: 'totp_replay' };
+    fresh.totp.lastCounter = res.counter;
+    await saveAdmin(env, fresh);
+    return { ok: true, method: 'totp' };
+}
+
+/** 只验 TOTP 码（不接受备用码），用于导出等敏感操作；同样防重放。 */
+export async function checkTotpCodeOnly(env, admin, code) {
+    const totp = admin && admin.totp;
+    if (!totp || !totp.enabled) return { ok: true, required: false };
+    const clean = String(code || '').replace(/\s+/g, '');
+    if (!clean) return { ok: false, error: 'totp_required' };
+    const res = await verifyTotpCode(totp.secret, clean, totp.lastCounter || 0);
+    if (!res.ok) return { ok: false, error: res.reason === 'replay' ? 'totp_replay' : 'totp_invalid' };
+    const fresh = await getAdmin(env);
+    if (!fresh || !fresh.totp) return { ok: false, error: 'totp_invalid' };
+    if (res.counter <= (fresh.totp.lastCounter || 0)) return { ok: false, error: 'totp_replay' };
+    fresh.totp.lastCounter = res.counter;
+    await saveAdmin(env, fresh);
+    return { ok: true, method: 'totp' };
 }
 
 /* --------------------------------------------------------------- sessions */
