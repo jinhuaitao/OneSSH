@@ -1,5 +1,5 @@
 // Account, session, throttle and at-rest secret encryption.
-import { getJSON, putJSON, putJSONIfAbsent, del, list, getJSONAll, delAll } from './store.js';
+import { getJSON, putJSON, putJSONIfAbsent, del, list, listLimited, getJSONAll, delAll } from './store.js';
 
 const ADMIN_KEY = 'sys/admin';
 const MASTER_KEY = 'sys/master';
@@ -587,6 +587,14 @@ export async function pruneSessions(env) {
 const THROTTLE_LIMIT = 6;
 const THROTTLE_WINDOW = 10 * 60 * 1000;
 const THROTTLE_LOCK = 15 * 60 * 1000;
+// 单次限流检查最多扫这么多条记录：原来全量 list，攻击者往自己 IP 的前缀里
+// 塞几千条失败记录，每次登录都要翻完，是一条现成的放大 DoS。
+// key 按时间戳升序排，过期记录最旧、排在最前面，所以有界扫描仍能先看到并
+// 删掉它们；窗口内计数满 6 条就能判定锁定，不需要后面的。唯一缺口是「过期
+// 记录超过上限、后面还藏着 6 条新鲜记录」：那次调用会删掉一批过期记录后
+// 放行一次，下一次调用就看得到新鲜记录了（自愈），且锁定时长仍不少于
+// 「第 6 次失败 + 15 分钟」。
+const THROTTLE_SCAN_CAP = 128;
 
 // R2 没有 CAS：原来「读计数 → 改 → 写回」在并发下会互相覆盖，6 次锁定形同虚设。
 // 改成每次失败写一个独立对象、用 list 计数 —— 并发写不同的 key 不会丢更新。
@@ -600,7 +608,7 @@ export async function checkThrottle(env, ip) {
     const now = Date.now();
     const stamps = [];
     const stale = [];
-    for (const o of await list(env, prefix)) {
+    for (const o of await listLimited(env, prefix, THROTTLE_SCAN_CAP)) {
         const ts = parseInt(o.key.slice(prefix.length), 10);
         if (!Number.isFinite(ts)) continue;
         if (now - ts <= THROTTLE_WINDOW) stamps.push(ts);
@@ -626,8 +634,27 @@ export async function clearFailures(env, ip) {
 
 /* ------------------------------------------------------- secret at rest */
 
+// 主密钥缓存：同一 isolate 内多次 decryptSecret/encryptSecret 不应每次都读 R2
+// 再 importKey。只缓存主密钥本身：
+//  - TTL 60 秒：超过后重新读 R2，轮换后最晚 60 秒生效；
+//  - 指纹是已加载密钥材料的 SHA-256，存在这里只为可观测（排障时确认当前
+//    用的是哪一把），命中时不靠它校验——要校验就得重新读 R2，缓存就没意义了；
+//  - 主密钥被导入/轮换时必须显式失效，见 invalidateMasterKeyCache()。
+// 绝不缓存会话校验、绝不缓存 verifyLogin 用的 admin、TOTP 的 lastCounter
+// 读取路径也不走这里：那些是「改了必须立刻生效」的状态，缓存就是安全回归。
+const MASTER_KEY_CACHE_TTL = 60 * 1000;
 let cachedMaster = null;
 let cachedMasterTag = null;
+let cachedMasterFingerprint = null;
+let cachedMasterAt = 0;
+
+/** 主密钥被导入/轮换（/api/import、ensureMasterKey 建新密钥）后调用。 */
+export function invalidateMasterKeyCache() {
+    cachedMaster = null;
+    cachedMasterTag = null;
+    cachedMasterFingerprint = null;
+    cachedMasterAt = 0;
+}
 
 function b64encode(u8) {
     let s = '';
@@ -670,15 +697,20 @@ export async function ensureMasterKey(env) {
     // 与管理员记录同理：并发初始化只能有一份主密钥落盘。
     // 败者绝不能覆盖 —— 否则赢家用 A 钥加密的凭据会被 B 钥毁掉。
     const candidate = { key: b64encode(crypto.getRandomValues(new Uint8Array(32))), createdAt: Date.now() };
-    if (await putJSONIfAbsent(env, MASTER_KEY, candidate)) return;
+    if (await putJSONIfAbsent(env, MASTER_KEY, candidate)) {
+        // 刚建的新密钥和缓存里的不是同一把：不清掉，后续加解密会继续用旧缓存。
+        invalidateMasterKeyCache();
+        return;
+    }
     const check = await getJSON(env, MASTER_KEY);
     if (!check || !check.key) throw new Error('主密钥初始化失败，请重试');
 }
 
 export async function getMasterKey(env) {
-    // 缓存按「密钥来源」区分：轮换 WEBSSH_MASTER_KEY 后不能再拿旧钥继续加解密
+    // 缓存按「密钥来源」区分：轮换 WEBSSH_MASTER_KEY 后不能再拿旧钥继续加解密。
+    // R2 来的密钥 tag 为 ''，轮换靠 TTL（60 秒）+ 导入路径显式失效兜底。
     const tag = env.WEBSSH_MASTER_KEY ? String(env.WEBSSH_MASTER_KEY).trim() : '';
-    if (cachedMaster && cachedMasterTag === tag) return cachedMaster;
+    if (cachedMaster && cachedMasterTag === tag && Date.now() - cachedMasterAt <= MASTER_KEY_CACHE_TTL) return cachedMaster;
     let raw = null;
     if (tag) {
         raw = masterKeyBytes(tag);
@@ -689,7 +721,14 @@ export async function getMasterKey(env) {
     }
     cachedMaster = await importMaster(raw);
     cachedMasterTag = tag;
+    cachedMasterFingerprint = toHex(new Uint8Array(await crypto.subtle.digest('SHA-256', raw)));
+    cachedMasterAt = Date.now();
     return cachedMaster;
+}
+
+/** 当前缓存的主密钥材料指纹（SHA-256 hex），未缓存时为 null。仅供排障/测试。 */
+export function cachedMasterKeyFingerprint() {
+    return cachedMasterFingerprint;
 }
 
 /** 把「这段密文属于哪个字段」绑进 AAD：搬走别人的密文就解不开 */

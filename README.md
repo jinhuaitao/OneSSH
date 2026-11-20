@@ -31,12 +31,24 @@
 - **服务请求前置**：NEWKEYS 写出后立即发 `ssh-userauth`，把「等 NEWKEYS + 等服务接受」压成一个往返；
 - **已知主机预取**：主机指纹在 TCP 建连时就开始读，验签不再等 R2。
 
-在 100ms RTT 的链路上，`TCP 已连接 → shell ready` 从约 700ms 降到约 540ms；
-浏览器到边缘的一整个往返也被 `warm()` 与握手重叠。可自行复测：
+在 100ms RTT 的链路上，`TCP 已连接 → shell ready` 从约 700ms 降到约 620ms（本地 ssh2 基准，`node tools/bench-handshake.mjs --delay=50 --rounds=5` 中位 621-622ms；`--delay=0` 中位约 178ms）；
+浏览器到边缘的一整个往返也被 `warm()` 与握手重叠，`curve25519` 密钥对在 `warm()` 里与 socket 建连并行生成。可自行复测：
 
 ```bash
 npm install
 node tools/bench-handshake.mjs --delay=50 --rounds=5
+```
+
+启动与 R2 也做了并行化：前端启动改走一次 `GET /api/bootstrap`（主机/分组/密钥库/常用账号/片段/已知主机一次返回，失败回退逐个接口），模拟 R2（每操作 20ms 延迟、100 台主机）下从约 890ms 降到约 327ms；主密钥缓存 60 秒 TTL（轮换/导入时显式失效）；连接预算改有界扫描。可自行复测：
+
+```bash
+node --import ./tests/register.mjs tools/bench-r2.mjs
+```
+
+SFTP 分块按实测调过：`READ_CHUNK` 256K、`WRITE_CHUNK` 128K、并发保持 4（10MB 上传在 10ms 延迟下从约 3.6s 降到约 1.9s；0 延迟下载反而略慢于 128K，属噪声/重组开销，见 `OneSSH-perf-SUMMARY.md`）。可自行复测：
+
+```bash
+node tools/bench-transfer.mjs --read-chunk=262144 --write-chunk=131072 --delay=10
 ```
 
 ## 🚀 部署
@@ -113,7 +125,7 @@ SSH 协议栈自研（`src/ssh/`），只用 WebCrypto：`curve25519-sha256` 与
 ```bash
 npm install
 npx wrangler dev        # http://127.0.0.1:8787
-npm test                # 146 个用例，无需 Cloudflare / sshd / 浏览器
+npm test                # 157 个用例，无需 Cloudflare / sshd / 浏览器
 npm run test:e2e        # 2 个用例，ssh2 起真实本地 sshd（与 npm test 里的同款用例单独跑）
 npx wrangler deploy     # 需先 wrangler login
 ```

@@ -3,7 +3,7 @@ import { Terminal, pruneOldLogs } from './session.js';
 import { normalizeHost, isPublicHost } from './hostaddr.js';
 import { connect } from 'cloudflare:sockets';
 import * as auth from './auth.js';
-import { getJSON, putJSON, del, delAll, list, getBytes, listJSON, putJSONAll } from './store.js';
+import { getJSON, putJSON, del, delAll, list, listLimited, getBytes, listJSON, putJSONAll } from './store.js';
 import { renderShell } from './pages.js';
 import { loadPrivateKey } from './ssh/keys.js';
 import { fingerprint } from './ssh/crypto.js';
@@ -152,9 +152,38 @@ function cleanGroupName(v) {
     return name;
 }
 
-async function storedGroups(env) {
-    const rec = await getJSON(env, 'sys/groups');
-    return rec && Array.isArray(rec.groups) ? rec.groups.filter((g) => typeof g === 'string' && g.trim()) : [];
+/** 从已读到的 sys/groups 记录 + 主机列表派生分组名（不额外读 R2）。 */
+function deriveGroups(groupsRec, hostPairs) {
+    const out = [];
+    const seen = new Set();
+    const stored = groupsRec && Array.isArray(groupsRec.groups)
+        ? groupsRec.groups.filter((g) => typeof g === 'string' && g.trim())
+        : [];
+    for (const g of stored) {
+        const name = g.trim();
+        if (name && !seen.has(name)) {
+            seen.add(name);
+            out.push(name);
+        }
+    }
+    // hosts saved before groups were a first-class concept still count
+    for (const { rec } of hostPairs) {
+        const name = rec && String(rec.group || '').trim();
+        if (name && !seen.has(name)) {
+            seen.add(name);
+            out.push(name);
+        }
+    }
+    return out;
+}
+
+async function listGroups(env, groupsRec, hostPairs) {
+    // 两路读互相独立，并行发；调用方传了已读到的就不再重复读
+    const [rec, pairs] = await Promise.all([
+        groupsRec === undefined ? getJSON(env, 'sys/groups') : Promise.resolve(groupsRec),
+        hostPairs === undefined ? listJSON(env, 'hosts/') : Promise.resolve(hostPairs),
+    ]);
+    return deriveGroups(rec, pairs);
 }
 
 async function saveGroups(env, groups) {
@@ -175,27 +204,6 @@ async function saveCreds(env, creds) {
 async function saveSnippets(env, snippets) {
     const rec = await getJSON(env, 'sys/snippets');
     await putJSON(env, 'sys/snippets', bumped(rec, { snippets }));
-}
-
-async function listGroups(env) {
-    const out = [];
-    const seen = new Set();
-    for (const g of await storedGroups(env)) {
-        const name = g.trim();
-        if (name && !seen.has(name)) {
-            seen.add(name);
-            out.push(name);
-        }
-    }
-    // hosts saved before groups were a first-class concept still count
-    for (const { rec } of await listJSON(env, 'hosts/')) {
-        const name = rec && String(rec.group || '').trim();
-        if (name && !seen.has(name)) {
-            seen.add(name);
-            out.push(name);
-        }
-    }
-    return out;
 }
 
 async function retagHosts(env, from, to) {
@@ -349,8 +357,9 @@ async function handleApi(request, env, url) {
     if (method !== 'GET' && method !== 'HEAD') assertSameOrigin(request);
 
     if (path === '/api/state' && method === 'GET') {
-        const admin = await auth.getAdmin(env);
-        const session = admin ? await auth.getSession(env, request) : null;
+        // getAdmin 和 getSession 互相独立：并行读。未初始化时 getSession 那次
+        // 读是多余的（只有 cookie 里有 token 才真的读 R2），换一次往返值得。
+        const [admin, session] = await Promise.all([auth.getAdmin(env), auth.getSession(env, request)]);
         // 未登录只返回最少字段：把 version / setupTokenConfigured 无条件返回，
         // 等于给扫描器免费做指纹识别（「这台跑着 OneSSH 1.2.3，且没配初始化口令」）。
         // 初始化口令现在是无条件必需的，前端无需靠 setupTokenConfigured 判断，
@@ -439,7 +448,6 @@ async function handleApi(request, env, url) {
                 return json({ error: 'totp_invalid', message: '两步验证码不正确' }, 401);
             }
         }
-        await auth.clearFailures(env, ip);
         // 旧格式记录（没带 pepper / 迭代次数变了）在登录成功这一刻顺手升级。
         // 放在登录成功之后做，失败也不影响本次登录，下次再试。
         if (auth.needsRehash(env, admin)) {
@@ -447,9 +455,8 @@ async function handleApi(request, env, url) {
                 await auth.rehashAdmin(env, admin, body.password);
             } catch (_) {}
         }
-        try {
-            await auth.pruneSessions(env);
-        } catch (_) {}
+        // 清限流记录和清过期会话互相独立（throttle/ vs sess/ 前缀），并行做
+        await Promise.all([auth.clearFailures(env, ip), auth.pruneSessions(env).catch(() => {})]);
         const token = await auth.createSession(env, admin.username, request);
         return json({ ok: true, user: admin.username }, 200, { 'set-cookie': auth.sessionCookie(token, request) });
     }
@@ -458,6 +465,51 @@ async function handleApi(request, env, url) {
 
     const session = await auth.getSession(env, request);
     if (!session) return json({ error: 'unauthorized', message: '登录已过期，请重新登录' }, 401);
+
+    /* -------------------------------------------------- bootstrap（启动聚合） */
+
+    if (path === '/api/bootstrap' && method === 'GET') {
+        // 启动时一次取回全部列表：前端原来要逐个调 6-7 个接口，每个接口
+        // 各自先读会话、再读数据，R2 往返全串起来。7 路读互相独立，Worker
+        // 内一次 Promise.all 发完，只剩一次浏览器往返。
+        // keys/creds 只返回去敏后的 publicKeyMeta/publicCredMeta，和原接口一致。
+        const [admin, groupsRec, hostPairs, keysRec, credsRec, snipRec, knownPairs] = await Promise.all([
+            auth.getAdmin(env),
+            getJSON(env, 'sys/groups'),
+            listJSON(env, 'hosts/'),
+            getJSON(env, 'sys/keys'),
+            getJSON(env, 'sys/creds'),
+            getJSON(env, 'sys/snippets'),
+            listJSON(env, 'known/'),
+        ]);
+        const hosts = hostPairs.map((p) => publicHost(p.rec));
+        hosts.sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0) || (a.name || '').localeCompare(b.name || ''));
+        const known = knownPairs.map((p) => ({ key: p.key, ...p.rec }));
+        known.sort((a, b) => String(a.host).localeCompare(String(b.host)));
+        return json({
+            hosts,
+            groups: deriveGroups(groupsRec, hostPairs),
+            keys: ((keysRec && keysRec.keys) || []).map(publicKeyMeta),
+            creds: ((credsRec && credsRec.creds) || []).map(publicCredMeta),
+            snippets: (snipRec && snipRec.snippets) || [],
+            known,
+            versions: {
+                groups: versionOf(groupsRec),
+                keys: versionOf(keysRec),
+                creds: versionOf(credsRec),
+                snippets: versionOf(snipRec),
+            },
+            state: {
+                setup: true,
+                authed: true,
+                user: session.u,
+                totpEnabled: Boolean(admin && admin.totp && admin.totp.enabled),
+                needsSetupToken: true,
+                setupTokenConfigured: Boolean(env.WEBSSH_SETUP_TOKEN),
+                version: VERSION,
+            },
+        });
+    }
 
     /* -------------------------------------------------- totp 两步验证 */
 
@@ -494,7 +546,10 @@ async function handleApi(request, env, url) {
         // 停用要同时验密码和码：只拿到会话还不够，防止「借用已登录电脑关掉 2FA」
         const okPass = await auth.verifyLogin(env, session.u, body.current);
         if (!okPass) return json({ error: 'bad_credentials', message: '当前密码不正确' }, 401);
-        const totp = await auth.checkTotp(env, await auth.getAdmin(env), body.totpCode);
+        // verifyLogin 刚读到的 admin 就是新鲜的：直接传给 checkTotp，
+        // 不用在它前面再读一次 getAdmin（checkTotp 写 lastCounter 前
+        // 自己还会再读一次 fresh 记录，防重放不受影响）
+        const totp = await auth.checkTotp(env, okPass, body.totpCode);
         if (!totp.ok) return json({ error: 'totp_invalid', message: '两步验证码不正确' }, 401);
         const fresh = await auth.getAdmin(env);
         const next = { ...fresh };
@@ -521,22 +576,25 @@ async function handleApi(request, env, url) {
             const totp = await auth.checkTotpCodeOnly(env, admin, body.totpCode);
             if (!totp.ok) return json({ error: totp.error === 'totp_required' ? 'totp_required' : 'totp_invalid', message: '导出需要提供有效的两步验证码' }, 401);
         }
-        const master = await getJSON(env, 'sys/master');
+        // 6 个读互相独立，并行发（原来串行 5 次 sys/hosts 读 + listJSON）
+        const [master, hosts, keysRec, credsRec, groupsRec, snipRec] = await Promise.all([
+            getJSON(env, 'sys/master'),
+            listJSON(env, 'hosts/'),
+            getJSON(env, 'sys/keys'),
+            getJSON(env, 'sys/creds'),
+            getJSON(env, 'sys/groups'),
+            getJSON(env, 'sys/snippets'),
+        ]);
         if (!master || !master.key) {
             // 主密钥在环境变量里时，R2 没有它可包：导出包解不开凭据，宁可拒绝
             // 也不要给用户一个「看着成功、导入后全是乱码」的包。
             return json({ error: 'master_key_in_env', message: '主密钥由 WEBSSH_MASTER_KEY 环境变量提供，无法打包进导出文件；请妥善保管该环境变量的值' }, 400);
         }
-        const hosts = (await listJSON(env, 'hosts/')).map((p) => p.rec);
-        const keysRec = await getJSON(env, 'sys/keys');
-        const credsRec = await getJSON(env, 'sys/creds');
-        const groupsRec = await getJSON(env, 'sys/groups');
-        const snipRec = await getJSON(env, 'sys/snippets');
         const payload = {
             v: 1,
             exportedAt: Date.now(),
             masterKey: master.key,
-            hosts,
+            hosts: hosts.map((p) => p.rec),
             keys: (keysRec && keysRec.keys) || [],
             creds: (credsRec && credsRec.creds) || [],
             groups: (groupsRec && groupsRec.groups) || [],
@@ -574,13 +632,18 @@ async function handleApi(request, env, url) {
             if (!isPublicHost(h.host)) return json({ error: 'bad_export', message: '导出文件里包含私网地址主机，已拒绝导入' }, 400);
         }
         await putJSON(env, 'sys/master', { key: payload.masterKey, createdAt: Date.now() });
+        // 主密钥换了：不清缓存，后续加解密还会拿旧钥，导入的凭据全解不开
+        auth.invalidateMasterKeyCache();
         const oldHosts = await list(env, 'hosts/');
         await delAll(env, oldHosts.map((o) => o.key));
         await putJSONAll(env, payload.hosts.map((h) => ({ key: 'hosts/' + h.id, rec: h })));
-        await saveKeys(env, payload.keys);
-        await saveCreds(env, payload.creds);
-        await saveGroups(env, Array.isArray(payload.groups) ? payload.groups : []);
-        await saveSnippets(env, Array.isArray(payload.snippets) ? payload.snippets : []);
+        // 四个 sys 记录互相独立，并行写（各写各的 key，save* 内部的读-改-写不冲突）
+        await Promise.all([
+            saveKeys(env, payload.keys),
+            saveCreds(env, payload.creds),
+            saveGroups(env, Array.isArray(payload.groups) ? payload.groups : []),
+            saveSnippets(env, Array.isArray(payload.snippets) ? payload.snippets : []),
+        ]);
         return json({
             ok: true,
             imported: {
@@ -617,8 +680,8 @@ async function handleApi(request, env, url) {
         const next = String(body.next || '');
         const pwError = checkPassword(next, admin.username);
         if (pwError) return json({ error: 'weak_password', message: pwError }, 400);
-        await auth.clearFailures(env, ip);
-        await auth.createAdmin(env, admin.username, next, admin);
+        // 清限流（throttle/）和改密码（sys/admin + sys/master 读）互相独立，并行做
+        await Promise.all([auth.clearFailures(env, ip), auth.createAdmin(env, admin.username, next, admin)]);
         // 改密意味着旧凭据可能已泄露：踢掉所有设备，再给当前浏览器发一枚新 token
         await auth.destroyAllSessions(env);
         const token = await auth.createSession(env, admin.username, request);
@@ -627,15 +690,20 @@ async function handleApi(request, env, url) {
 
     if (path === '/api/groups') {
         if (method === 'GET') {
-            return json({ groups: await listGroups(env), version: versionOf(await getJSON(env, 'sys/groups')) });
+            // sys/groups 只读一次：列表和 version 用同一份记录
+            const groupRec = await getJSON(env, 'sys/groups');
+            return json({ groups: await listGroups(env, groupRec), version: versionOf(groupRec) });
         }
         if (method === 'POST') {
             const body = await readJSON(request);
             const groupRec = await getJSON(env, 'sys/groups');
             const conflict = checkExpectedVersion(body, groupRec);
             if (conflict) return conflict;
-            const stored = await storedGroups(env);
-            const groups = await listGroups(env);
+            // stored / groups 都从上面这一次读里派生，不再各读一次 sys/groups
+            const stored = groupRec && Array.isArray(groupRec.groups)
+                ? groupRec.groups.filter((g) => typeof g === 'string' && g.trim())
+                : [];
+            const groups = await listGroups(env, groupRec);
             const op = String(body.op || '');
             if (op === 'add') {
                 const name = cleanGroupName(body.name);
@@ -671,14 +739,18 @@ async function handleApi(request, env, url) {
 
     if (path === '/api/keys') {
         if (method === 'GET') {
-            return json({ keys: (await storedKeys(env)).map(publicKeyMeta), version: versionOf(await getJSON(env, 'sys/keys')) });
+            // storedKeys() 和取 version 原来各读一次 sys/keys，这里一次读够
+            const keysRec = await getJSON(env, 'sys/keys');
+            const keys = keysRec && Array.isArray(keysRec.keys) ? keysRec.keys : [];
+            return json({ keys: keys.map(publicKeyMeta), version: versionOf(keysRec) });
         }
         if (method === 'POST') {
             const body = await readJSON(request);
             const keysRec = await getJSON(env, 'sys/keys');
             const conflict = checkExpectedVersion(body, keysRec);
             if (conflict) return conflict;
-            const keys = await storedKeys(env);
+            // 列表直接取自上面读到的记录：storedKeys() 会把同一条再读一遍
+            const keys = keysRec && Array.isArray(keysRec.keys) ? keysRec.keys : [];
             const id = String(body.id || '').trim();
             const name = cleanKeyName(body.name);
             const keyText = body.privateKey ? String(body.privateKey) : '';
@@ -716,9 +788,9 @@ async function handleApi(request, env, url) {
     if (path.startsWith('/api/keys/') && method === 'DELETE') {
         const id = path.slice('/api/keys/'.length);
         if (!/^[a-zA-Z0-9]+$/.test(id)) return json({ error: 'bad_id', message: '无效的密钥 ID' }, 400);
-        const keys = await storedKeys(env);
+        // 密钥库和主机列表互相独立，并行读
+        const [keys, pairs] = await Promise.all([storedKeys(env), listJSON(env, 'hosts/')]);
         if (!keys.some((k) => k.id === id)) return json({ error: 'not_found', message: '密钥不存在' }, 404);
-        const pairs = await listJSON(env, 'hosts/');
         const used = pairs.filter((p) => p.rec.keyId === id).length;
         if (used) return json({ error: 'in_use', message: `该密钥正被 ${used} 台主机使用，请先改用其他凭据` }, 409);
         await saveKeys(env, keys.filter((k) => k.id !== id));
@@ -727,14 +799,17 @@ async function handleApi(request, env, url) {
 
     if (path === '/api/creds') {
         if (method === 'GET') {
-            return json({ creds: (await storedCreds(env)).map(publicCredMeta), version: versionOf(await getJSON(env, 'sys/creds')) });
+            // 同 /api/keys GET：一次读够，不再为 version 单独读一次
+            const credsRec = await getJSON(env, 'sys/creds');
+            const creds = credsRec && Array.isArray(credsRec.creds) ? credsRec.creds : [];
+            return json({ creds: creds.map(publicCredMeta), version: versionOf(credsRec) });
         }
         if (method === 'POST') {
             const body = await readJSON(request);
             const credsRec = await getJSON(env, 'sys/creds');
             const conflict = checkExpectedVersion(body, credsRec);
             if (conflict) return conflict;
-            const creds = await storedCreds(env);
+            const creds = credsRec && Array.isArray(credsRec.creds) ? credsRec.creds : [];
             const id = String(body.id || '').trim();
             const name = cleanCredName(body.name);
             const username = cleanCredUser(body.username);
@@ -776,9 +851,9 @@ async function handleApi(request, env, url) {
     if (path.startsWith('/api/creds/') && method === 'DELETE') {
         const id = path.slice('/api/creds/'.length);
         if (!/^[a-zA-Z0-9]+$/.test(id)) return json({ error: 'bad_id', message: '无效的账号 ID' }, 400);
-        const creds = await storedCreds(env);
+        // 同上：账号库和主机列表并行读
+        const [creds, pairs] = await Promise.all([storedCreds(env), listJSON(env, 'hosts/')]);
         if (!creds.some((c) => c.id === id)) return json({ error: 'not_found', message: '常用账号不存在' }, 404);
-        const pairs = await listJSON(env, 'hosts/');
         const used = pairs.filter((p) => p.rec.credId === id).length;
         if (used) return json({ error: 'in_use', message: `该账号正被 ${used} 台主机使用，请先改用其他凭据` }, 409);
         await saveCreds(env, creds.filter((c) => c.id !== id));
@@ -799,23 +874,30 @@ async function handleApi(request, env, url) {
                 return json({ error: 'bad_id', message: '无效的主机 ID' }, 400);
             }
             // 新建时卡上限：R2 没有配额提醒，主机列表每页都要回读一遍，
-            // 无限往里塞最后是「打开首页超时」，而不是一个能看懂的报错
-            if (!body.id && (await list(env, 'hosts/')).length >= MAX_HOSTS) {
+            // 无限往里塞最后是「打开首页超时」，而不是一个能看懂的报错。
+            // 只要数到 MAX_HOSTS 条就能下结论，不用全扫（listLimited）。
+            // 更新不占新名额，不用数。
+            if (!body.id && (await listLimited(env, 'hosts/', MAX_HOSTS)).length >= MAX_HOSTS) {
                 return json(
                     { error: 'too_many', message: `主机数量已达上限（${MAX_HOSTS} 台），请先删除不再使用的主机` },
                     409
                 );
             }
             const id = body.id || 'h' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
-            const existing = body.id ? await getJSON(env, 'hosts/' + id) : null;
+            // 原有记录和凭据库互相独立，并行读：原来是「先读主机、再读凭据库」
+            // 两次串行 R2 往返。只需要读提交里实际用到的那一个库。
+            const credId = base.authType === 'password' && typeof body.credId === 'string' ? body.credId.trim() : '';
+            const keyId = base.authType === 'key' && typeof body.keyId === 'string' ? body.keyId.trim() : '';
+            const [existing, vault] = await Promise.all([
+                body.id ? getJSON(env, 'hosts/' + id) : Promise.resolve(null),
+                credId ? storedCreds(env) : keyId ? storedKeys(env) : Promise.resolve(null),
+            ]);
             if (body.id && !existing) return json({ error: 'not_found', message: '主机不存在' }, 404);
             const rec = { id, ...base, createdAt: existing ? existing.createdAt : Date.now(), updatedAt: Date.now() };
 
             const saveSecret = body.saveSecret !== false;
             if (base.authType === 'password') {
-                const credId = typeof body.credId === 'string' ? body.credId.trim() : '';
                 if (credId) {
-                    const vault = await storedCreds(env);
                     if (!vault.some((c) => c.id === credId && c.passEnc)) {
                         return json({ error: 'bad_cred', message: '所选常用账号不存在，请刷新凭据库后重试' }, 400);
                     }
@@ -828,10 +910,8 @@ async function handleApi(request, env, url) {
                     rec.credId = existing.credId;
                 }
             } else {
-                const keyId = typeof body.keyId === 'string' ? body.keyId.trim() : '';
                 const keyText = body.privateKey ? String(body.privateKey) : '';
                 if (keyId) {
-                    const vault = await storedKeys(env);
                     const entry = vault.find((k) => k.id === keyId);
                     if (!entry || !entry.keyEnc) {
                         return json({ error: 'bad_key', message: '所选密钥不存在，请刷新密钥库后重试' }, 400);
@@ -989,7 +1069,10 @@ async function slidingBudget(env, prefix, limit, windowMs, ctx) {
     const now = Date.now();
     let used = 0;
     const stale = [];
-    for (const o of await list(env, prefix)) {
+    // 只取 limit+1 条就停：数到上限就知道没额度了，不用翻完整个前缀。
+    // key 按时间戳升序，过期记录排在最前面，所以顺手清理的也是最旧那批；
+    // 一次清不完的，下次调用继续清，不影响正确性。
+    for (const o of await listLimited(env, prefix, limit + 1)) {
         const ts = parseInt(o.key.slice(prefix.length), 10);
         if (!Number.isFinite(ts)) continue;
         if (now - ts < windowMs) used++;

@@ -75,6 +75,29 @@ export async function list(env, prefix, includeMeta) {
     return out;
 }
 
+/**
+ * 带上限的 list：拿到 limit 条就停，不翻完所有页。
+ * 只适用于「够数就能下结论」的场景（连接预算：limit+1 条就知道超没超；
+ * 主机数量上限：MAX_HOSTS 条就知道满没满）。需要「一个都不能漏」的场景
+ * （destroyAllSessions、pruneSessions、列表展示）继续用全量 list()。
+ */
+export async function listLimited(env, prefix, limit, includeMeta) {
+    const out = [];
+    let cursor;
+    for (let i = 0; i < 200 && out.length < limit; i++) {
+        const page = await bucket(env).list({
+            prefix,
+            cursor,
+            limit: Math.min(500, limit - out.length),
+            include: includeMeta ? ['customMetadata', 'httpMetadata'] : undefined,
+        });
+        for (const o of page.objects) out.push(o);
+        if (!page.truncated) return out;
+        cursor = page.cursor;
+    }
+    return out;
+}
+
 /* ----------------------------------------------------- 并发批量读写 */
 
 // R2 单次读的延迟在 10-50ms 量级，串行回读 100 个对象就是「首页打不开」。

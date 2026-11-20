@@ -29,15 +29,23 @@ export class Mac {
         this.hash = spec.hash;
         this.keyBytes = keyBytes;
         this.key = null;
+        // 4 字节序号头复用：sign() 里 concat() 会同步把它拷进新缓冲（见 sign 注释），
+        // 拷完之后再无任何 await 接触它；而且 sign 的调用方（send/_readPacket）
+        // 都是串行 await，不存在两个 sign 交错写同一块 head 的情况。
+        this._head = new Uint8Array(4);
+        this._headView = new DataView(this._head.buffer);
     }
     async ready() {
         this.key = await subtle().importKey('raw', this.keyBytes, { name: 'HMAC', hash: this.hash }, false, ['sign']);
         return this;
     }
     async sign(seq, packet) {
-        const head = new Uint8Array(4);
-        new DataView(head.buffer).setUint32(0, seq >>> 0);
-        const mac = new Uint8Array(await subtle().sign('HMAC', this.key, concat(head, packet)));
+        this._headView.setUint32(0, seq >>> 0);
+        // concat() 是同步拷贝：head 的 4 个字节在这一行就进了新缓冲，
+        // 之后的 await（subtle.sign）再也不会读到 this._head，所以复用安全。
+        // packet 本身那份拷贝省不掉：WebCrypto sign 只接受一段连续缓冲，
+        // 没有流式 HMAC 接口，seq 头 + 包体必须先拼成一段。
+        const mac = new Uint8Array(await subtle().sign('HMAC', this.key, concat(this._head, packet)));
         return mac.subarray(0, this.len);
     }
 }
@@ -55,10 +63,43 @@ function addCounter(iv, blocks) {
     return out;
 }
 
+// keystream 按 16KB 块生成：足够覆盖一次 peek(16B 头) + 绝大多数整包，
+// 又不至于一次分配过大；大于 16KB 的包分块生成。
+const KS_CHUNK = 16 * 1024;
+// 全零输入复用同一块只读缓冲：subtle().encrypt 不改写输入，
+// 两个方向的 CtrCipher 并发调用也安全。
+const ZEROS = new Uint8Array(KS_CHUNK);
+
+/** out[i] = data[i] ^ ks[i]：能对齐时按 Uint32 批量异或，尾部逐字节。 */
+function xorInto(out, data, ks) {
+    const n = data.length;
+    let i = 0;
+    // 先逐字节走到 data 4 字节对齐（最多 3 字节）；此时 ks/out 若也对齐，
+    // 字边界就一致，批量异或才与逐字节等价。
+    const lead = (4 - (data.byteOffset & 3)) & 3;
+    for (; i < lead && i < n; i++) out[i] = data[i] ^ ks[i];
+    if (i < n && ((ks.byteOffset + i) & 3) === 0 && ((out.byteOffset + i) & 3) === 0) {
+        const words = (n - i) >> 2;
+        const d32 = new Uint32Array(data.buffer, data.byteOffset + i, words);
+        const k32 = new Uint32Array(ks.buffer, ks.byteOffset + i, words);
+        const o32 = new Uint32Array(out.buffer, out.byteOffset + i, words);
+        for (let j = 0; j < words; j++) o32[j] = d32[j] ^ k32[j];
+        i += words << 2;
+    }
+    for (; i < n; i++) out[i] = data[i] ^ ks[i];
+}
+
 /**
  * Continuous CTR keystream with byte-granular offsets: SSH encrypts packet by
  * packet but the counter never resets, so we recompute the counter block for
  * each call and slice into the generated keystream.
+ *
+ * 缓存：最近一次生成的 16KB keystream 块留在 this._ks 里（[_ksStart, _ksStart
+ * + _ks.length)）。_readPacket 里 peek(16B 包头) 紧接着 crypt(整包)，
+ * 原来同一包头要算两次 keystream，现在第二次命中缓存、不调 WebCrypto；
+ * 大包分块生成时，未用完的块尾也留在缓存里给下一次调用。
+ * offset 只向前走，缓存的区间永远是“已生成且对应当前 key/iv 的真 keystream”，
+ * 不存在过期问题；peek 不推进 offset，所以 peek 后的 crypt 仍命中同一区间。
  */
 export class CtrCipher {
     constructor(keyBytes, iv) {
@@ -66,27 +107,66 @@ export class CtrCipher {
         this.iv = iv;
         this.offset = 0;
         this.key = null;
+        this._ks = null;
+        this._ksStart = 0;
     }
     async ready() {
         this.key = await subtle().importKey('raw', this.keyBytes, { name: 'AES-CTR' }, false, ['encrypt']);
         return this;
     }
     async _keystream(len) {
-        const startBlock = Math.floor(this.offset / 16);
-        const intra = this.offset % 16;
-        const blocks = Math.ceil((intra + len) / 16);
-        const counter = addCounter(this.iv, startBlock);
-        const zeros = new Uint8Array(blocks * 16);
-        const ks = new Uint8Array(
-            await subtle().encrypt({ name: 'AES-CTR', counter, length: 128 }, this.key, zeros)
-        );
-        return ks.subarray(intra, intra + len);
+        const start = this.offset;
+        const end = start + len;
+        // 全部命中缓存：直接切片，不调 WebCrypto
+        if (this._ks && start >= this._ksStart && end <= this._ksStart + this._ks.length) {
+            return this._ks.subarray(start - this._ksStart, end - this._ksStart);
+        }
+        const parts = [];
+        let covered = start;
+        // 缓存的前缀能覆盖一部分：先取走，避免重算
+        if (this._ks && start >= this._ksStart && start < this._ksStart + this._ks.length) {
+            const take = Math.min(this._ksStart + this._ks.length, end) - start;
+            parts.push(this._ks.subarray(start - this._ksStart, start - this._ksStart + take));
+            covered = start + take;
+        }
+        let lastChunk = null;
+        let lastChunkStart = 0;
+        while (covered < end) {
+            const startBlock = Math.floor(covered / 16);
+            const intra = covered % 16;
+            // 本轮从块边界起算，最多生成一个 16KB 块
+            const want = Math.min(KS_CHUNK, end - covered + intra);
+            const blocks = Math.ceil(want / 16);
+            const counter = addCounter(this.iv, startBlock);
+            const ks = new Uint8Array(
+                await subtle().encrypt({ name: 'AES-CTR', counter, length: 128 }, this.key, ZEROS.subarray(0, blocks * 16))
+            );
+            const take = Math.min(ks.length - intra, end - covered);
+            parts.push(ks.subarray(intra, intra + take));
+            lastChunk = ks;
+            lastChunkStart = startBlock * 16;
+            covered += take;
+        }
+        // 只缓存最后生成的整块：它的尾部可能正好是下一次 peek/crypt 的起点
+        // （例如 peek 生成 16KB 后 crypt 只消耗了包头部分，剩余仍在缓存里）。
+        if (lastChunk) {
+            this._ks = lastChunk;
+            this._ksStart = lastChunkStart;
+        }
+        if (parts.length === 1) return parts[0];
+        const out = new Uint8Array(len);
+        let o = 0;
+        for (const p of parts) {
+            out.set(p, o);
+            o += p.length;
+        }
+        return out;
     }
     async crypt(data) {
         if (!data.length) return data;
         const ks = await this._keystream(data.length);
         const out = new Uint8Array(data.length);
-        for (let i = 0; i < data.length; i++) out[i] = data[i] ^ ks[i];
+        xorInto(out, data, ks);
         this.offset += data.length;
         return out;
     }
@@ -94,7 +174,7 @@ export class CtrCipher {
     async peek(data) {
         const ks = await this._keystream(data.length);
         const out = new Uint8Array(data.length);
-        for (let i = 0; i < data.length; i++) out[i] = data[i] ^ ks[i];
+        xorInto(out, data, ks);
         return out;
     }
 }
@@ -270,7 +350,7 @@ export function hostKeyType(keyBlob) {
     return r.text();
 }
 
-async function importHostKey(keyBlob) {
+async function importHostKey(keyBlob, sigAlg) {
     const r = new Reader(keyBlob);
     const type = r.text();
     if (type === 'ssh-ed25519') {
@@ -284,8 +364,12 @@ async function importHostKey(keyBlob) {
     if (type === 'ssh-rsa') {
         const e = r.mpint();
         const n = r.mpint();
-        const spki = rsaSpki(n, e);
-        const key = await subtle().importKey('spki', spki, { name: 'RSASSA-PKCS1-v1_5', hash: 'SHA-256' }, false, [
+        // RSA 的 hash 由签名算法定（rsa-sha2-256 → SHA-256，rsa-sha2-512 → SHA-512）：
+        // WebCrypto 的 key 绑定 hash，SHA-256 的 key 验不了 SHA-512 的签名，
+        // 所以必须按 sigAlg 导入——但只导入一次。旧代码在这里按 SHA-256
+        // 导入一次，验签分支又按 hash 再导入一次，第二次导入才是真正用的那把。
+        const hash = sigAlg === 'rsa-sha2-512' ? 'SHA-512' : 'SHA-256';
+        const key = await subtle().importKey('spki', rsaSpki(n, e), { name: 'RSASSA-PKCS1-v1_5', hash }, false, [
             'verify',
         ]);
         return { type, key, params: { name: 'RSASSA-PKCS1-v1_5' }, rsa: true };
@@ -316,9 +400,15 @@ export async function verifyHostKeySignature(keyBlob, sigBlob, exchangeHash) {
     // SHA-1 签名一律拒绝：这是最容易被降级命中的一环（rsa-sha2-* 协商成功却被回退到 ssh-rsa）
     if (sigAlg === 'ssh-rsa') return fail('拒绝 SHA-1 主机签名（ssh-rsa），请让服务器改用 rsa-sha2-256/512');
 
+    // RSA 的签名算法必须在导入前定下来：hash 绑在 key 上，算法不对连导入
+    // 都没意义；提前拒绝也避免给一个非法算法白白导入一次。
+    if (type === 'ssh-rsa' && sigAlg !== 'rsa-sha2-256' && sigAlg !== 'rsa-sha2-512') {
+        return fail('不支持的 RSA 签名算法：' + sigAlg);
+    }
+
     let imported;
     try {
-        imported = await importHostKey(keyBlob);
+        imported = await importHostKey(keyBlob, sigAlg);
     } catch (e) {
         return fail(e.message);
     }
@@ -329,18 +419,8 @@ export async function verifyHostKeySignature(keyBlob, sigBlob, exchangeHash) {
             return ok ? { type, sigAlg, verified: true, reason: null } : fail('signature mismatch');
         }
         if (imported.rsa) {
-            if (sigAlg !== 'rsa-sha2-256' && sigAlg !== 'rsa-sha2-512') {
-                return fail('不支持的 RSA 签名算法：' + sigAlg);
-            }
-            const hash = sigAlg === 'rsa-sha2-512' ? 'SHA-512' : 'SHA-256';
-            const key = await subtle().importKey(
-                'spki',
-                rsaSpkiFromBlob(keyBlob),
-                { name: 'RSASSA-PKCS1-v1_5', hash },
-                false,
-                ['verify']
-            );
-            const ok = await subtle().verify({ name: 'RSASSA-PKCS1-v1_5' }, key, sig, exchangeHash);
+            // hash 已在 importHostKey 里按 sigAlg 选好，这把 key 就是验签用的那把，不再导入
+            const ok = await subtle().verify({ name: 'RSASSA-PKCS1-v1_5' }, imported.key, sig, exchangeHash);
             return ok ? { type, sigAlg, verified: true, reason: null } : fail('signature mismatch');
         }
         if (imported.ecdsa) {
@@ -357,14 +437,6 @@ export async function verifyHostKeySignature(keyBlob, sigBlob, exchangeHash) {
         return fail(String(e && e.message ? e.message : e));
     }
     return fail('unsupported signature algorithm: ' + sigAlg);
-}
-
-function rsaSpkiFromBlob(keyBlob) {
-    const r = new Reader(keyBlob);
-    r.text();
-    const e = r.mpint();
-    const n = r.mpint();
-    return rsaSpki(n, e);
 }
 
 function leftPad(u8, len) {

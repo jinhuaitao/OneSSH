@@ -1833,6 +1833,34 @@ function enterApp() {
         state.term.init();
     }
     showDash();
+    loadBootstrap();
+}
+
+/* 启动聚合：一次 /api/bootstrap 取回全部列表（hosts/groups/keys/creds/
+ * snippets/known/state），失败（旧部署没有这个接口）时回退到逐个加载，
+ * 保证降级后仍能打开。401 说明会话已过期，走登录页，不再逐个重试。 */
+async function loadBootstrap() {
+    try {
+        const res = await api('/api/bootstrap');
+        if (res && Array.isArray(res.hosts)) {
+            state.hosts = res.hosts || [];
+            state.groups = res.groups || [];
+            state.snippets = res.snippets || [];
+            state.keys = res.keys || [];
+            state.creds = res.creds || [];
+            if (res.state && res.state.version) state.version = res.state.version;
+            if (state.filter !== 'all' && !state.hosts.some((h) => h.country === state.filter)) state.filter = 'all';
+            renderDash();
+            return;
+        }
+    } catch (e) {
+        if (e && e.status === 401) {
+            state.authed = false;
+            showAuth('login');
+            return;
+        }
+        // 其它失败（404/网络）走下面的逐个加载回退，不弹错
+    }
     loadHosts();
     loadSnippets();
     loadKeys();

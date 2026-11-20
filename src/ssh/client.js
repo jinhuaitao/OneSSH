@@ -185,7 +185,11 @@ export class SSHClient {
         this._transportStarted = true;
         // 先把 x25519 密钥对算出来：真正开始发包后，服务器可能在同一个 RTT 内
         // 就把 KEXINIT 打回来，到那时再去生成密钥就晚了。
-        this.kex = await C.curve25519Keypair();
+        // warm() 可能已经与 socket.opened 并行生成好了（opts.keypair），
+        // 直接用它；没有预热（测试/嵌入式调用）或预热失败时在这里现生成。
+        this.kex = this.opts.keypair
+            ? await Promise.resolve(this.opts.keypair).catch(() => C.curve25519Keypair())
+            : await C.curve25519Keypair();
         this._writeVersion();
         // KEXINIT 与 ECDH_INIT 是两条独立报文，但都不依赖对端 KEXINIT 的内容
         // （我们只提供 curve25519-sha256），因此可以顺序写出、合并成一次 RTT。

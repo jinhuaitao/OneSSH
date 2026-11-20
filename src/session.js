@@ -1,14 +1,22 @@
 // WebSocket <-> SSH bridge. One Durable-less session per socket.
 import { connect } from 'cloudflare:sockets';
 import { SSHClient } from './ssh/client.js';
+import { curve25519Keypair } from './ssh/crypto.js';
 import { SFTPClient, OPEN, b64encode, b64decode, isDirMode, isLinkMode, modeString, tempName } from './ssh/sftp.js';
 import { getJSON, putJSON, putBytes, list, del } from './store.js';
 import { decryptSecret, randomHex, encryptBytes } from './auth.js';
 import { normalizeHost, isPublicHost } from './hostaddr.js';
 
 const MAX_FILE = 64 * 1024 * 1024;
-const READ_CHUNK = 128 * 1024;
-const WRITE_CHUNK = 64 * 1024;
+// READ_CHUNK 256K：顺序读 + 真实 RTT 下比 128K 快近一半（bench-transfer：
+// delay=50 顺序读 4450ms vs 8506ms；delay=10 并发读 583ms vs 663ms），
+// 代价只在 0 延迟并发读时慢约三成（923ms vs 674ms，_feed 重组开销），
+// 生产路径是 RTT 占主导，取 256K。注意上限：'read' 操作把 len 封顶在
+// 262144，且回复是按 32KB 通道包分片到达的，不会撞上 256K 的包长上限。
+const READ_CHUNK = 256 * 1024;
+// WRITE_CHUNK 128K：顺序写请求数减半，delay=0 快约 10%（~523ms vs ~594ms），
+// delay=10 快约一半（1870ms vs 3640ms）。
+const WRITE_CHUNK = 128 * 1024;
 const EDIT_MAX = 512 * 1024;
 // 单会话内并发的 SFTP 请求上限 / 同时打开的文件句柄上限
 const SFTP_CONCURRENCY = 4;
@@ -214,6 +222,11 @@ export class Terminal {
 
     async _warm() {
         if (!this.socket) return;
+        // x25519 密钥对现在就开始生成，与 socket.opened（TCP 建连，常需一个 RTT）
+        // 并行；_startTransport 里直接用它，不再等一次生成。生成失败时
+        // connect() 内会重新生成（见 client.js _startTransport）。
+        const keypairPromise = curve25519Keypair();
+        keypairPromise.catch(() => {}); // warm 中途失败、client 没接手时也不产生 unhandled rejection
         // 主机记录也在这里就开始读：它和 TCP 建连、KEX 是并行的
         if (this.target && this.target.hostId) {
             this.hostRec = this.target.hostRec || null;
@@ -235,6 +248,7 @@ export class Terminal {
             cols: 80,
             rows: 24,
             term: 'xterm-256color',
+            keypair: keypairPromise,
             write: (b) => this.write(b),
             onData: (data) => {
                 this.sendData(data);

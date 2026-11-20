@@ -125,6 +125,67 @@ test('AES-CTR peek：读包长时不推进密钥流', async () => {
     assert.equal(peeked.length, 16);
 });
 
+test('AES-CTR peek：大包（跨 16KB 块）peek 后 crypt 结果一致', async () => {
+    const key = crypto.getRandomValues(new Uint8Array(32));
+    const iv = crypto.getRandomValues(new Uint8Array(16));
+    const data = crypto.getRandomValues(new Uint8Array(40000)); // > 16KB，跨 keystream 块
+
+    const a = await new C.CtrCipher(key, iv).ready();
+    const peeked = await a.peek(data.subarray(0, 16));
+    const full = await a.crypt(data);
+    const b = await new C.CtrCipher(key, iv).ready();
+    assert.ok(equalBytes(full, await b.crypt(data)), 'peek 后 crypt 整包必须与直接 crypt 一致');
+    assert.ok(equalBytes(peeked, full.subarray(0, 16)), 'peek 出来的包头必须等于 crypt 结果的包头');
+});
+
+test('AES-CTR：分块边界与跨块 keystream 复用', async () => {
+    const key = crypto.getRandomValues(new Uint8Array(32));
+    const iv = crypto.getRandomValues(new Uint8Array(16));
+    const data = new Uint8Array(70000);
+    for (let i = 0; i < data.length; i += 32768) {
+        crypto.getRandomValues(data.subarray(i, Math.min(data.length, i + 32768)));
+    }
+
+    const whole = await new C.CtrCipher(key, iv).ready();
+    const once = await whole.crypt(data);
+
+    // 在 16KB 块边界两侧切：16383 / 16384 / 16385 / 32768，keystream 必须连续
+    const split = await new C.CtrCipher(key, iv).ready();
+    const parts = [];
+    let off = 0;
+    for (const cut of [37, 16383, 16384, 16385, 32768, 50000]) {
+        parts.push(await split.crypt(data.subarray(off, cut)));
+        off = cut;
+    }
+    parts.push(await split.crypt(data.subarray(off)));
+    assert.ok(equalBytes(once, concat(...parts)), '跨 16KB 块的分片 crypt 必须与一次性 crypt 一致');
+
+    // peek 发生在非零 offset（前面已 crypt 过一部分），再 crypt 剩余部分
+    const c = await new C.CtrCipher(key, iv).ready();
+    const first = await c.crypt(data.subarray(0, 1000));
+    const peeked = await c.peek(data.subarray(1000, 1016));
+    const rest = await c.crypt(data.subarray(1000));
+    assert.ok(equalBytes(first, once.subarray(0, 1000)));
+    assert.ok(equalBytes(peeked, once.subarray(1000, 1016)), '中途 peek 不得推进密钥流');
+    assert.ok(equalBytes(rest, once.subarray(1000)), '中途 peek 后 crypt 必须接上原来的密钥流');
+});
+
+test('AES-CTR：未对齐偏移的批量 XOR 与逐字节一致', async () => {
+    const key = crypto.getRandomValues(new Uint8Array(16));
+    const iv = crypto.getRandomValues(new Uint8Array(16));
+    // 故意让 data 的 byteOffset 不是 4 的倍数（覆盖 xorInto 的对齐前导分支）
+    const backing = crypto.getRandomValues(new Uint8Array(5003));
+    const data = backing.subarray(1, 5001);
+    assert.equal(data.byteOffset % 4, 1);
+
+    const whole = await new C.CtrCipher(key, iv).ready();
+    const once = await whole.crypt(data);
+    const split = await new C.CtrCipher(key, iv).ready();
+    const parts = [];
+    for (let i = 0; i < data.length; i += 7) parts.push(await split.crypt(data.subarray(i, i + 7)));
+    assert.ok(equalBytes(once, concat(...parts)));
+});
+
 test('deriveKey：长度正确、可复现、不同字母不同结果', async () => {
     const k = new Uint8Array(32).fill(7);
     const H = new Uint8Array(32).fill(9);
@@ -208,6 +269,34 @@ test('rsa 主机密钥：spki 重建正确，rsa-sha2-256 校验通过', async (
     const res = await C.verifyHostKeySignature(keyBlob, sigBlob, H);
     assert.equal(res.verified, true, res.reason);
     assert.equal(res.type, 'ssh-rsa');
+});
+
+test('rsa 主机密钥：rsa-sha2-512 校验通过，篡改后失败', async () => {
+    const kp = await crypto.subtle.generateKey(
+        { name: 'RSASSA-PKCS1-v1_5', modulusLength: 2048, publicExponent: new Uint8Array([1, 0, 1]), hash: 'SHA-512' },
+        true,
+        ['sign', 'verify']
+    );
+    const jwk = await crypto.subtle.exportKey('jwk', kp.publicKey);
+    const keyBlob = new Writer().str('ssh-rsa').mpint(b64url(jwk.e)).mpint(b64url(jwk.n)).bytes();
+    const H = await C.sha256(new Uint8Array([4, 5, 6]));
+
+    const sig = new Uint8Array(await crypto.subtle.sign({ name: 'RSASSA-PKCS1-v1_5' }, kp.privateKey, H));
+    const sigBlob = new Writer().str('rsa-sha2-512').str(sig).bytes();
+
+    const res = await C.verifyHostKeySignature(keyBlob, sigBlob, H);
+    assert.equal(res.verified, true, res.reason);
+    assert.equal(res.sigAlg, 'rsa-sha2-512');
+    assert.equal(res.type, 'ssh-rsa');
+
+    // 同一把 key、同一个签名，拿 SHA-256 的名义去验必须失败（key 绑定的 hash 不同）
+    const wrongAlg = await C.verifyHostKeySignature(keyBlob, new Writer().str('rsa-sha2-256').str(sig).bytes(), H);
+    assert.equal(wrongAlg.verified, false, 'SHA-512 的签名不能用 rsa-sha2-256 的名义通过');
+
+    // 篡改交换哈希后必须失败（回归：单次导入不能把验签逻辑改松）
+    const tampered = await C.sha256(new Uint8Array([4, 5, 7]));
+    const bad = await C.verifyHostKeySignature(keyBlob, sigBlob, tampered);
+    assert.equal(bad.verified, false);
 });
 
 test('不支持的主机密钥算法给出原因而不是崩溃', async () => {

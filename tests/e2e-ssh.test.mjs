@@ -22,6 +22,7 @@ import path from 'node:path';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
 import { SSHClient } from '../src/ssh/client.js';
+import { curve25519Keypair } from '../src/ssh/crypto.js';
 
 const require = createRequire(import.meta.url);
 const { Server } = require('ssh2');
@@ -99,7 +100,7 @@ async function startTestServer() {
     return { server, port: server.address().port, tmp };
 }
 
-function connectClient(port) {
+function connectClient(port, extraOpts) {
     const socket = net.connect(port, '127.0.0.1');
     socket.setNoDelay(true);
     const shellChunks = [];
@@ -114,6 +115,7 @@ function connectClient(port) {
         auth: { password: PASSWORD },
         cols: 80,
         rows: 24,
+        ...(extraOpts || {}),
         write: (bytes) => {
             socket.write(Buffer.from(bytes));
             return Promise.resolve();
@@ -165,6 +167,36 @@ test('E2E: shell ready 且收到服务端问候', { skip: SKIP, timeout: 15000 }
             5000
         );
         assert.ok(got, 'shell 未在 5 秒内收到服务端 ready 问候');
+    } finally {
+        await cleanup({ ...conn, server, tmp });
+    }
+});
+
+test('E2E: 预热的 x25519 密钥对被 _startTransport 直接使用', { skip: SKIP, timeout: 15000 }, async () => {
+    const { server, port, tmp } = await startTestServer();
+    const prewarmed = await curve25519Keypair();
+    const conn = connectClient(port, { keypair: Promise.resolve(prewarmed) });
+    try {
+        await withTimeout(conn.readyPromise, 10000, 'SSH 握手/认证超时（10 秒内未 ready）');
+        assert.ok(
+            conn.client.kex && Buffer.from(conn.client.kex.publicKey).equals(Buffer.from(prewarmed.publicKey)),
+            'client 必须用预热的密钥对完成 KEX，而不是现生成一把'
+        );
+    } finally {
+        await cleanup({ ...conn, server, tmp });
+    }
+});
+
+test('E2E: 预热密钥对失败时回退到现生成，连接仍成功', { skip: SKIP, timeout: 15000 }, async () => {
+    const { server, port, tmp } = await startTestServer();
+    // 先挂一个空 catch：这个已拒绝的 promise 在 client 接手前不能算 unhandled rejection
+    //（session.js 里 warm() 对预热 promise 也是同样处理）
+    const bad = Promise.reject(new Error('预热失败（测试注入）'));
+    bad.catch(() => {});
+    const conn = connectClient(port, { keypair: bad });
+    try {
+        await withTimeout(conn.readyPromise, 10000, 'SSH 握手/认证超时（10 秒内未 ready）');
+        assert.ok(conn.client.kex && conn.client.kex.publicKey.length === 32, '回退后应有一把现生成的密钥对');
     } finally {
         await cleanup({ ...conn, server, tmp });
     }
